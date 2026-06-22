@@ -1,0 +1,23 @@
+[package]
+name = "on9log_host"
+version = "0.1.0"
+edition = "2024"
+description = "Host-side decoder and CLI for on9log binary log streams"
+license = "MIT"
+
+[lib]
+name = "on9log_host"
+path = "src/lib.rs"
+
+[[bin]]
+name = "on9log"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.6.1", features = ["derive"] }
+tokio-serial = "5.5.0"
+goblin = "0.10"
+# Runtime required to drive tokio-serial's async serial stream.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "io-util"] }
+crossterm = "0.29.0"
+sprintf = "0.4.3"
