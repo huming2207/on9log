@@ -64,6 +64,44 @@ callbacks receive an explicit `end_cb()`. Raw UART output does not add an
 extra end delimiter, so consumers that need streamed packets over UART must add
 a framing layer outside this raw byte stream.
 
+## Default ESP VFS Sink
+
+`on9log_esp_vfs.c` provides the default framed ESP VFS sink. It calls
+`esp_stdio_log_vfs_init()`, registers an `on9log_sink_t`, and writes SLIP-framed packets
+to `STDOUT_FILENO`. Output fanout to ESP console VFS devices is owned by
+`esp_stdio_log_vfs.c`:
+
+- `/dev/uart/<CONFIG_ESP_CONSOLE_UART_NUM>` when console UART is enabled;
+- `/dev/usbserjtag` when USB Serial/JTAG console output is enabled;
+- `/dev/cdcacm` when USB CDC console output is enabled.
+
+Additional outputs should be added through `esp_stdio_log_vfs_add_output(path)` before or
+after `on9log_esp_vfs_init()`.
+
+Because raw UART output has no packet boundary, this sink uses SLIP framing:
+
+```text
+0xc0
+SLIP(header bytes)
+SLIP(payload bytes)
+SLIP(crc16_ccitt_le)
+0xc0
+```
+
+Both frame start and frame end are `0xc0`. Payload byte `0xc0` is escaped as
+`0xdb 0xdc`; payload byte `0xdb` is escaped as `0xdb 0xdd`.
+
+The CRC is CRC-16-CCITT with initial value `0xffff`, calculated over the
+unescaped packet header and payload bytes. The final two CRC bytes are appended
+little-endian and SLIP-escaped before the ending `0xc0`. The implementation is
+LUT-based and does not use the ESP ROM CRC implementation.
+
+The sink takes `esp_log_impl_lock()` from `start_cb()` through `end_cb()` so
+frames from different tasks/cores do not interleave on shared VFS outputs.
+`on9log_esp_vfs_init()` disables the core raw ROM UART output with
+`on9log_set_uart_enabled(false)` so framed and unframed log streams are not
+mixed on the console.
+
 Normal log packets use:
 
 ```text
