@@ -3,12 +3,14 @@
 #include <stdint.h>
 
 #define ON9LOG_PACKET_MAGIC 0x9au
+#define ON9LOG_PAYLOAD_LEN_STREAMING 0xffffu
 
 typedef enum {
     ON9LOG_PKT_LOG = 0,
     ON9LOG_PKT_DROPPED = 1,
     ON9LOG_PKT_TIME_SYNC = 2,
     ON9LOG_PKT_BOOT = 3,
+    ON9LOG_PKT_BUFFER = 4,
 } on9log_packet_type_t;
 
 typedef struct {
@@ -18,5 +20,5 @@ typedef struct {
     uint32_t time_ms;     // milliseconds since boot, wraps naturally
     uint32_t tag_id;      // tag string address in ELF
     uint32_t fmt_id;      // format string address in ELF
-    uint16_t payload_len; // bytes after this header: arg type table + encoded args
+    uint16_t payload_len; // bytes after this header, or ON9LOG_PAYLOAD_LEN_STREAMING
 } __attribute__((packed)) on9log_packet_header_t;

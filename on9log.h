@@ -12,10 +12,22 @@
 extern "C" {
 #endif
 
-typedef void (*on9log_sink_t)(const uint8_t *packet, size_t packet_len, void *ctx);
+typedef void (*on9log_sink_start_cb_t)(const uint8_t *header, size_t header_len, void *ctx);
+typedef void (*on9log_sink_payload_cb_t)(const uint8_t *payload,
+                                         size_t payload_len,
+                                         size_t total_arg_cnt,
+                                         size_t curr_arg_index,
+                                         void *ctx);
+typedef void (*on9log_sink_end_cb_t)(void *ctx);
 
-esp_err_t on9log_add_sink(on9log_sink_t sink, void *ctx);
-esp_err_t on9log_remove_sink(on9log_sink_t sink, void *ctx);
+typedef struct {
+    on9log_sink_start_cb_t start_cb;
+    on9log_sink_payload_cb_t payload_cb;
+    on9log_sink_end_cb_t end_cb;
+} on9log_sink_t;
+
+esp_err_t on9log_add_sink(const on9log_sink_t *sink, void *ctx);
+esp_err_t on9log_remove_sink(const on9log_sink_t *sink, void *ctx);
 void on9log_set_uart_enabled(bool enabled);
 uint32_t on9log_get_dropped_count(void);
 
@@ -24,6 +36,11 @@ void on9log_write(esp_log_level_t level,
                   const char *format,
                   const char *arg_types,
                   ...) __attribute__((format(printf, 3, 5)));
+
+void on9log_write_buffer(esp_log_level_t level,
+                         const char *tag,
+                         const void *buffer,
+                         size_t buffer_len);
 
 #ifdef __cplusplus
 }
@@ -184,3 +201,15 @@ constexpr unsigned long long ON9_LOG_DETECT_TYPE_IMPL(const T &, bool is_constan
 #define ON9_LOGI(tag, format, ...) ON9_LOG_LEVEL(ESP_LOG_INFO, tag, format, ##__VA_ARGS__)
 #define ON9_LOGD(tag, format, ...) ON9_LOG_LEVEL(ESP_LOG_DEBUG, tag, format, ##__VA_ARGS__)
 #define ON9_LOGV(tag, format, ...) ON9_LOG_LEVEL(ESP_LOG_VERBOSE, tag, format, ##__VA_ARGS__)
+
+#define ON9_LOG_BUF_LEVEL(level, tag, buffer, buffer_len) do { \
+        if (ESP_LOG_ENABLED(level)) { \
+            on9log_write_buffer((level), (tag), (buffer), (buffer_len)); \
+        } \
+    } while (0)
+
+#define ON9_LOG_BUFE(tag, buffer, buffer_len) ON9_LOG_BUF_LEVEL(ESP_LOG_ERROR, tag, buffer, buffer_len)
+#define ON9_LOG_BUFW(tag, buffer, buffer_len) ON9_LOG_BUF_LEVEL(ESP_LOG_WARN, tag, buffer, buffer_len)
+#define ON9_LOG_BUFI(tag, buffer, buffer_len) ON9_LOG_BUF_LEVEL(ESP_LOG_INFO, tag, buffer, buffer_len)
+#define ON9_LOG_BUFD(tag, buffer, buffer_len) ON9_LOG_BUF_LEVEL(ESP_LOG_DEBUG, tag, buffer, buffer_len)
+#define ON9_LOG_BUFV(tag, buffer, buffer_len) ON9_LOG_BUF_LEVEL(ESP_LOG_VERBOSE, tag, buffer, buffer_len)

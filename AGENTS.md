@@ -27,8 +27,8 @@ Important points:
 - To forward binary logs in firmware, either patch ESP-IDF's binary formatter or
   implement a separate logger.
 - Network I/O should not happen directly in the logging path.
-- Forward complete log packets to a queue/ring buffer, then let MQTT/WebSocket
-  tasks drain them.
+- Forward or frame log packet streams into a queue/ring buffer, then let
+  MQTT/WebSocket tasks drain them.
 
 ## Current Packet Format
 
@@ -44,6 +44,7 @@ typedef enum {
     ON9LOG_PKT_DROPPED   = 1,
     ON9LOG_PKT_TIME_SYNC = 2,
     ON9LOG_PKT_BOOT      = 3,
+    ON9LOG_PKT_BUFFER    = 4,
 } on9log_packet_type_t;
 
 typedef struct {
@@ -53,9 +54,15 @@ typedef struct {
     uint32_t time_ms;     // milliseconds since boot, wraps naturally
     uint32_t tag_id;      // tag string address in ELF
     uint32_t fmt_id;      // format string address in ELF
-    uint16_t payload_len; // bytes after this header
+    uint16_t payload_len; // bytes after this header, or 0xffff for streaming
 } __attribute__((packed)) on9log_packet_header_t;
 ```
+
+`payload_len == ON9LOG_PAYLOAD_LEN_STREAMING` means the logger is emitting a
+streamed packet and the transport/sink framing determines the packet end. Sink
+callbacks receive an explicit `end_cb()`. Raw UART output does not add an
+extra end delimiter, so consumers that need streamed packets over UART must add
+a framing layer outside this raw byte stream.
 
 Normal log packets use:
 
@@ -81,8 +88,8 @@ Encoded argument values use:
 32-bit argument       4 bytes
 64-bit argument       8 bytes
 pointer argument      4 bytes
-dynamic string        uint16_t length + copied bytes, no trailing NUL
-null dynamic string   uint16_t 0xffff, no copied bytes
+dynamic string        uint32_t length + copied bytes, no trailing NUL
+null dynamic string   uint32_t 0xffffffff, no copied bytes
 ```
 
 For `%.*s`, the precision argument is still encoded as its normal 32-bit
@@ -92,6 +99,21 @@ at runtime, so the host decoder applies the precision when rendering.
 The host decoder is expected to recover the format string from the ELF, parse
 the format string, read the argument type table, and consume the payload
 accordingly.
+
+Buffer dump packets use packet type `ON9LOG_PKT_BUFFER`. The `tag_id` field is
+the tag pointer and `fmt_id` is zero.
+
+```text
+uint32_t total_len
+uint32_t offset
+uint32_t chunk_len
+uint8_t  bytes[chunk_len]
+```
+
+The buffer pointer is always treated as dynamic memory and the bytes are copied
+into the streamed packet. The logger no longer imposes a fixed packet-size
+chunk limit. Transports may still split, buffer, reject, or frame the stream
+according to their own limits.
 
 ## Format And Tag Strings
 
@@ -115,20 +137,20 @@ argument is consumed by a `%s` or `%.*s` conversion, the logger copies the
 string bytes into the packet as:
 
 ```text
-uint16_t length
+uint32_t length
 bytes[length]
 ```
 
 The copied bytes do not include a trailing NUL. A null dynamic string pointer is
-encoded as length `0xffff` with no following bytes.
+encoded as length `0xffffffff` with no following bytes.
 
 String arguments are not emitted as ELF pointer IDs. The host distinguishes
 copied dynamic strings from non-string pointers by reading the argument type
 table at the start of the payload.
 
-This makes dynamic strings self-contained in the log stream, with the tradeoff
-that long strings can cause the packet to exceed `ON9LOG_MAX_PACKET_LEN`; such
-logs are dropped and reported by the dropped-packet mechanism.
+This makes dynamic strings self-contained in the log stream. Long strings are
+no longer rejected by a logger packet-size cap; transport-specific limits are
+handled by sinks.
 
 ## Sequence Counter
 
@@ -213,11 +235,45 @@ reported explicitly by the dropped packet.
 - UART output through ROM serial output when enabled;
 - registered callback sinks using `on9log_add_sink()`.
 
-Each sink receives one complete packet per log event.
+Sinks use a streaming interface:
 
-Sink callbacks should be fast. They should copy/enqueue the packet and return.
-They should not perform MQTT/WebSocket/TCP I/O directly, and should avoid logging
-from inside the sink to prevent recursion.
+```c
+typedef struct {
+    void (*start_cb)(const uint8_t *header, size_t header_len, void *ctx);
+    void (*payload_cb)(const uint8_t *payload,
+                       size_t payload_len,
+                       size_t total_arg_cnt,
+                       size_t curr_arg_index,
+                       void *ctx);
+    void (*end_cb)(void *ctx);
+} on9log_sink_t;
+```
+
+`start_cb()` receives the fixed packet header. `payload_cb()` receives one
+payload span at a time. `end_cb()` marks the end of the packet so a sink can
+close/flush a ring buffer item, calculate a transport CRC, or finish an MQTT or
+WebSocket frame.
+
+For normal log packets, `total_arg_cnt` is the argument count and
+`curr_arg_index` is the argument being emitted. Payload metadata, such as the
+argument count and type table, is emitted with `curr_arg_index == SIZE_MAX`.
+For buffer dump packets, the copied buffer bytes are emitted with
+`total_arg_cnt == 1` and `curr_arg_index == 0`; buffer metadata is emitted with
+`curr_arg_index == SIZE_MAX`.
+
+Sink callbacks should be fast. They should copy/enqueue or frame the streamed
+packet and return. They should not perform blocking MQTT/WebSocket/TCP I/O
+directly, and should avoid logging from inside the sink to prevent recursion.
+
+Buffer dumps are emitted with:
+
+```c
+ON9_LOG_BUFE(TAG, buffer, len);
+ON9_LOG_BUFW(TAG, buffer, len);
+ON9_LOG_BUFI(TAG, buffer, len);
+ON9_LOG_BUFD(TAG, buffer, len);
+ON9_LOG_BUFV(TAG, buffer, len);
+```
 
 ## Locking And Atomics
 
@@ -228,13 +284,16 @@ Current shared state is handled as follows:
 - packet sequence counter: atomic;
 - dropped packet counter: atomic;
 - UART enable flag: atomic;
-- sink dispatch: lock-free atomic pointer loads;
+- sink stream dispatch: lock-free atomic pointer loads;
 - sink add/remove: still locked to serialize table mutation and duplicate/free
   slot checks.
 
-Sink slots publish `ctx` first and then publish `sink` with release semantics.
-Dispatch loads `sink` with acquire semantics and only reads `ctx` if `sink` is
-non-null.
+Sink slots publish `ctx` first and then publish the sink-struct pointer with
+release semantics. Dispatch loads `sink` with acquire semantics and only reads
+`ctx` if `sink` is non-null. At packet start, dispatch snapshots the currently
+registered sink pointers and contexts, then uses that snapshot for all payload
+callbacks and `end_cb()` for that packet. The sink struct must have static or
+otherwise long-lived storage; the logger stores its pointer, not a copy.
 
 This makes normal log emission and sink dispatch lock-free. Registration and
 removal are expected to be infrequent, so keeping those paths locked is a
@@ -243,13 +302,15 @@ reasonable tradeoff.
 One important lifetime rule:
 
 ```text
-After on9log_remove_sink(), do not immediately free ctx if another core may
-already have loaded the callback.
+After on9log_remove_sink(), do not immediately free ctx or the sink struct if
+another core may already have loaded the callback pointer.
 ```
 
 Removal prevents future dispatches after the cleared sink pointer is observed,
-but it is not an in-flight callback barrier. If strict teardown is needed later,
-add reference counting, an epoch/RCU scheme, or make sinks init-only.
+but it is not an in-flight callback barrier. A sink already captured in a packet
+snapshot may still receive payload callbacks and `end_cb()`. If strict teardown
+is needed later, add reference counting, an epoch/RCU scheme, or make sinks
+init-only.
 
 ## clangd Atomic Diagnostics
 
@@ -305,4 +366,6 @@ The host decoder must:
 - map `fmt_id` and `tag_id` through the ELF;
 - parse the format string;
 - read the payload argument type table;
-- decode pointer, scalar, and copied dynamic-string arguments.
+- decode pointer, scalar, and copied dynamic-string arguments;
+- use sink/transport framing to find the end of streamed packets;
+- decode `ON9LOG_PKT_BUFFER` copied memory dump bytes.
