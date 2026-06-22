@@ -48,9 +48,8 @@ typedef enum {
     ON9_LOG_ARGS_TYPE_32BITS = 1,
     ON9_LOG_ARGS_TYPE_64BITS = 2,
     ON9_LOG_ARGS_TYPE_POINTER = 3,
+    ON9_LOG_ARGS_TYPE_DYNAMIC_STRING = 4,
 } on9log_args_type_t;
-
-#define ON9_LOG_ARGS_TYPE_LEN 2
 
 typedef struct {
     unsigned tmp;
@@ -58,35 +57,29 @@ typedef struct {
 
 #define ON9_LOG_INIT_ARG_TYPE_N(n) ON9_LOG_INIT_ARG_TYPE_##n
 #define ON9_LOG_INIT_ARG_TYPE(n, ...) ON9_LOG_INIT_ARG_TYPE_N(n)(__VA_ARGS__)
-#define ON9_LOG_INIT_ARG_TYPE_1(a) ON9_LOG_PACK_4_TYPES(a, (on9log_args_end_t){0}, (on9log_args_end_t){0}, (on9log_args_end_t){0})
-#define ON9_LOG_INIT_ARG_TYPE_2(a, b) ON9_LOG_PACK_4_TYPES(a, b, (on9log_args_end_t){0}, (on9log_args_end_t){0})
-#define ON9_LOG_INIT_ARG_TYPE_3(a, b, c) ON9_LOG_PACK_4_TYPES(a, b, c, (on9log_args_end_t){0})
-#define ON9_LOG_INIT_ARG_TYPE_4(a, b, c, d) ON9_LOG_PACK_4_TYPES(a, b, c, d)
-#define ON9_LOG_INIT_ARG_TYPE_5(a, b, c, d, ...) ON9_LOG_INIT_ARG_TYPE_4(a, b, c, d), ON9_LOG_INIT_ARG_TYPE_1(__VA_ARGS__)
-#define ON9_LOG_INIT_ARG_TYPE_6(a, b, c, d, ...) ON9_LOG_INIT_ARG_TYPE_4(a, b, c, d), ON9_LOG_INIT_ARG_TYPE_2(__VA_ARGS__)
-#define ON9_LOG_INIT_ARG_TYPE_7(a, b, c, d, ...) ON9_LOG_INIT_ARG_TYPE_4(a, b, c, d), ON9_LOG_INIT_ARG_TYPE_3(__VA_ARGS__)
-#define ON9_LOG_INIT_ARG_TYPE_8(a, b, c, d, ...) ON9_LOG_INIT_ARG_TYPE_4(a, b, c, d), ON9_LOG_INIT_ARG_TYPE_4(__VA_ARGS__)
-#define ON9_LOG_INIT_ARG_TYPE_9(a, b, c, d, ...) ON9_LOG_INIT_ARG_TYPE_4(a, b, c, d), ON9_LOG_INIT_ARG_TYPE_5(__VA_ARGS__)
-#define ON9_LOG_INIT_ARG_TYPE_10(a, b, c, d, ...) ON9_LOG_INIT_ARG_TYPE_4(a, b, c, d), ON9_LOG_INIT_ARG_TYPE_6(__VA_ARGS__)
-#define ON9_LOG_INIT_ARG_TYPE_11(a, b, c, d, ...) ON9_LOG_INIT_ARG_TYPE_4(a, b, c, d), ON9_LOG_INIT_ARG_TYPE_7(__VA_ARGS__)
-#define ON9_LOG_INIT_ARG_TYPE_12(a, b, c, d, ...) ON9_LOG_INIT_ARG_TYPE_4(a, b, c, d), ON9_LOG_INIT_ARG_TYPE_8(__VA_ARGS__)
-#define ON9_LOG_INIT_ARG_TYPE_13(a, b, c, d, ...) ON9_LOG_INIT_ARG_TYPE_4(a, b, c, d), ON9_LOG_INIT_ARG_TYPE_9(__VA_ARGS__)
-#define ON9_LOG_INIT_ARG_TYPE_14(a, b, c, d, ...) ON9_LOG_INIT_ARG_TYPE_4(a, b, c, d), ON9_LOG_INIT_ARG_TYPE_10(__VA_ARGS__)
-#define ON9_LOG_INIT_ARG_TYPE_15(a, b, c, d, ...) ON9_LOG_INIT_ARG_TYPE_4(a, b, c, d), ON9_LOG_INIT_ARG_TYPE_11(__VA_ARGS__)
-#define ON9_LOG_INIT_ARG_TYPE_16(a, b, c, d, ...) ON9_LOG_INIT_ARG_TYPE_4(a, b, c, d), ON9_LOG_INIT_ARG_TYPE_12(__VA_ARGS__)
-
-#define ON9_LOG_PACK_4_TYPES(a, b, c, d) (char)( \
-        (ON9_LOG_DETECT_TYPE(a) << (0 * ON9_LOG_ARGS_TYPE_LEN)) | \
-        (ON9_LOG_DETECT_TYPE(b) << (1 * ON9_LOG_ARGS_TYPE_LEN)) | \
-        (ON9_LOG_DETECT_TYPE(c) << (2 * ON9_LOG_ARGS_TYPE_LEN)) | \
-        (ON9_LOG_DETECT_TYPE(d) << (3 * ON9_LOG_ARGS_TYPE_LEN)))
+#define ON9_LOG_INIT_ARG_TYPE_1(a) (char)ON9_LOG_DETECT_TYPE(a)
+#define ON9_LOG_INIT_ARG_TYPE_2(a, b) ON9_LOG_INIT_ARG_TYPE_1(a), ON9_LOG_INIT_ARG_TYPE_1(b)
+#define ON9_LOG_INIT_ARG_TYPE_3(a, b, c) ON9_LOG_INIT_ARG_TYPE_2(a, b), ON9_LOG_INIT_ARG_TYPE_1(c)
+#define ON9_LOG_INIT_ARG_TYPE_4(a, b, c, d) ON9_LOG_INIT_ARG_TYPE_3(a, b, c), ON9_LOG_INIT_ARG_TYPE_1(d)
+#define ON9_LOG_INIT_ARG_TYPE_5(a, b, c, d, e) ON9_LOG_INIT_ARG_TYPE_4(a, b, c, d), ON9_LOG_INIT_ARG_TYPE_1(e)
+#define ON9_LOG_INIT_ARG_TYPE_6(a, b, c, d, e, f) ON9_LOG_INIT_ARG_TYPE_5(a, b, c, d, e), ON9_LOG_INIT_ARG_TYPE_1(f)
+#define ON9_LOG_INIT_ARG_TYPE_7(a, b, c, d, e, f, g) ON9_LOG_INIT_ARG_TYPE_6(a, b, c, d, e, f), ON9_LOG_INIT_ARG_TYPE_1(g)
+#define ON9_LOG_INIT_ARG_TYPE_8(a, b, c, d, e, f, g, h) ON9_LOG_INIT_ARG_TYPE_7(a, b, c, d, e, f, g), ON9_LOG_INIT_ARG_TYPE_1(h)
+#define ON9_LOG_INIT_ARG_TYPE_9(a, b, c, d, e, f, g, h, i) ON9_LOG_INIT_ARG_TYPE_8(a, b, c, d, e, f, g, h), ON9_LOG_INIT_ARG_TYPE_1(i)
+#define ON9_LOG_INIT_ARG_TYPE_10(a, b, c, d, e, f, g, h, i, j) ON9_LOG_INIT_ARG_TYPE_9(a, b, c, d, e, f, g, h, i), ON9_LOG_INIT_ARG_TYPE_1(j)
+#define ON9_LOG_INIT_ARG_TYPE_11(a, b, c, d, e, f, g, h, i, j, k) ON9_LOG_INIT_ARG_TYPE_10(a, b, c, d, e, f, g, h, i, j), ON9_LOG_INIT_ARG_TYPE_1(k)
+#define ON9_LOG_INIT_ARG_TYPE_12(a, b, c, d, e, f, g, h, i, j, k, l) ON9_LOG_INIT_ARG_TYPE_11(a, b, c, d, e, f, g, h, i, j, k), ON9_LOG_INIT_ARG_TYPE_1(l)
+#define ON9_LOG_INIT_ARG_TYPE_13(a, b, c, d, e, f, g, h, i, j, k, l, m) ON9_LOG_INIT_ARG_TYPE_12(a, b, c, d, e, f, g, h, i, j, k, l), ON9_LOG_INIT_ARG_TYPE_1(m)
+#define ON9_LOG_INIT_ARG_TYPE_14(a, b, c, d, e, f, g, h, i, j, k, l, m, n) ON9_LOG_INIT_ARG_TYPE_13(a, b, c, d, e, f, g, h, i, j, k, l, m), ON9_LOG_INIT_ARG_TYPE_1(n)
+#define ON9_LOG_INIT_ARG_TYPE_15(a, b, c, d, e, f, g, h, i, j, k, l, m, n, o) ON9_LOG_INIT_ARG_TYPE_14(a, b, c, d, e, f, g, h, i, j, k, l, m, n), ON9_LOG_INIT_ARG_TYPE_1(o)
+#define ON9_LOG_INIT_ARG_TYPE_16(a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p) ON9_LOG_INIT_ARG_TYPE_15(a, b, c, d, e, f, g, h, i, j, k, l, m, n, o), ON9_LOG_INIT_ARG_TYPE_1(p)
 
 #ifndef __cplusplus
 #define ON9_LOG_DETECT_TYPE(arg) ( \
     _Generic((arg), \
         on9log_args_end_t: ON9_LOG_ARGS_TYPE_NONE, \
-        char*: ON9_LOG_ARGS_TYPE_POINTER, \
-        const char*: ON9_LOG_ARGS_TYPE_POINTER, \
+        char*: ON9_LOG_ARGS_TYPE_DYNAMIC_STRING, \
+        const char*: ON9_LOG_ARGS_TYPE_DYNAMIC_STRING, \
         uint8_t*: ON9_LOG_ARGS_TYPE_POINTER, \
         const uint8_t*: ON9_LOG_ARGS_TYPE_POINTER, \
         long long int: ON9_LOG_ARGS_TYPE_64BITS, \
@@ -99,65 +92,80 @@ extern "C++" {
 template <typename T>
 struct On9LogArgType {
     constexpr static unsigned long long log_type = ON9_LOG_ARGS_TYPE_32BITS;
+    constexpr static unsigned long long constant_log_type = log_type;
 };
 template <>
 struct On9LogArgType<on9log_args_end_t> {
     constexpr static unsigned long long log_type = ON9_LOG_ARGS_TYPE_NONE;
+    constexpr static unsigned long long constant_log_type = log_type;
 };
 template <>
 struct On9LogArgType<char *> {
-    constexpr static unsigned long long log_type = ON9_LOG_ARGS_TYPE_POINTER;
+    constexpr static unsigned long long log_type = ON9_LOG_ARGS_TYPE_DYNAMIC_STRING;
+    constexpr static unsigned long long constant_log_type = log_type;
 };
 template <>
 struct On9LogArgType<const char *> {
-    constexpr static unsigned long long log_type = ON9_LOG_ARGS_TYPE_POINTER;
+    constexpr static unsigned long long log_type = ON9_LOG_ARGS_TYPE_DYNAMIC_STRING;
+    constexpr static unsigned long long constant_log_type = log_type;
 };
 template <>
 struct On9LogArgType<uint8_t *> {
     constexpr static unsigned long long log_type = ON9_LOG_ARGS_TYPE_POINTER;
+    constexpr static unsigned long long constant_log_type = log_type;
 };
 template <>
 struct On9LogArgType<const uint8_t *> {
     constexpr static unsigned long long log_type = ON9_LOG_ARGS_TYPE_POINTER;
+    constexpr static unsigned long long constant_log_type = log_type;
 };
 template <size_t N>
 struct On9LogArgType<char[N]> {
-    constexpr static unsigned long long log_type = ON9_LOG_ARGS_TYPE_POINTER;
+    constexpr static unsigned long long log_type = ON9_LOG_ARGS_TYPE_DYNAMIC_STRING;
+    constexpr static unsigned long long constant_log_type = log_type;
 };
 template <size_t N>
 struct On9LogArgType<const char[N]> {
-    constexpr static unsigned long long log_type = ON9_LOG_ARGS_TYPE_POINTER;
+    constexpr static unsigned long long log_type = ON9_LOG_ARGS_TYPE_DYNAMIC_STRING;
+    constexpr static unsigned long long constant_log_type = log_type;
 };
 template <size_t N>
 struct On9LogArgType<uint8_t[N]> {
     constexpr static unsigned long long log_type = ON9_LOG_ARGS_TYPE_POINTER;
+    constexpr static unsigned long long constant_log_type = log_type;
 };
 template <size_t N>
 struct On9LogArgType<const uint8_t[N]> {
     constexpr static unsigned long long log_type = ON9_LOG_ARGS_TYPE_POINTER;
+    constexpr static unsigned long long constant_log_type = log_type;
 };
 template <>
 struct On9LogArgType<long long int> {
     constexpr static unsigned long long log_type = ON9_LOG_ARGS_TYPE_64BITS;
+    constexpr static unsigned long long constant_log_type = log_type;
 };
 template <>
 struct On9LogArgType<long long unsigned int> {
     constexpr static unsigned long long log_type = ON9_LOG_ARGS_TYPE_64BITS;
+    constexpr static unsigned long long constant_log_type = log_type;
 };
 template <>
 struct On9LogArgType<double> {
     constexpr static unsigned long long log_type = ON9_LOG_ARGS_TYPE_64BITS;
+    constexpr static unsigned long long constant_log_type = log_type;
 };
 template <>
 struct On9LogArgType<float> {
     constexpr static unsigned long long log_type = ON9_LOG_ARGS_TYPE_64BITS;
+    constexpr static unsigned long long constant_log_type = log_type;
 };
 template <typename T>
-constexpr unsigned long long ON9_LOG_DETECT_TYPE(const T &)
+constexpr unsigned long long ON9_LOG_DETECT_TYPE_IMPL(const T &, bool is_constant)
 {
-    return On9LogArgType<T>::log_type;
+    return is_constant ? On9LogArgType<T>::constant_log_type : On9LogArgType<T>::log_type;
 }
 }
+#define ON9_LOG_DETECT_TYPE(arg) ON9_LOG_DETECT_TYPE_IMPL((arg), __builtin_constant_p(arg))
 #endif
 
 #define ON9_LOG_ARGS_TYPE(...) (__extension__({ \

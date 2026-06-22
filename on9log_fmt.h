@@ -18,5 +18,5 @@ typedef struct {
     uint32_t time_ms;     // milliseconds since boot, wraps naturally
     uint32_t tag_id;      // tag string address in ELF
     uint32_t fmt_id;      // format string address in ELF
-    uint16_t payload_len; // bytes after this header
+    uint16_t payload_len; // bytes after this header: arg type table + encoded args
 } __attribute__((packed)) on9log_packet_header_t;

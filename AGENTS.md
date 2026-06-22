@@ -61,20 +61,37 @@ Normal log packets use:
 
 ```text
 header
-raw argument payload
+argument metadata
+encoded argument payload
 ```
 
 Payload encoding:
 
 ```text
-32-bit argument    4 bytes
-64-bit argument    8 bytes
-pointer argument   4 bytes
+uint8_t arg_count
+uint8_t arg_types[arg_count]
+encoded arguments in printf format order
 ```
 
-The payload does not include argument type metadata. The host decoder is expected
-to recover the format string from the ELF, parse the format string, and consume
-the raw payload accordingly.
+Argument type values are the `ON9_LOG_ARGS_TYPE_*` values from `on9log.h`.
+
+Encoded argument values use:
+
+```text
+32-bit argument       4 bytes
+64-bit argument       8 bytes
+pointer argument      4 bytes
+dynamic string        uint16_t length + copied bytes, no trailing NUL
+null dynamic string   uint16_t 0xffff, no copied bytes
+```
+
+For `%.*s`, the precision argument is still encoded as its normal 32-bit
+argument before the string. The firmware does not parse no-load format strings
+at runtime, so the host decoder applies the precision when rendering.
+
+The host decoder is expected to recover the format string from the ELF, parse
+the format string, read the argument type table, and consume the payload
+accordingly.
 
 ## Format And Tag Strings
 
@@ -92,20 +109,26 @@ resolve it from the ELF or from normal read-only sections.
 
 ## Dynamic Strings
 
-The fast path does not copy dynamic `%s` contents into the packet.
+All `char *`, `const char *`, and character-array arguments are treated as
+dynamic strings by default, including direct string literals. When such an
+argument is consumed by a `%s` or `%.*s` conversion, the logger copies the
+string bytes into the packet as:
 
-For pointer arguments, including `%s`, the logger currently sends only the
-32-bit pointer value. This is small and fast, but it means dynamic strings are
-not self-contained in the log stream.
-
-Future slower explicit APIs could be added, for example:
-
-```c
-ON9_LOGS(TAG, "message=%s", ON9_STR_COPY(msg));
+```text
+uint16_t length
+bytes[length]
 ```
 
-That would make dynamic string copying intentional instead of accidentally
-creating large packets in the logging path.
+The copied bytes do not include a trailing NUL. A null dynamic string pointer is
+encoded as length `0xffff` with no following bytes.
+
+String arguments are not emitted as ELF pointer IDs. The host distinguishes
+copied dynamic strings from non-string pointers by reading the argument type
+table at the start of the payload.
+
+This makes dynamic strings self-contained in the log stream, with the tradeoff
+that long strings can cause the packet to exceed `ON9LOG_MAX_PACKET_LEN`; such
+logs are dropped and reported by the dropped-packet mechanism.
 
 ## Sequence Counter
 
@@ -281,4 +304,5 @@ The host decoder must:
 - handle timestamp wrap;
 - map `fmt_id` and `tag_id` through the ELF;
 - parse the format string;
-- decode the raw payload.
+- read the payload argument type table;
+- decode pointer, scalar, and copied dynamic-string arguments.

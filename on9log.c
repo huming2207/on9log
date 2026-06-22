@@ -15,6 +15,8 @@
 
 #define ON9LOG_MAX_PACKET_LEN 512u
 #define ON9LOG_MAX_SINKS 4u
+#define ON9LOG_NULL_STRING_LEN UINT16_MAX
+#define ON9LOG_MAX_MEASURED_STRING_LEN ON9LOG_MAX_PACKET_LEN
 
 typedef struct {
     atomic_uintptr_t sink;
@@ -62,52 +64,124 @@ static void on9log_put_u64(on9log_encoder_t *enc, uint64_t val)
     on9log_put_u32(enc, (uint32_t)(val >> 32u));
 }
 
+static void on9log_put_bytes(on9log_encoder_t *enc, const void *data, size_t len)
+{
+    const uint8_t *bytes = (const uint8_t *)data;
+
+    for (size_t i = 0; i < len; ++i) {
+        on9log_put_u8(enc, bytes[i]);
+    }
+}
+
 static uint8_t on9log_arg_type_at(const char *arg_types, unsigned idx)
 {
     if (arg_types == NULL) {
         return ON9_LOG_ARGS_TYPE_NONE;
     }
-    return (uint8_t)((arg_types[idx / 4u] >> ((idx % 4u) * ON9_LOG_ARGS_TYPE_LEN)) & 0x03u);
+    return (uint8_t)arg_types[idx];
 }
 
-static size_t on9log_measure_payload_len(const char *arg_types)
+static uint8_t on9log_arg_count(const char *arg_types)
+{
+    uint8_t count = 0;
+
+    while (on9log_arg_type_at(arg_types, count) != ON9_LOG_ARGS_TYPE_NONE) {
+        if (count == UINT8_MAX) {
+            break;
+        }
+        ++count;
+    }
+
+    return count;
+}
+
+static size_t on9log_bounded_strlen(const char *str, size_t max_len)
 {
     size_t len = 0;
 
-    for (unsigned idx = 0;; ++idx) {
-        switch (on9log_arg_type_at(arg_types, idx)) {
-        case ON9_LOG_ARGS_TYPE_32BITS:
-        case ON9_LOG_ARGS_TYPE_POINTER:
-            len += sizeof(uint32_t);
-            break;
-        case ON9_LOG_ARGS_TYPE_64BITS:
-            len += sizeof(uint64_t);
-            break;
-        case ON9_LOG_ARGS_TYPE_NONE:
-        default:
-            return len;
-        }
+    while (len < max_len && str[len] != '\0') {
+        ++len;
     }
+
+    return len;
+}
+
+static size_t on9log_process_arg(on9log_encoder_t *enc,
+                                 uint8_t arg_type,
+                                 va_list args)
+{
+    switch (arg_type) {
+    case ON9_LOG_ARGS_TYPE_32BITS: {
+        uint32_t val = va_arg(args, uint32_t);
+        if (enc != NULL) {
+            on9log_put_u32(enc, val);
+        }
+        return sizeof(uint32_t);
+    }
+    case ON9_LOG_ARGS_TYPE_64BITS: {
+        uint64_t val = va_arg(args, uint64_t);
+        if (enc != NULL) {
+            on9log_put_u64(enc, val);
+        }
+        return sizeof(uint64_t);
+    }
+    case ON9_LOG_ARGS_TYPE_POINTER: {
+        const void *ptr = va_arg(args, const void *);
+        if (enc != NULL) {
+            on9log_put_u32(enc, (uint32_t)(uintptr_t)ptr);
+        }
+        return sizeof(uint32_t);
+    }
+    case ON9_LOG_ARGS_TYPE_DYNAMIC_STRING: {
+        const char *str = va_arg(args, const char *);
+        if (str == NULL) {
+            if (enc != NULL) {
+                on9log_put_u16(enc, ON9LOG_NULL_STRING_LEN);
+            }
+            return sizeof(uint16_t);
+        }
+
+        size_t str_len = on9log_bounded_strlen(str, ON9LOG_MAX_MEASURED_STRING_LEN);
+        if (enc != NULL) {
+            on9log_put_u16(enc, (uint16_t)str_len);
+            on9log_put_bytes(enc, str, str_len);
+        }
+        return sizeof(uint16_t) + str_len;
+    }
+    case ON9_LOG_ARGS_TYPE_NONE:
+    default:
+        if (enc != NULL) {
+            enc->overflow = true;
+        }
+        return 0;
+    }
+}
+
+static size_t on9log_process_payload_args(on9log_encoder_t *enc, const char *arg_types, va_list args)
+{
+    size_t len = 0;
+
+    for (unsigned idx = 0; on9log_arg_type_at(arg_types, idx) != ON9_LOG_ARGS_TYPE_NONE; ++idx) {
+        len += on9log_process_arg(enc, on9log_arg_type_at(arg_types, idx), args);
+    }
+
+    return len;
+}
+
+static size_t on9log_measure_payload_len(const char *arg_types, va_list args)
+{
+    uint8_t arg_count = on9log_arg_count(arg_types);
+
+    return sizeof(uint8_t) + arg_count + on9log_process_payload_args(NULL, arg_types, args);
 }
 
 static void on9log_put_payload(on9log_encoder_t *enc, const char *arg_types, va_list args)
 {
-    for (unsigned idx = 0;; ++idx) {
-        switch (on9log_arg_type_at(arg_types, idx)) {
-        case ON9_LOG_ARGS_TYPE_32BITS:
-            on9log_put_u32(enc, va_arg(args, uint32_t));
-            break;
-        case ON9_LOG_ARGS_TYPE_64BITS:
-            on9log_put_u64(enc, va_arg(args, uint64_t));
-            break;
-        case ON9_LOG_ARGS_TYPE_POINTER:
-            on9log_put_u32(enc, (uint32_t)(uintptr_t)va_arg(args, const void *));
-            break;
-        case ON9_LOG_ARGS_TYPE_NONE:
-        default:
-            return;
-        }
-    }
+    uint8_t arg_count = on9log_arg_count(arg_types);
+
+    on9log_put_u8(enc, arg_count);
+    on9log_put_bytes(enc, arg_types, arg_count);
+    (void)on9log_process_payload_args(enc, arg_types, args);
 }
 
 static void on9log_put_header(on9log_encoder_t *enc,
@@ -149,7 +223,11 @@ static bool on9log_build_log_packet(on9log_encoder_t *enc,
                                     const char *arg_types,
                                     va_list args)
 {
-    size_t payload_len = on9log_measure_payload_len(arg_types);
+    va_list measure_args;
+    va_copy(measure_args, args);
+    size_t payload_len = on9log_measure_payload_len(arg_types, measure_args);
+    va_end(measure_args);
+
     if (payload_len > UINT16_MAX ||
             payload_len + sizeof(on9log_packet_header_t) > ON9LOG_MAX_PACKET_LEN) {
         return false;
