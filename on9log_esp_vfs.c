@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <unistd.h>
 
 #include "esp_private/log_lock.h"
@@ -105,6 +106,8 @@ static void on9log_esp_vfs_start(const uint8_t *header, size_t header_len, void 
     (void)ctx;
 
     esp_log_impl_lock();
+    flockfile(stdout);
+    fflush(stdout);
     s_on9log_esp_vfs.crc = ON9LOG_CRC16_CCITT_INIT;
     on9log_esp_vfs_write_raw_byte(ON9LOG_SLIP_END);
     s_on9log_esp_vfs.crc = on9log_crc16_ccitt_update(s_on9log_esp_vfs.crc, header, header_len);
@@ -133,6 +136,7 @@ static void on9log_esp_vfs_end(void *ctx)
     on9log_esp_vfs_write_slip_byte((uint8_t)(crc & 0xffu));
     on9log_esp_vfs_write_slip_byte((uint8_t)(crc >> 8u));
     on9log_esp_vfs_write_raw_byte(ON9LOG_SLIP_END);
+    funlockfile(stdout);
     esp_log_impl_unlock();
 }
 

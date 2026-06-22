@@ -97,7 +97,11 @@ little-endian and SLIP-escaped before the ending `0xc0`. The implementation is
 LUT-based and does not use the ESP ROM CRC implementation.
 
 The sink takes `esp_log_impl_lock()` from `start_cb()` through `end_cb()` so
-frames from different tasks/cores do not interleave on shared VFS outputs.
+frames from different tasks/cores do not interleave on shared VFS outputs. It
+also takes `flockfile(stdout)` for the same interval, flushes `stdout` before
+the opening `0xc0`, and releases the file lock after writing the closing
+`0xc0`. This keeps SLIP frames from interleaving with normal stdio users such as
+`printf()`/`fprintf(stdout, ...)` that honor the `stdout` `FILE *` lock.
 `on9log_esp_vfs_init()` disables the core raw ROM UART output with
 `on9log_set_uart_enabled(false)` so framed and unframed log streams are not
 mixed on the console.
