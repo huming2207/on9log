@@ -6,14 +6,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "esp_log_level.h"
-#include "esp_log_timestamp.h"
-#include "esp_private/log_lock.h"
-#include "esp_rom_serial_output.h"
+#include "on9log_config.h"
 #include "on9log_fmt.h"
-#include "sdkconfig.h"
+#include "on9log_port.h"
 
-#define ON9LOG_MAX_SINKS 4u
 #define ON9LOG_NULL_STRING_LEN UINT32_MAX
 #define ON9LOG_PAYLOAD_META_ARG_INDEX SIZE_MAX
 
@@ -114,9 +110,7 @@ static void on9log_uart_write(const on9log_stream_t *stream, const uint8_t *data
         return;
     }
 
-    for (size_t i = 0; i < len; ++i) {
-        esp_rom_output_tx_one_char(data[i]);
-    }
+    on9log_port_write(data, len);
 }
 
 static void on9log_stream_start(on9log_stream_t *stream, const uint8_t *header, size_t header_len)
@@ -255,7 +249,7 @@ static void on9log_emit_payload_args(on9log_stream_t *stream, const char *arg_ty
 
 static void on9log_put_header(on9log_encoder_t *enc,
                               on9log_packet_type_t type,
-                              esp_log_level_t level,
+                              on9log_level_t level,
                               uint16_t seq,
                               uint32_t time_ms,
                               uint32_t tag_id,
@@ -273,7 +267,7 @@ static void on9log_put_header(on9log_encoder_t *enc,
 
 static bool on9log_encode_header(uint8_t *header,
                                  on9log_packet_type_t type,
-                                 esp_log_level_t level,
+                                 on9log_level_t level,
                                  uint16_t seq,
                                  uint32_t time_ms,
                                  uint32_t tag_id,
@@ -291,7 +285,7 @@ static bool on9log_encode_header(uint8_t *header,
 
 static void on9log_emit_header(on9log_stream_t *stream,
                                on9log_packet_type_t type,
-                               esp_log_level_t level,
+                               on9log_level_t level,
                                uint32_t tag_id,
                                uint32_t fmt_id,
                                uint16_t payload_len)
@@ -302,7 +296,7 @@ static void on9log_emit_header(on9log_stream_t *stream,
                              type,
                              level,
                              (uint16_t)atomic_fetch_add_explicit(&s_seq, 1, memory_order_relaxed),
-                             esp_log_timestamp(),
+                             on9log_port_timestamp_ms(),
                              tag_id,
                              fmt_id,
                              payload_len)) {
@@ -314,68 +308,67 @@ static void on9log_emit_dropped_packet(uint32_t dropped_count)
 {
     on9log_stream_t stream = {0};
 
-    on9log_emit_header(&stream, ON9LOG_PKT_DROPPED, ESP_LOG_NONE, 0, 0, sizeof(uint32_t));
+    on9log_emit_header(&stream, ON9LOG_PKT_DROPPED, ON9_LOG_LEVEL_NONE, 0, 0, sizeof(uint32_t));
     on9log_emit_u32(&stream, dropped_count, 1, 0);
     on9log_stream_end(&stream);
 }
 
-static bool on9log_level_enabled(esp_log_level_t level, const char *tag)
+static bool on9log_level_enabled(on9log_level_t level, const char *tag)
 {
-    if (level == ESP_LOG_NONE || level > LOG_LOCAL_LEVEL) {
+    (void)tag;
+
+    if (level == ON9_LOG_LEVEL_NONE ||
+        level > ON9_LOG_LEVEL_VERBOSE ||
+        level > ON9_LOG_LOCAL_LEVEL) {
         return false;
     }
-#if CONFIG_LOG_MASTER_LEVEL
-    if (esp_log_get_level_master() < level) {
-        return false;
-    }
-#endif
-    return esp_log_level_get(tag) >= level;
+    return true;
 }
 
-esp_err_t on9log_add_sink(const on9log_sink_t *sink, void *ctx)
+on9log_err_t on9log_add_sink(const on9log_sink_t *sink, void *ctx)
 {
     if (sink == NULL || sink->start_cb == NULL || sink->payload_cb == NULL || sink->end_cb == NULL) {
-        return ESP_ERR_INVALID_ARG;
+        return ON9LOG_ERR_INVALID_ARG;
     }
 
-    esp_log_impl_lock();
+    on9log_port_lock();
     for (size_t i = 0; i < ON9LOG_MAX_SINKS; ++i) {
         const on9log_sink_t *slot_sink = (const on9log_sink_t *)atomic_load_explicit(&s_sinks[i].sink, memory_order_acquire);
         void *slot_ctx = (void *)atomic_load_explicit(&s_sinks[i].ctx, memory_order_relaxed);
         if (slot_sink == sink && slot_ctx == ctx) {
-            esp_log_impl_unlock();
-            return ESP_OK;
+            on9log_port_unlock();
+            return ON9LOG_OK;
         }
     }
     for (size_t i = 0; i < ON9LOG_MAX_SINKS; ++i) {
         if (atomic_load_explicit(&s_sinks[i].sink, memory_order_acquire) == (uintptr_t)NULL) {
             atomic_store_explicit(&s_sinks[i].ctx, (uintptr_t)ctx, memory_order_relaxed);
             atomic_store_explicit(&s_sinks[i].sink, (uintptr_t)sink, memory_order_release);
-            esp_log_impl_unlock();
-            return ESP_OK;
+            on9log_port_unlock();
+            return ON9LOG_OK;
         }
     }
-    esp_log_impl_unlock();
+    on9log_port_unlock();
 
-    return ESP_ERR_NO_MEM;
+    return ON9LOG_ERR_NO_MEM;
 }
 
-esp_err_t on9log_remove_sink(const on9log_sink_t *sink, void *ctx)
+on9log_err_t on9log_remove_sink(const on9log_sink_t *sink, void *ctx)
 {
-    esp_log_impl_lock();
+    on9log_port_lock();
     for (size_t i = 0; i < ON9LOG_MAX_SINKS; ++i) {
         const on9log_sink_t *slot_sink = (const on9log_sink_t *)atomic_load_explicit(&s_sinks[i].sink, memory_order_acquire);
         void *slot_ctx = (void *)atomic_load_explicit(&s_sinks[i].ctx, memory_order_relaxed);
         if (slot_sink == sink && slot_ctx == ctx) {
             atomic_store_explicit(&s_sinks[i].sink, (uintptr_t)NULL, memory_order_release);
             atomic_store_explicit(&s_sinks[i].ctx, (uintptr_t)NULL, memory_order_relaxed);
-            esp_log_impl_unlock();
-            return ESP_OK;
+            on9log_port_unlock();
+            return ON9LOG_OK;
         }
     }
-    esp_log_impl_unlock();
+    on9log_port_unlock();
 
-    return ESP_ERR_NOT_FOUND;
+    return ON9LOG_ERR_NOT_FOUND;
 }
 
 void on9log_set_uart_enabled(bool enabled)
@@ -388,7 +381,7 @@ uint32_t on9log_get_dropped_count(void)
     return (uint32_t)atomic_load_explicit(&s_dropped_count, memory_order_relaxed);
 }
 
-void on9log_write(esp_log_level_t level,
+void on9log_write(on9log_level_t level,
                   const char *tag,
                   const char *format,
                   const char *arg_types,
@@ -427,7 +420,7 @@ void on9log_write(esp_log_level_t level,
     va_end(args);
 }
 
-void on9log_write_buffer(esp_log_level_t level,
+void on9log_write_buffer(on9log_level_t level,
                          const char *tag,
                          const void *buffer,
                          size_t buffer_len)

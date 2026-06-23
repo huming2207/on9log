@@ -1,10 +1,11 @@
 //! `on9log` — host-side CLI for the on9log binary log stream.
 //!
-//! Opens a UART port, deframes SLIP+CRC packets, decodes them against an
-//! optional ELF, and prints colorized, terminal-width-wrapped log lines.
+//! Opens a UART port, deframes typed SLIP+CRC transport frames, decodes on9log
+//! packets against an optional ELF, and prints colorized log lines.
 
 use std::io::Write;
 use std::path::PathBuf;
+use std::ptr;
 use std::sync::Arc;
 
 use clap::Parser;
@@ -32,6 +33,10 @@ struct Cli {
     /// Disable colored output.
     #[arg(long)]
     no_color: bool,
+
+    /// Prefix each decoded log and each plain-text line with local wall time.
+    #[arg(short = 't', long)]
+    timestamp: bool,
 
     /// Override detected terminal width (0 = auto-detect).
     #[arg(long, default_value_t = 0)]
@@ -80,7 +85,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    rt.block_on(run(cli.port, cli.baud, elf, use_color, width))?;
+    rt.block_on(run(cli.port, cli.baud, elf, use_color, width, cli.timestamp))?;
     Ok(())
 }
 
@@ -90,6 +95,7 @@ async fn run(
     elf: Option<Arc<ElfStrings>>,
     use_color: bool,
     width: usize,
+    timestamp: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut serial = tokio_serial::new(&port, baud)
         .open_native_async()
@@ -98,6 +104,7 @@ async fn run(
     let mut deframer = Deframer::new();
     let mut decoder = Decoder::new();
     let mut buf = vec![0u8; 4096];
+    let mut plain_text_line_start = true;
 
     eprintln!("on9log: listening on {port} @ {baud} baud (width {width})");
 
@@ -108,7 +115,15 @@ async fn run(
             break;
         }
         for outcome in deframer.feed(&buf[..n]) {
-            handle_outcome(outcome, &mut decoder, elf.as_deref(), use_color, width);
+            handle_outcome(
+                outcome,
+                &mut decoder,
+                elf.as_deref(),
+                use_color,
+                width,
+                timestamp,
+                &mut plain_text_line_start,
+            );
         }
     }
 
@@ -121,20 +136,30 @@ fn handle_outcome(
     elf: Option<&ElfStrings>,
     use_color: bool,
     width: usize,
+    timestamp: bool,
+    plain_text_line_start: &mut bool,
 ) {
     match outcome {
         Outcome::Frame(frame) => match decoder.decode(&frame, elf) {
             DecodedPacket::Log(l) => {
                 let color_code = level_color(l.level);
-                let prefix = format!("{} ({:>7}) {}: ", l.level.letter(), l.meta.time_ms, l.tag);
+                let prefix = format!(
+                    "{}{} ({:>7}) {}: ",
+                    timestamp_prefix(timestamp),
+                    l.level.letter(),
+                    l.meta.time_ms,
+                    l.tag
+                );
                 let indent = prefix.chars().count();
                 if let Some(gap) = l.meta.gap {
                     warn_line(
                         &format!("--- missed {gap} packet(s) before seq {} ---", l.meta.seq),
                         use_color,
+                        timestamp,
                     );
                 }
                 term::print_log_line(&prefix, &l.message, color_code, indent, width, use_color);
+                *plain_text_line_start = true;
             }
             DecodedPacket::Dropped(d) => {
                 warn_line(
@@ -143,12 +168,15 @@ fn handle_outcome(
                         d.count, d.meta.seq, d.meta.time_ms
                     ),
                     use_color,
+                    timestamp,
                 );
+                *plain_text_line_start = true;
             }
             DecodedPacket::Buffer(b) => {
                 let color_code = level_color(b.level);
                 let header = format!(
-                    "{} ({:>7}) {} [buf {} @{} +{}]: <buffer dump, {} bytes>",
+                    "{}{} ({:>7}) {} [buf {} @{} +{}]: <buffer dump, {} bytes>",
+                    timestamp_prefix(timestamp),
                     b.level.letter(),
                     b.meta.time_ms,
                     b.tag,
@@ -167,7 +195,8 @@ fn handle_outcome(
                 } else {
                     println!("{header}");
                 }
-                print_hexdump(&b.bytes, color_code, use_color);
+                print_hexdump(&b.bytes, color_code, use_color, timestamp);
+                *plain_text_line_start = true;
             }
             DecodedPacket::Other {
                 meta,
@@ -191,15 +220,23 @@ fn handle_outcome(
         Outcome::CrcMismatch => eprintln!("on9log: frame failed CRC, discarded"),
         Outcome::Truncated => eprintln!("on9log: truncated frame discarded"),
         Outcome::LengthMismatch => eprintln!("on9log: frame payload length mismatch, discarded"),
+        Outcome::FrameTooLong => {
+            eprintln!("on9log: transport frame exceeded maximum length, discarded")
+        }
+        Outcome::UnknownFrameType(t) => {
+            eprintln!("on9log: unknown transport frame type 0x{t:02x}, discarded");
+        }
+        Outcome::InvalidEscape => eprintln!("on9log: invalid SLIP escape, discarded"),
         Outcome::PlainText(bytes) => {
             let mut out = std::io::stdout().lock();
-            let _ = out.write_all(&bytes);
+            let _ = write_plain_text(&mut out, &bytes, timestamp, plain_text_line_start);
             let _ = out.flush();
         }
     }
 }
 
-fn warn_line(msg: &str, use_color: bool) {
+fn warn_line(msg: &str, use_color: bool, timestamp: bool) {
+    let msg = format!("{}{}", timestamp_prefix(timestamp), msg);
     if use_color {
         println!(
             "{DIM}{YELLOW}{msg}{RESET}",
@@ -212,7 +249,7 @@ fn warn_line(msg: &str, use_color: bool) {
     }
 }
 
-fn print_hexdump(bytes: &[u8], color_code: &str, use_color: bool) {
+fn print_hexdump(bytes: &[u8], color_code: &str, use_color: bool, timestamp: bool) {
     const BYTES_PER_LINE: usize = 16;
     for (i, chunk) in bytes.chunks(BYTES_PER_LINE).enumerate() {
         let addr = (i * BYTES_PER_LINE) as u32;
@@ -227,7 +264,13 @@ fn print_hexdump(bytes: &[u8], color_code: &str, use_color: bool) {
                 }
             })
             .collect();
-        let line = format!("{:08x}  {:<48}  {}", addr, hex.join(" "), ascii);
+        let line = format!(
+            "{}{:08x}  {:<48}  {}",
+            timestamp_prefix(timestamp),
+            addr,
+            hex.join(" "),
+            ascii
+        );
         if use_color {
             println!(
                 "{color}{line}{RESET}",
@@ -237,5 +280,97 @@ fn print_hexdump(bytes: &[u8], color_code: &str, use_color: bool) {
         } else {
             println!("{line}");
         }
+    }
+}
+
+fn write_plain_text<W: Write>(
+    out: &mut W,
+    bytes: &[u8],
+    timestamp: bool,
+    line_start: &mut bool,
+) -> std::io::Result<()> {
+    for &b in bytes {
+        if timestamp && *line_start {
+            out.write_all(timestamp_prefix(true).as_bytes())?;
+            *line_start = false;
+        }
+        out.write_all(&[b])?;
+        if b == b'\n' {
+            *line_start = true;
+        }
+    }
+    Ok(())
+}
+
+fn timestamp_prefix(enabled: bool) -> String {
+    if !enabled {
+        return String::new();
+    }
+    format!("[{}] ", local_timestamp())
+}
+
+#[cfg(unix)]
+fn local_timestamp() -> String {
+    let mut tv = libc::timeval {
+        tv_sec: 0,
+        tv_usec: 0,
+    };
+    unsafe {
+        libc::gettimeofday(&mut tv, ptr::null_mut());
+    }
+
+    let secs: libc::time_t = tv.tv_sec;
+    let mut tm = std::mem::MaybeUninit::<libc::tm>::uninit();
+    let tm = unsafe {
+        if libc::localtime_r(&secs, tm.as_mut_ptr()).is_null() {
+            return "19700101-00:00:00.000".to_string();
+        }
+        tm.assume_init()
+    };
+    let millis = tv.tv_usec / 1000;
+
+    format!(
+        "{:04}{:02}{:02}-{:02}:{:02}:{:02}.{:03}",
+        tm.tm_year + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min,
+        tm.tm_sec,
+        millis
+    )
+}
+
+#[cfg(not(unix))]
+fn local_timestamp() -> String {
+    "19700101-00:00:00.000".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timestamps_each_plain_text_line() {
+        let mut out = Vec::new();
+        let mut line_start = true;
+        write_plain_text(&mut out, b"a\nb", true, &mut line_start).unwrap();
+        let s = String::from_utf8(out).unwrap();
+
+        assert_eq!(s.matches('[').count(), 2);
+        assert!(s.ends_with("b"));
+        assert!(!line_start);
+    }
+
+    #[test]
+    fn plain_text_timestamp_state_spans_chunks() {
+        let mut out = Vec::new();
+        let mut line_start = true;
+        write_plain_text(&mut out, b"a", true, &mut line_start).unwrap();
+        write_plain_text(&mut out, b"b\n", true, &mut line_start).unwrap();
+        let s = String::from_utf8(out).unwrap();
+
+        assert_eq!(s.matches('[').count(), 1);
+        assert!(line_start);
     }
 }

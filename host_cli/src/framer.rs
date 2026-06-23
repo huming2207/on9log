@@ -1,16 +1,17 @@
-//! SLIP deframing + CRC verification.
+//! Transport SLIP deframing + CRC verification.
 //!
-//! The ESP VFS sink wraps every packet as:
-//! `0xc0 SLIP(header) SLIP(payload) SLIP(crc16_le) 0xc0`.
-//! This module turns the raw UART byte stream into verified frames.
+//! The ESP VFS transport wraps both on9log packets and plain-text stdio as:
+//! `0xa5 SLIP(frame_type) SLIP(payload) SLIP(crc16_le) 0xc0`.
+//! This module turns the raw UART byte stream into verified typed frames.
 
 use crate::crc;
 use crate::wire::{
     HEADER_LEN, Header, PAYLOAD_LEN_STREAMING, SLIP_END, SLIP_ESC, SLIP_ESC_END, SLIP_ESC_ESC,
+    SLIP_ESC_START, SLIP_START, TRANSPORT_FRAME_ON9LOG, TRANSPORT_FRAME_TEXT,
+    TRANSPORT_MAX_PAYLOAD,
 };
 
-/// A fully decoded, CRC-verified raw frame: its 18-byte header bytes and the
-/// payload (header and payload are what the CRC covers).
+/// A fully decoded on9log packet carried inside a CRC-verified transport frame.
 #[derive(Debug, Clone)]
 pub struct RawFrame {
     pub header: Header,
@@ -28,12 +29,14 @@ pub enum Outcome {
     CrcMismatch,
     Truncated,
     LengthMismatch,
+    FrameTooLong,
+    UnknownFrameType(u8),
+    InvalidEscape,
 }
 
-/// Streaming SLIP deframer. Feed it arbitrary byte slices from the transport.
+/// Streaming transport deframer. Feed it arbitrary byte slices from the UART.
 pub struct Deframer {
     buf: Vec<u8>,
-    plain: Vec<u8>,
     in_frame: bool,
     escape: bool,
 }
@@ -48,7 +51,6 @@ impl Deframer {
     pub fn new() -> Self {
         Self {
             buf: Vec::with_capacity(256),
-            plain: Vec::with_capacity(256),
             in_frame: false,
             escape: false,
         }
@@ -60,25 +62,39 @@ impl Deframer {
         let mut out = Vec::new();
         for &b in data {
             if !self.in_frame {
-                if b == SLIP_END {
-                    if !self.plain.is_empty() {
-                        out.push(Outcome::PlainText(std::mem::take(&mut self.plain)));
-                    }
+                if b == SLIP_START {
                     self.in_frame = true;
                     self.escape = false;
                     self.buf.clear();
-                } else {
-                    self.plain.push(b);
                 }
                 continue;
             }
 
+            if self.escape {
+                let unescaped = match b {
+                    SLIP_ESC_END => Some(SLIP_END),
+                    SLIP_ESC_ESC => Some(SLIP_ESC),
+                    SLIP_ESC_START => Some(SLIP_START),
+                    _ => None,
+                };
+                if let Some(v) = unescaped {
+                    self.push_byte(v, &mut out);
+                } else {
+                    self.buf.clear();
+                    self.in_frame = false;
+                    out.push(Outcome::InvalidEscape);
+                }
+                self.escape = false;
+                continue;
+            }
+
             match b {
+                SLIP_START => {
+                    // A fresh unescaped start marker is a reliable resync point.
+                    self.buf.clear();
+                    self.escape = false;
+                }
                 SLIP_END => {
-                    if self.buf.is_empty() {
-                        self.escape = false;
-                        continue;
-                    }
                     if let Some(o) = Self::decode_frame(&self.buf) {
                         out.push(o);
                     }
@@ -87,56 +103,70 @@ impl Deframer {
                     self.in_frame = false;
                 }
                 SLIP_ESC => self.escape = true,
-                other if self.escape => {
-                    let unescaped = match other {
-                        SLIP_ESC_END => Some(SLIP_END),
-                        SLIP_ESC_ESC => Some(SLIP_ESC),
-                        _ => None, // invalid escape: drop this byte, stay lenient
-                    };
-                    if let Some(v) = unescaped {
-                        self.buf.push(v);
-                    }
-                    self.escape = false;
-                }
                 other => {
-                    self.buf.push(other);
+                    self.push_byte(other, &mut out);
                 }
             }
-        }
-        if !self.in_frame && !self.plain.is_empty() {
-            out.push(Outcome::PlainText(std::mem::take(&mut self.plain)));
         }
         out
     }
 
-    /// Decode one unescaped frame buffer into an `Outcome`.
+    fn push_byte(&mut self, byte: u8, out: &mut Vec<Outcome>) {
+        let max_frame_bytes = 1 + TRANSPORT_MAX_PAYLOAD + 2;
+        if self.buf.len() >= max_frame_bytes {
+            self.buf.clear();
+            self.in_frame = false;
+            self.escape = false;
+            out.push(Outcome::FrameTooLong);
+            return;
+        }
+        self.buf.push(byte);
+    }
+
+    /// Decode one unescaped transport frame buffer into an `Outcome`.
     fn decode_frame(buf: &[u8]) -> Option<Outcome> {
-        // header(18) + crc(2) is the minimum.
-        if buf.len() < HEADER_LEN + 2 {
+        // type(1) + crc(2) is the minimum transport frame.
+        if buf.len() < 3 {
             return Some(Outcome::Truncated);
         }
-        let header = match Header::parse(&buf[..HEADER_LEN]) {
+        let frame_type = buf[0];
+        let crc_bytes: [u8; 2] = [buf[buf.len() - 2], buf[buf.len() - 1]];
+        let payload = &buf[1..buf.len() - 2];
+        if payload.len() > TRANSPORT_MAX_PAYLOAD {
+            return Some(Outcome::FrameTooLong);
+        }
+
+        if !crc::verify(&buf[..1], payload, &crc_bytes) {
+            return Some(Outcome::CrcMismatch);
+        }
+
+        match frame_type {
+            TRANSPORT_FRAME_ON9LOG => Self::decode_on9log_payload(payload),
+            TRANSPORT_FRAME_TEXT => Some(Outcome::PlainText(payload.to_vec())),
+            other => Some(Outcome::UnknownFrameType(other)),
+        }
+    }
+
+    fn decode_on9log_payload(payload: &[u8]) -> Option<Outcome> {
+        // header(18) is the minimum inner on9log packet.
+        if payload.len() < HEADER_LEN {
+            return Some(Outcome::Truncated);
+        }
+        let header = match Header::parse(&payload[..HEADER_LEN]) {
             Some(h) => h,
             None => return Some(Outcome::BadMagic),
         };
-        let crc_bytes: [u8; 2] = [buf[buf.len() - 2], buf[buf.len() - 1]];
-        // Bytes covered by the CRC: header + payload (everything except the CRC).
-        let covered = &buf[..buf.len() - 2];
-        let payload = &covered[HEADER_LEN..];
-
-        if !crc::verify(&covered[..HEADER_LEN], payload, &crc_bytes) {
-            return Some(Outcome::CrcMismatch);
-        }
+        let inner_payload = &payload[HEADER_LEN..];
         if header.payload_len != PAYLOAD_LEN_STREAMING
-            && payload.len() != usize::from(header.payload_len)
+            && inner_payload.len() != usize::from(header.payload_len)
         {
             return Some(Outcome::LengthMismatch);
         }
 
         Some(Outcome::Frame(RawFrame {
             header,
-            header_bytes: buf[..HEADER_LEN].to_vec(),
-            payload: payload.to_vec(),
+            header_bytes: payload[..HEADER_LEN].to_vec(),
+            payload: inner_payload.to_vec(),
         }))
     }
 }
@@ -148,31 +178,46 @@ mod tests {
         ArgType, HEADER_LEN, Level, PACKET_MAGIC, PAYLOAD_LEN_STREAMING, PacketType,
     };
 
-    /// Build a full on9log SLIP frame exactly as `on9log_esp_vfs.c` would emit
-    /// it: `0xc0 SLIP(header) SLIP(payload) SLIP(crc_le) 0xc0`.
-    fn build_frame(header: &[u8], payload: &[u8]) -> Vec<u8> {
-        let crc = crate::crc::compute(header, payload);
+    /// Build a full typed transport frame exactly as `esp_stdio_log_vfs.c` emits
+    /// it: `0xa5 SLIP(type) SLIP(payload) SLIP(crc_le) 0xc0`.
+    fn build_transport_frame(frame_type: u8, payload: &[u8]) -> Vec<u8> {
+        let crc = crate::crc::compute(&[frame_type], payload);
         let mut inner = Vec::new();
-        inner.extend_from_slice(header);
         inner.extend_from_slice(payload);
         inner.extend_from_slice(&crc.to_le_bytes());
 
-        let mut out = vec![SLIP_END];
+        let mut out = vec![SLIP_START];
+        push_slip(frame_type, &mut out);
         for &b in &inner {
-            match b {
-                SLIP_END => {
-                    out.push(SLIP_ESC);
-                    out.push(SLIP_ESC_END);
-                }
-                SLIP_ESC => {
-                    out.push(SLIP_ESC);
-                    out.push(SLIP_ESC_ESC);
-                }
-                other => out.push(other),
-            }
+            push_slip(b, &mut out);
         }
         out.push(SLIP_END);
         out
+    }
+
+    fn build_on9log_frame(header: &[u8], payload: &[u8]) -> Vec<u8> {
+        let mut inner_payload = Vec::new();
+        inner_payload.extend_from_slice(header);
+        inner_payload.extend_from_slice(payload);
+        build_transport_frame(TRANSPORT_FRAME_ON9LOG, &inner_payload)
+    }
+
+    fn push_slip(byte: u8, out: &mut Vec<u8>) {
+        match byte {
+            SLIP_START => {
+                out.push(SLIP_ESC);
+                out.push(SLIP_ESC_START);
+            }
+            SLIP_END => {
+                out.push(SLIP_ESC);
+                out.push(SLIP_ESC_END);
+            }
+            SLIP_ESC => {
+                out.push(SLIP_ESC);
+                out.push(SLIP_ESC_ESC);
+            }
+            other => out.push(other),
+        }
     }
 
     fn make_header(seq: u16) -> Vec<u8> {
@@ -194,7 +239,7 @@ mod tests {
         payload.extend_from_slice(&42u32.to_le_bytes());
 
         let header = make_header(7);
-        let wire = build_frame(&header, &payload);
+        let wire = build_on9log_frame(&header, &payload);
 
         let mut d = Deframer::new();
         let outcomes = d.feed(&wire);
@@ -214,9 +259,9 @@ mod tests {
     fn detects_crc_corruption() {
         let payload = vec![0u8]; // arg_count 0
         let header = make_header(1);
-        let mut wire = build_frame(&header, &payload);
-        // Flip a payload byte (index: END + header_len).
-        let idx = 1 + HEADER_LEN;
+        let mut wire = build_on9log_frame(&header, &payload);
+        // Flip an escaped-frame byte after START + type.
+        let idx = 2 + HEADER_LEN;
         wire[idx] ^= 0xff;
         let mut d = Deframer::new();
         let outcomes = d.feed(&wire);
@@ -230,7 +275,7 @@ mod tests {
         let mut header = make_header(3);
         let len_offset = HEADER_LEN - 2;
         header[len_offset..HEADER_LEN].copy_from_slice(&4u16.to_le_bytes());
-        let wire = build_frame(&header, &payload);
+        let wire = build_on9log_frame(&header, &payload);
 
         let mut d = Deframer::new();
         let outcomes = d.feed(&wire);
@@ -243,7 +288,7 @@ mod tests {
         let mut payload = vec![1u8, ArgType::Bits32 as u8];
         payload.extend_from_slice(&0xc0_c0_c0_c0u32.to_le_bytes());
         let header = make_header(2);
-        let wire = build_frame(&header, &payload);
+        let wire = build_on9log_frame(&header, &payload);
 
         // Feed in two chunks to verify incremental deframing.
         let split = wire.len() / 2;
@@ -258,11 +303,24 @@ mod tests {
     }
 
     #[test]
-    fn emits_plain_text_before_slip_frame() {
+    fn emits_plain_text_frame() {
+        let wire = build_transport_frame(TRANSPORT_FRAME_TEXT, b"I (123) boot: hello\n");
+
+        let mut d = Deframer::new();
+        let outcomes = d.feed(&wire);
+        assert_eq!(outcomes.len(), 1);
+        match &outcomes[0] {
+            Outcome::PlainText(text) => assert_eq!(text, b"I (123) boot: hello\n"),
+            o => panic!("expected PlainText, got {o:?}"),
+        }
+    }
+
+    #[test]
+    fn handles_text_before_on9log_frame() {
         let payload = vec![0u8];
         let header = make_header(4);
-        let mut wire = b"I (123) boot: hello\n".to_vec();
-        wire.extend(build_frame(&header, &payload));
+        let mut wire = build_transport_frame(TRANSPORT_FRAME_TEXT, b"I (123) boot: hello\n");
+        wire.extend(build_on9log_frame(&header, &payload));
 
         let mut d = Deframer::new();
         let outcomes = d.feed(&wire);
@@ -276,30 +334,58 @@ mod tests {
 
     #[test]
     fn preserves_plain_text_across_split_feeds() {
+        let wire = build_transport_frame(TRANSPORT_FRAME_TEXT, b"I (1) tag: msg\n");
         let mut d = Deframer::new();
-        let outcomes = d.feed(b"I (");
+        let split = wire.len() / 2;
+        let outcomes = d.feed(&wire[..split]);
+        assert!(outcomes.is_empty());
+        let outcomes = d.feed(&wire[split..]);
         assert_eq!(outcomes.len(), 1);
         match &outcomes[0] {
-            Outcome::PlainText(text) => assert_eq!(text, b"I ("),
-            o => panic!("expected PlainText, got {o:?}"),
-        }
-
-        let outcomes = d.feed(b"1) tag: msg\n\xc0");
-        assert_eq!(outcomes.len(), 1);
-        match &outcomes[0] {
-            Outcome::PlainText(text) => assert_eq!(text, b"1) tag: msg\n"),
+            Outcome::PlainText(text) => assert_eq!(text, b"I (1) tag: msg\n"),
             o => panic!("expected PlainText, got {o:?}"),
         }
     }
 
     #[test]
-    fn emits_plain_text_without_slip_frame() {
+    fn ignores_bytes_outside_transport_frames() {
         let mut d = Deframer::new();
         let outcomes = d.feed(b"I (42) tag: text only\n");
+        assert!(outcomes.is_empty());
+    }
+
+    #[test]
+    fn resyncs_after_missing_start_marker() {
+        let payload = vec![0u8];
+        let header = make_header(5);
+        let first = build_on9log_frame(&header, &payload);
+        let second = build_on9log_frame(&make_header(6), &payload);
+        let mut wire = first[1..].to_vec();
+        wire.extend(second);
+
+        let mut d = Deframer::new();
+        let outcomes = d.feed(&wire);
         assert_eq!(outcomes.len(), 1);
         match &outcomes[0] {
-            Outcome::PlainText(text) => assert_eq!(text, b"I (42) tag: text only\n"),
-            o => panic!("expected PlainText, got {o:?}"),
+            Outcome::Frame(f) => assert_eq!(f.header.seq, 6),
+            o => panic!("expected Frame, got {o:?}"),
         }
+    }
+
+    #[test]
+    fn rejects_oversized_transport_frame() {
+        let mut wire = vec![SLIP_START];
+        wire.extend(std::iter::repeat_n(0x55, TRANSPORT_MAX_PAYLOAD + 4));
+        let mut d = Deframer::new();
+        let outcomes = d.feed(&wire);
+        assert!(matches!(outcomes[0], Outcome::FrameTooLong));
+    }
+
+    #[test]
+    fn rejects_invalid_escape_sequence() {
+        let wire = [SLIP_START, SLIP_ESC, SLIP_END];
+        let mut d = Deframer::new();
+        let outcomes = d.feed(&wire);
+        assert!(matches!(outcomes[0], Outcome::InvalidEscape));
     }
 }

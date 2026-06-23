@@ -363,6 +363,7 @@ dependencies = [
  "clap",
  "crossterm",
  "goblin",
+ "libc",
  "sprintf",
  "tokio",
  "tokio-serial",

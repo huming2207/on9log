@@ -15,7 +15,7 @@ typedef enum {
 
 typedef struct {
     uint8_t magic;        // ON9LOG_PACKET_MAGIC
-    uint8_t type_level;   // high nibble: on9log_packet_type_t, low nibble: esp_log_level_t
+    uint8_t type_level;   // high nibble: on9log_packet_type_t, low nibble: on9log_level_t
     uint16_t seq;         // wraps naturally
     uint32_t time_ms;     // milliseconds since boot, wraps naturally
     uint32_t tag_id;      // tag string address in ELF

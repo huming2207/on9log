@@ -23,7 +23,7 @@ ELF and maps those addresses back to strings.
 Important points:
 
 - `esp_log_set_vprintf()` does not catch ESP-IDF binary logs.
-- ESP-IDF binary logging writes raw bytes directly through ROM serial output.
+- ESP-IDF binary logging writes raw bytes through its own internal output path.
 - To forward binary logs in firmware, either patch ESP-IDF's binary formatter or
   implement a separate logger.
 - Network I/O should not happen directly in the logging path.
@@ -49,7 +49,7 @@ typedef enum {
 
 typedef struct {
     uint8_t  magic;       // ON9LOG_PACKET_MAGIC
-    uint8_t  type_level;  // high nibble: packet type, low nibble: log level
+    uint8_t  type_level;  // high nibble: packet type, low nibble: on9log_level_t
     uint16_t seq;         // wraps naturally
     uint32_t time_ms;     // milliseconds since boot, wraps naturally
     uint32_t tag_id;      // tag string address in ELF
@@ -67,9 +67,10 @@ a framing layer outside this raw byte stream.
 ## Default ESP VFS Sink
 
 `on9log_esp_vfs.c` provides the default framed ESP VFS sink. It calls
-`esp_stdio_log_vfs_init()`, registers an `on9log_sink_t`, and writes SLIP-framed packets
-to `STDOUT_FILENO`. Output fanout to ESP console VFS devices is owned by
-`esp_stdio_log_vfs.c`:
+`esp_stdio_log_vfs_init()`, registers an `on9log_sink_t`, buffers each raw on9log
+packet until `end_cb()`, and forwards it through the shared stdio transport
+framer as frame type `0x01`. Output fanout to ESP console VFS devices is owned
+by `esp_stdio_log_vfs.c`:
 
 - `/dev/uart/<CONFIG_ESP_CONSOLE_UART_NUM>` when console UART is enabled;
 - `/dev/usbserjtag` when USB Serial/JTAG console output is enabled;
@@ -78,31 +79,51 @@ to `STDOUT_FILENO`. Output fanout to ESP console VFS devices is owned by
 Additional outputs should be added through `esp_stdio_log_vfs_add_output(path)` before or
 after `on9log_esp_vfs_init()`.
 
-Because raw UART output has no packet boundary, this sink uses SLIP framing:
+Because raw UART output has no packet boundary, the stdio VFS transport uses an
+explicit-start typed SLIP envelope for both on9log binary packets and normal
+plain text:
 
 ```text
-0xc0
-SLIP(header bytes)
+0xa5
+SLIP(frame_type)
 SLIP(payload bytes)
 SLIP(crc16_ccitt_le)
 0xc0
 ```
 
-Both frame start and frame end are `0xc0`. Payload byte `0xc0` is escaped as
-`0xdb 0xdc`; payload byte `0xdb` is escaped as `0xdb 0xdd`.
+Frame type values:
+
+```text
+0x01  on9log binary packet (payload is on9log header + on9log payload)
+0x02  plain text stdout/stderr bytes
+```
+
+Frame start is `0xa5`; frame end is `0xc0`. Payload byte `0xa5` is escaped as
+`0xdb 0xde`; payload byte `0xc0` is escaped as `0xdb 0xdc`; payload byte `0xdb`
+is escaped as `0xdb 0xdd`.
 
 The CRC is CRC-16-CCITT with initial value `0xffff`, calculated over the
-unescaped packet header and payload bytes. The final two CRC bytes are appended
-little-endian and SLIP-escaped before the ending `0xc0`. The implementation is
-LUT-based and does not use the ESP ROM CRC implementation.
+unescaped frame type byte and payload bytes. The final two CRC bytes are
+appended little-endian and SLIP-escaped before the ending `0xc0`. The
+implementation is LUT-based and does not use the ESP ROM CRC implementation.
+
+`ESP_STDIO_LOG_VFS_FRAME_MAX_PAYLOAD` is currently 3072 bytes. Text writes are
+chunked into multiple text frames if needed. On9log binary packets are emitted as
+one transport frame; if `header + payload` exceeds the 3072-byte transport
+payload cap, the VFS sink drops that UART transport frame. The core packet stream
+in `on9log.c` is intentionally unchanged so non-UART sinks such as MQTT or
+WebSocket can forward raw on9log packet bytes without SLIP wrapping.
 
 The sink takes `esp_log_impl_lock()` from `start_cb()` through `end_cb()` so
-frames from different tasks/cores do not interleave on shared VFS outputs. It
-also takes `flockfile(stdout)` for the same interval, flushes `stdout` before
-the opening `0xc0`, and releases the file lock after writing the closing
-`0xc0`. This keeps SLIP frames from interleaving with normal stdio users such as
-`printf()`/`fprintf(stdout, ...)` that honor the `stdout` `FILE *` lock.
-`on9log_esp_vfs_init()` disables the core raw ROM UART output with
+on9log packet buffering does not interleave across tasks/cores. It also takes
+`flockfile(stdout)` for the same interval, flushes `stdout` before emitting the
+transport frame, and releases the file lock after the frame write. Normal stdio
+users such as `printf()`/`fprintf(stdout, ...)` are wrapped by
+`esp_stdio_log_vfs.c` as text frames. `esp_stdio_log_vfs_write_frame()` uses a
+dedicated transport mutex while writing raw bytes to the configured console fds,
+so stdout, stderr, and on9log binary transport frames share one byte-stream
+serialization point without relying on the ESP log lock. `on9log_esp_vfs_init()`
+disables the core raw ROM UART output with
 `on9log_set_uart_enabled(false)` so framed and unframed log streams are not
 mixed on the console.
 
@@ -142,6 +163,63 @@ The host decoder is expected to recover the format string from the ELF, parse
 the format string, read the argument type table, and consume the payload
 accordingly.
 
+## Core API And Configuration
+
+The core `on9log.h` / `on9log.c` packet producer does not depend on ESP-IDF log
+types or ESP-IDF error types. It defines:
+
+```c
+typedef enum {
+    ON9LOG_OK = 0,
+    ON9LOG_ERR_FAIL = -1,
+    ON9LOG_ERR_INVALID_ARG = -2,
+    ON9LOG_ERR_NO_MEM = -3,
+    ON9LOG_ERR_NOT_FOUND = -4,
+    ON9LOG_ERR_INVALID_SIZE = -5,
+} on9log_err_t;
+
+typedef enum {
+    ON9_LOG_LEVEL_NONE = 0,
+    ON9_LOG_LEVEL_ERROR = 1,
+    ON9_LOG_LEVEL_WARN = 2,
+    ON9_LOG_LEVEL_INFO = 3,
+    ON9_LOG_LEVEL_DEBUG = 4,
+    ON9_LOG_LEVEL_VERBOSE = 5,
+} on9log_level_t;
+```
+
+`ON9_LOGE/W/I/D/V()` and `ON9_LOG_BUF*()` use these on9log levels, not
+`ESP_LOG_*`. `ON9_LOG_ENABLED(level)` is controlled by `ON9_LOG_LOCAL_LEVEL`;
+users can define `ON9_LOG_LOCAL_LEVEL` before including `on9log.h` to override
+the default for one translation unit.
+
+In ESP-IDF builds, `Kconfig` exposes:
+
+```text
+CONFIG_ON9LOG_MAXIMUM_LEVEL
+CONFIG_ON9LOG_MAX_SINKS
+```
+
+`on9log_config.h` maps `CONFIG_ON9LOG_MAXIMUM_LEVEL` to the default
+`ON9_LOG_LOCAL_LEVEL` when the user has not defined it manually. Outside ESP-IDF,
+`on9log_config.h` falls back to INFO level and 4 sinks.
+
+Platform-specific services are isolated behind `on9log_port.h`:
+
+```c
+void on9log_port_lock(void);
+void on9log_port_unlock(void);
+uint32_t on9log_port_timestamp_ms(void);
+void on9log_port_write(const uint8_t *data, size_t len);
+```
+
+`on9log_port_weak.c` provides weak no-op/default implementations so the core can
+link on non-ESP targets. `on9log_esp_port.c` provides the ESP-IDF implementation
+using `esp_log_impl_lock()` and `esp_log_timestamp()`. It deliberately does not
+override `on9log_port_write()`: ESP-IDF console output should be provided by
+`on9log_esp_vfs.c`, which buffers a complete on9log packet and passes it to
+`esp_stdio_log_vfs_write_frame()`.
+
 Buffer dump packets use packet type `ON9LOG_PKT_BUFFER`. The `tag_id` field is
 the tag pointer and `fmt_id` is zero.
 
@@ -159,7 +237,8 @@ according to their own limits.
 
 ## Format And Tag Strings
 
-`ON9_LOGx()` macros place constant format strings in `.noload_keep_in_elf.*`.
+`ON9_LOGx()` macros place constant format strings in `.noload_keep_in_elf.*` on
+ELF targets by default.
 
 That means:
 
@@ -167,6 +246,12 @@ That means:
 - the string is not included in the flashed app binary;
 - the packet only sends `fmt_id`, the address of the format string;
 - the host needs the matching ELF to decode logs.
+
+`ON9_LOG_NOLOAD_ATTR` is overridable before including `on9log.h`. It defaults to
+the ESP-IDF/ELF `.noload_keep_in_elf.<counter>` section attribute, but is empty
+on Apple/Mach-O targets where that section spelling is invalid. This keeps the
+core header usable outside ESP-IDF while preserving the ESP-IDF no-load behavior
+for firmware builds.
 
 Tags are currently passed as pointer values too. If a tag is static, the host can
 resolve it from the ELF or from normal read-only sections.
@@ -274,7 +359,7 @@ reported explicitly by the dropped packet.
 
 `on9log` currently supports:
 
-- UART output through ROM serial output when enabled;
+- a platform `on9log_port_write()` hook for non-ESP or custom raw transports;
 - registered callback sinks using `on9log_add_sink()`.
 
 Sinks use a streaming interface:
@@ -388,6 +473,41 @@ bool enabled = __atomic_load_n(&s_uart_enabled, __ATOMIC_RELAXED);
 
 This keeps atomic code generation while usually avoiding `clangd`'s `_Atomic`
 type confusion.
+
+## Known Implementation Risks
+
+The current implementation is usable for the intended ESP32-S3 experiment, but
+these review findings are still open and should be treated as real constraints:
+
+- **Non-constant format strings are not rejected.** `ON9_LOG_ATTR_STR(str)` falls
+  back to `(str)` when `__builtin_constant_p(str)` is false. Such logs can still
+  compile, but the firmware only sends the pointer as `fmt_id`; the host resolver
+  expects format strings in `.noload` and will render unresolved dynamic formats
+  as `<fmt @0x........>`.
+- **Argument capture is ABI-reliant.** Type detection only special-cases a small
+  set of C/C++ types, then `on9log_emit_arg()` reads raw `uint32_t`, `uint64_t`,
+  pointer, or string values from `va_arg`. This is not a complete printf ABI
+  model: signed integer promotion, `double`/`float`, arbitrary pointer types,
+  and using `char *` with `%p` are still sharp edges.
+- **Public `on9log_write()` trusts `arg_types`.** The macro-generated type table
+  is NUL-terminated, but direct callers can pass a non-terminated or inconsistent
+  table. `on9log_arg_count()` will scan until `ON9_LOG_ARGS_TYPE_NONE` or
+  `UINT8_MAX`, so external callers must provide a valid table.
+- **Some VFS output errors are still hidden.** `esp_stdio_log_vfs_add_output()`
+  returns `ESP_OK` even if `open()` fails, and the on9log VFS sink currently
+  ignores the return value from `esp_stdio_log_vfs_write_frame()`. The shared
+  framed write path now handles short writes and reports failure to the stdio VFS
+  callback, but binary UART drops still surface mainly as host-side sequence gaps.
+- **Init failure has no rollback.** `esp_stdio_log_vfs_init()` can register the
+  VFS and redirect `stdout` before a later failure, and `on9log_esp_vfs_init()`
+  can fail after stdio redirection but before disabling the raw UART path. Failed
+  init should be considered potentially partially applied.
+- **Sink removal is not an in-flight callback barrier.** The lifetime rule in the
+  locking section is part of the API contract until teardown synchronization is
+  added.
+- **Firmware build has not been verified in this shell.** Rust host tests and
+  clippy passed, but `idf.py` was not available here, so C-side compatibility must
+  still be confirmed with the ESP-IDF build environment.
 
 ## Current Tradeoffs
 

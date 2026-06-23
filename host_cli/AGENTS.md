@@ -15,10 +15,11 @@ CRC, and ELF string strategy. This document only describes the host side.
 
 ## Goal
 
-Given a UART byte stream emitted by `on9log_esp_vfs.c`, recover individual
-packets, verify them, decode arguments, resolve format/tag strings from the
-matching firmware ELF, and render human-readable colored log output that wraps
-to the current terminal width.
+Given a UART byte stream emitted by `esp_stdio_log_vfs.c` /
+`on9log_esp_vfs.c`, recover individual typed transport frames, verify them,
+decode on9log binary packets, resolve format/tag strings from the matching
+firmware ELF, and render human-readable colored log output that wraps to the
+current terminal width.
 
 The decoder must also be usable as a library (e.g. from a Node.js binding via
 `napi-rs`), so the decoding core is kept free of any I/O / runtime dependency.
@@ -31,7 +32,7 @@ All multi-byte fields are little-endian. The packet header is **18 bytes**
 
 ```text
 magic        u8   0x9a
-type_level   u8   high nibble: packet type, low nibble: esp_log_level_t
+type_level   u8   high nibble: packet type, low nibble: on9log_level_t
 seq          u16  wraps naturally
 time_ms      u32  milliseconds since boot, wraps naturally
 tag_id       u32  tag string address in ELF
@@ -49,34 +50,47 @@ Packet types (`ON9LOG_PKT_*`):
 4  BUFFER
 ```
 
-Log levels (`esp_log_level_t`):
+Log levels (`on9log_level_t`):
 
 ```text
 0 NONE    1 ERROR    2 WARN    3 INFO    4 DEBUG    5 VERBOSE
 ```
 
-The ESP VFS sink frames each packet over raw UART with SLIP + a trailing
-CRC-16-CCITT:
+The ESP VFS transport frames both on9log binary packets and plain-text
+stdout/stderr bytes over raw UART with an explicit-start typed SLIP envelope and
+a trailing CRC-16-CCITT:
 
 ```text
-0xc0
-SLIP(header bytes)
+0xa5
+SLIP(frame_type)
 SLIP(payload bytes)
 SLIP(crc16_ccitt_le)
 0xc0
 ```
 
+Transport frame types:
+
+```text
+0x01  on9log binary packet (payload is the 18-byte on9log header + payload)
+0x02  plain text stdout/stderr bytes
+```
+
 SLIP escaping:
 
 ```text
+0xa5 -> 0xdb 0xde
 0xc0 -> 0xdb 0xdc
 0xdb -> 0xdb 0xdd
 ```
 
 CRC is CRC-16-CCITT (CCITT-FALSE): polynomial `0x1021`, initial value `0xffff`,
-no reflection, no final xor. It is computed over the unescaped header + payload
-only; the two resulting bytes are appended little-endian and then SLIP-escaped
-before the closing `0xc0`. The firmware uses a 256-entry LUT.
+no reflection, no final xor. It is computed over the unescaped frame type byte
+and payload bytes only; the two resulting bytes are appended little-endian and
+then SLIP-escaped before the closing `0xc0`. The firmware uses a 256-entry LUT.
+
+The transport payload cap is 3072 bytes. Text writes can arrive as multiple text
+frames. On9log binary packets that exceed the cap are dropped by the UART/VFS
+transport; the next received on9log packet should show a sequence gap.
 
 A normal LOG packet payload is:
 
@@ -123,12 +137,13 @@ distinct from transport loss detected by sequence gaps).
 ```text
 host_cli/
   Cargo.toml         lib + bin; deps: clap, tokio-serial, goblin, tokio,
-                     crossterm (terminal size), sprintf (printf rendering)
+                     crossterm (terminal size), sprintf (printf rendering),
+                     libc (local timestamp formatting on Unix)
   src/
     lib.rs           crate root, public re-exports
     wire.rs          header/types/levels/arg-type constants and Header::parse
     crc.rs           CRC-16-CCITT-FALSE (table-generated to match firmware LUT)
-    framer.rs        streaming SLIP deframer + CRC verification -> RawFrame
+    framer.rs        typed transport SLIP deframer + CRC verification -> RawFrame/plain text
     elf_resolv.rs    goblin-based address -> C-string resolver
     printf.rs        printf rendering via the `sprintf` crate (+ minimal scan)
     decode.rs        stateful Decoder: arg decode + packet dispatch + seq gaps
@@ -169,24 +184,28 @@ at runtime from polynomial `0x1021`; the standard check value "123456789" ->
 `0x29b1` is covered by a unit test.
 
 `framer.rs` holds the streaming `Deframer`. Feed it arbitrary byte slices. Bytes
-seen outside a SLIP frame are accumulated as third-party/plain-text output and
-returned as `Outcome::PlainText(Vec<u8>)` at the end of each feed call. Seeing
-`0xc0` outside a frame first flushes any pending plain text, then starts an
-on9log frame; bytes are then SLIP-unescaped until the next `0xc0`, which ends
-the frame and triggers CRC and header validation. `decode_frame` returns one of:
+seen outside a transport frame are ignored; this prevents a missed start marker
+from dumping binary packet debris to the terminal. Seeing `0xa5` starts a
+transport frame. Bytes are then SLIP-unescaped until `0xc0`, which ends the frame
+and triggers CRC/type validation. An unescaped `0xa5` inside a frame is treated
+as a resync point: the partial frame is discarded and a fresh frame begins.
+`decode_frame` returns one of:
 
 - `Outcome::Frame(RawFrame)` — header parsed, CRC verified;
-- `Outcome::PlainText(Vec<u8>)` — non-on9log text bytes seen before a frame;
+- `Outcome::PlainText(Vec<u8>)` — verified transport frame type `0x02`;
 - `Outcome::BadMagic` — magic byte not `0x9a`;
 - `Outcome::CrcMismatch` — CRC did not verify;
 - `Outcome::Truncated` — fewer than header + CRC bytes;
 - `Outcome::LengthMismatch` — non-streaming payload length did not match the
-  header's declared `payload_len`.
+  header's declared `payload_len`;
+- `Outcome::FrameTooLong` — decoded transport frame exceeded 3072 bytes;
+- `Outcome::UnknownFrameType(_)` — verified frame type was not `0x01` or `0x02`;
+- `Outcome::InvalidEscape` — bad SLIP escape sequence.
 
 Non-Frame outcomes never halt decoding. Bad SLIP frames are reported and the
-deframer returns to plain-text mode after the closing `0xc0`. For non-streaming
-packets (`payload_len != 0xffff`) the deframer also checks that the payload
-length matches the declared value.
+deframer returns to start-marker hunt mode. For non-streaming on9log packets
+(`payload_len != 0xffff`) the deframer also checks that the payload length
+matches the declared value.
 
 `elf_resolv.rs` parses the firmware ELF with goblin and builds an
 address-indexed table of string-bearing sections. It skips NOBITS/SHT_NOBITS
@@ -250,12 +269,14 @@ width, then indents continuation lines under the message. Color emission is
 suppressed when stdout is not a TTY (or when `--no-color` is passed).
 
 `main.rs` is the CLI. It uses clap with derive: `-p/--port` (required), `-b/--baud`
-(default 115200), `--elf` (optional firmware ELF path), `--no-color`, and
-`--width` (0 = auto-detect). It loads the ELF up front, builds a tokio runtime,
-opens the serial port via `tokio_serial::new(port, baud).open_native_async()`,
-and reads in a 4096-byte loop, feeding each chunk to the deframer. Plain-text
-outcomes are written to stdout as-is. Verified on9log frames are decoded and
-printed with the normal colored/wrapped presentation.
+(default 115200), `--elf` (optional firmware ELF path), `--no-color`,
+`-t/--timestamp`, and `--width` (0 = auto-detect). It loads the ELF up front,
+builds a tokio runtime, opens the serial port via
+`tokio_serial::new(port, baud).open_native_async()`, and reads in a 4096-byte
+loop, feeding each chunk to the deframer. Verified plain-text transport frames
+are written to stdout as-is unless `--timestamp` is set, in which case a local
+wall-clock prefix is inserted at each text line start. Verified on9log frames are
+decoded and printed with the normal colored/wrapped presentation.
 
 ## ELF No-Load String Resolution
 
@@ -315,6 +336,33 @@ If the section name, type, or addressing changes (e.g. a future linker-script
 rewrite makes it NOBITS or moves it to a real VMA), the resolver's
 `.noload`-name and VMA-0 special-casing must be revisited.
 
+## Known Implementation Risks
+
+The host tool currently passes its Rust unit tests and `cargo clippy -- -D
+warnings`, but these review findings are still open:
+
+- **LOG payloads are not fully strict.** `decode_log()` consumes the declared
+  argument count and argument bodies, but it does not currently reject extra bytes
+  left at the end of the payload. BUFFER and DROPPED packets already check exact
+  lengths.
+- **Formatter correctness depends on firmware ABI assumptions.** `printf.rs`
+  assumes the ESP32 32-bit ABI for default `int`, `long`, `size_t`, pointers, and
+  `ptrdiff_t`, and delegates conversion behavior to the `sprintf` crate. It is
+  suitable for the current ESP32-S3 target, but it is not a general cross-target
+  printf implementation.
+- **Unsupported or unusual printf conversions render as errors.** On a
+  `sprintf` error the CLI preserves the log by printing `<render error: ...>` plus
+  the original format string. This is intentional recovery, not complete printf
+  coverage.
+- **Decoded on9log messages lose repeated whitespace when wrapped.** `term::wrap`
+  splits on whitespace, so multiple spaces/tabs inside decoded messages are
+  collapsed. Verified type `0x02` text transport frames are written raw and are
+  not affected.
+- **Unframed bytes are intentionally ignored.** The host now only trusts
+  transport frames beginning with `0xa5`. Early boot output or third-party bytes
+  written before the stdio VFS transport is installed will not be displayed
+  unless they are wrapped as type `0x02` text frames.
+
 ## Output Format
 
 A decoded LOG line looks like:
@@ -326,6 +374,13 @@ I (   1234) TAG: rendered message goes here
 where `I` is the ESP-IDF level letter, the parenthesized number is `time_ms`
 since boot, then the tag, then the rendered message. Continuation lines (when
 the message wraps) are indented under the message.
+
+With `-t/--timestamp`, decoded log lines and plain-text transport lines are
+prefixed with local wall time:
+
+```text
+[YYYYmmdd-hh:mm:ss.sss] I (   1234) TAG: rendered message goes here
+```
 
 Level colors:
 
@@ -365,11 +420,13 @@ decoding.
   `crossterm::terminal::size()` (cross-platform `ioctl`); colors remain raw ANSI
   SGR codes emitted inline so wrapped lines stay colored.
 - **Streaming deframer.** The deframer accepts arbitrary byte boundaries,
-  passes through plain text outside SLIP frames, and accumulates from a starting
-  `0xc0` until a frame-ending `0xc0`, so partial reads and split frames are
-  handled naturally.
-- **Lenient recovery.** Bad magic, CRC mismatch, and truncation are reported but
-  do not halt the stream; the next `0xc0` resynchronizes.
+  ignores bytes outside explicit-start transport frames, and accumulates from a
+  starting `0xa5` until a frame-ending `0xc0`, so partial reads and split frames
+  are handled naturally. If the opening `0xa5` is missed, the parser hunts until
+  the next unescaped `0xa5` and resynchronizes.
+- **Lenient recovery.** Bad magic, CRC mismatch, invalid escapes, oversized
+  frames, and truncation are reported but do not halt the stream; the next
+  unescaped `0xa5` resynchronizes.
 - **printf scope.** Rendering is delegated to `sprintf`, which covers the
   conversions used by ESP-IDF-style log formats. On a `sprintf` error the format
   string is returned with a marker so the log line is not lost.
@@ -397,13 +454,14 @@ CLI flags:
 -b, --baud <BAUD>     baud rate                                    default 115200
     --elf <FILE>      firmware ELF for format/tag string resolution
     --no-color        disable colored output
+-t, --timestamp       prefix logs/text lines with local wall time
     --width <WIDTH>   override terminal width (0 = auto-detect)    default 0
 ```
 
 Tests:
 
 ```bash
-cargo test       # CRC, sprintf rendering, SLIP/plain-text framing, decode, ELF resolution
+cargo test       # CRC, sprintf rendering, typed SLIP framing, decode, ELF resolution
 cargo clippy     # 0 warnings
 ```
 

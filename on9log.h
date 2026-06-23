@@ -4,13 +4,29 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "esp_err.h"
-#include "esp_log_level.h"
-#include "esp_macros.h"
+#include "on9log_config.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+typedef enum {
+    ON9LOG_OK = 0,
+    ON9LOG_ERR_FAIL = -1,
+    ON9LOG_ERR_INVALID_ARG = -2,
+    ON9LOG_ERR_NO_MEM = -3,
+    ON9LOG_ERR_NOT_FOUND = -4,
+    ON9LOG_ERR_INVALID_SIZE = -5,
+} on9log_err_t;
+
+typedef enum {
+    ON9_LOG_LEVEL_NONE = 0,
+    ON9_LOG_LEVEL_ERROR = 1,
+    ON9_LOG_LEVEL_WARN = 2,
+    ON9_LOG_LEVEL_INFO = 3,
+    ON9_LOG_LEVEL_DEBUG = 4,
+    ON9_LOG_LEVEL_VERBOSE = 5,
+} on9log_level_t;
 
 typedef void (*on9log_sink_start_cb_t)(const uint8_t *header, size_t header_len, void *ctx);
 typedef void (*on9log_sink_payload_cb_t)(const uint8_t *payload,
@@ -26,18 +42,18 @@ typedef struct {
     on9log_sink_end_cb_t end_cb;
 } on9log_sink_t;
 
-esp_err_t on9log_add_sink(const on9log_sink_t *sink, void *ctx);
-esp_err_t on9log_remove_sink(const on9log_sink_t *sink, void *ctx);
+on9log_err_t on9log_add_sink(const on9log_sink_t *sink, void *ctx);
+on9log_err_t on9log_remove_sink(const on9log_sink_t *sink, void *ctx);
 void on9log_set_uart_enabled(bool enabled);
 uint32_t on9log_get_dropped_count(void);
 
-void on9log_write(esp_log_level_t level,
+void on9log_write(on9log_level_t level,
                   const char *tag,
                   const char *format,
                   const char *arg_types,
                   ...) __attribute__((format(printf, 3, 5)));
 
-void on9log_write_buffer(esp_log_level_t level,
+void on9log_write_buffer(on9log_level_t level,
                          const char *tag,
                          const void *buffer,
                          size_t buffer_len);
@@ -49,8 +65,20 @@ void on9log_write_buffer(esp_log_level_t level,
 #define ON9_LOG_STRINGIFY2(x) #x
 #define ON9_LOG_STRINGIFY(x) ON9_LOG_STRINGIFY2(x)
 
+#define ON9_LOG_VA_NARG(...) ON9_LOG_VA_NARG_IMPL(_, ##__VA_ARGS__, \
+    16, 15, 14, 13, 12, 11, 10, 9, \
+    8, 7, 6, 5, 4, 3, 2, 1, 0)
+#define ON9_LOG_VA_NARG_IMPL(_0, _1, _2, _3, _4, _5, _6, _7, _8, _9, \
+                             _10, _11, _12, _13, _14, _15, _16, N, ...) N
+
+#ifndef ON9_LOG_NOLOAD_ATTR
+#if defined(__APPLE__)
+#define ON9_LOG_NOLOAD_ATTR
+#else
 #define ON9_LOG_NOLOAD_ATTR \
     __attribute__((section(".noload_keep_in_elf." ON9_LOG_STRINGIFY(__COUNTER__))))
+#endif
+#endif
 
 #define ON9_LOG_NOLOAD_STR(str) \
     (__extension__({ \
@@ -186,30 +214,32 @@ constexpr unsigned long long ON9_LOG_DETECT_TYPE_IMPL(const T &, bool is_constan
 #endif
 
 #define ON9_LOG_ARGS_TYPE(...) (__extension__({ \
-    static const char __on9log_arg_types[] = { __VA_OPT__(ON9_LOG_INIT_ARG_TYPE(ESP_VA_NARG(__VA_ARGS__), __VA_ARGS__), ) 0 }; \
+    static const char __on9log_arg_types[] = { __VA_OPT__(ON9_LOG_INIT_ARG_TYPE(ON9_LOG_VA_NARG(__VA_ARGS__), __VA_ARGS__), ) 0 }; \
     (const char *)&__on9log_arg_types; \
 }))
 
+#define ON9_LOG_ENABLED(level) ((level) != ON9_LOG_LEVEL_NONE && (level) <= ON9_LOG_LOCAL_LEVEL)
+
 #define ON9_LOG_LEVEL(level, tag, format, ...) do { \
-        if (ESP_LOG_ENABLED(level)) { \
+        if (ON9_LOG_ENABLED(level)) { \
             on9log_write((level), (tag), ON9_LOG_ATTR_STR(format), ON9_LOG_ARGS_TYPE(__VA_ARGS__), ##__VA_ARGS__); \
         } \
     } while (0)
 
-#define ON9_LOGE(tag, format, ...) ON9_LOG_LEVEL(ESP_LOG_ERROR, tag, format, ##__VA_ARGS__)
-#define ON9_LOGW(tag, format, ...) ON9_LOG_LEVEL(ESP_LOG_WARN, tag, format, ##__VA_ARGS__)
-#define ON9_LOGI(tag, format, ...) ON9_LOG_LEVEL(ESP_LOG_INFO, tag, format, ##__VA_ARGS__)
-#define ON9_LOGD(tag, format, ...) ON9_LOG_LEVEL(ESP_LOG_DEBUG, tag, format, ##__VA_ARGS__)
-#define ON9_LOGV(tag, format, ...) ON9_LOG_LEVEL(ESP_LOG_VERBOSE, tag, format, ##__VA_ARGS__)
+#define ON9_LOGE(tag, format, ...) ON9_LOG_LEVEL(ON9_LOG_LEVEL_ERROR, tag, format, ##__VA_ARGS__)
+#define ON9_LOGW(tag, format, ...) ON9_LOG_LEVEL(ON9_LOG_LEVEL_WARN, tag, format, ##__VA_ARGS__)
+#define ON9_LOGI(tag, format, ...) ON9_LOG_LEVEL(ON9_LOG_LEVEL_INFO, tag, format, ##__VA_ARGS__)
+#define ON9_LOGD(tag, format, ...) ON9_LOG_LEVEL(ON9_LOG_LEVEL_DEBUG, tag, format, ##__VA_ARGS__)
+#define ON9_LOGV(tag, format, ...) ON9_LOG_LEVEL(ON9_LOG_LEVEL_VERBOSE, tag, format, ##__VA_ARGS__)
 
 #define ON9_LOG_BUF_LEVEL(level, tag, buffer, buffer_len) do { \
-        if (ESP_LOG_ENABLED(level)) { \
+        if (ON9_LOG_ENABLED(level)) { \
             on9log_write_buffer((level), (tag), (buffer), (buffer_len)); \
         } \
     } while (0)
 
-#define ON9_LOG_BUFE(tag, buffer, buffer_len) ON9_LOG_BUF_LEVEL(ESP_LOG_ERROR, tag, buffer, buffer_len)
-#define ON9_LOG_BUFW(tag, buffer, buffer_len) ON9_LOG_BUF_LEVEL(ESP_LOG_WARN, tag, buffer, buffer_len)
-#define ON9_LOG_BUFI(tag, buffer, buffer_len) ON9_LOG_BUF_LEVEL(ESP_LOG_INFO, tag, buffer, buffer_len)
-#define ON9_LOG_BUFD(tag, buffer, buffer_len) ON9_LOG_BUF_LEVEL(ESP_LOG_DEBUG, tag, buffer, buffer_len)
-#define ON9_LOG_BUFV(tag, buffer, buffer_len) ON9_LOG_BUF_LEVEL(ESP_LOG_VERBOSE, tag, buffer, buffer_len)
+#define ON9_LOG_BUFE(tag, buffer, buffer_len) ON9_LOG_BUF_LEVEL(ON9_LOG_LEVEL_ERROR, tag, buffer, buffer_len)
+#define ON9_LOG_BUFW(tag, buffer, buffer_len) ON9_LOG_BUF_LEVEL(ON9_LOG_LEVEL_WARN, tag, buffer, buffer_len)
+#define ON9_LOG_BUFI(tag, buffer, buffer_len) ON9_LOG_BUF_LEVEL(ON9_LOG_LEVEL_INFO, tag, buffer, buffer_len)
+#define ON9_LOG_BUFD(tag, buffer, buffer_len) ON9_LOG_BUF_LEVEL(ON9_LOG_LEVEL_DEBUG, tag, buffer, buffer_len)
+#define ON9_LOG_BUFV(tag, buffer, buffer_len) ON9_LOG_BUF_LEVEL(ON9_LOG_LEVEL_VERBOSE, tag, buffer, buffer_len)

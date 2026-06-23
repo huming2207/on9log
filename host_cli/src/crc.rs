@@ -1,7 +1,7 @@
-//! CRC-16-CCITT (CCITT-FALSE) matching `on9log_esp_vfs.c`.
+//! CRC-16-CCITT (CCITT-FALSE) matching `esp_stdio_log_vfs.c`.
 //!
 //! Initial value `0xffff`, polynomial `0x1021`, no reflection, no final xor.
-//! The firmware appends the result little-endian after SLIP-escaping.
+//! The firmware appends the little-endian result before SLIP-escaping it.
 
 const POLY: u16 = 0x1021;
 
@@ -29,8 +29,7 @@ fn table_entry(idx: u16) -> u16 {
     crc
 }
 
-/// Compute CRC-16-CCITT over `header` followed by `payload`, the exact byte
-/// span the firmware covers before appending the checksum.
+/// Compute CRC-16-CCITT over `header` followed by `payload`.
 pub fn compute(header: &[u8], payload: &[u8]) -> u16 {
     let mut crc = super::wire::CRC16_CCITT_INIT;
     crc = update(crc, header);

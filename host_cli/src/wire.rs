@@ -7,15 +7,20 @@ pub const PACKET_MAGIC: u8 = 0x9a;
 pub const PAYLOAD_LEN_STREAMING: u16 = 0xffff;
 pub const HEADER_LEN: usize = 18;
 pub const NULL_STRING_LEN: u32 = 0xffff_ffff;
+pub const TRANSPORT_MAX_PAYLOAD: usize = 3 * 1024;
+pub const TRANSPORT_FRAME_ON9LOG: u8 = 0x01;
+pub const TRANSPORT_FRAME_TEXT: u8 = 0x02;
 
-/// CRC-16-CCITT (CCITT-FALSE) initial value, matching `on9log_esp_vfs.c`.
+/// CRC-16-CCITT (CCITT-FALSE) initial value, matching `esp_stdio_log_vfs.c`.
 pub const CRC16_CCITT_INIT: u16 = 0xffff;
 
-/// SLIP framing bytes from `on9log_esp_vfs.c`.
+/// Transport framing bytes from `esp_stdio_log_vfs.c`.
+pub const SLIP_START: u8 = 0xa5;
 pub const SLIP_END: u8 = 0xc0;
 pub const SLIP_ESC: u8 = 0xdb;
 pub const SLIP_ESC_END: u8 = 0xdc;
 pub const SLIP_ESC_ESC: u8 = 0xdd;
+pub const SLIP_ESC_START: u8 = 0xde;
 
 /// Packet type, stored in the high nibble of `type_level`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,7 +46,7 @@ impl PacketType {
     }
 }
 
-/// `esp_log_level_t` values, stored in the low nibble of `type_level`.
+/// `on9log_level_t` values, stored in the low nibble of `type_level`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Level {
@@ -103,7 +108,7 @@ impl ArgType {
     }
 }
 
-/// Parsed 16-byte packet header.
+/// Parsed 18-byte packet header.
 #[derive(Debug, Clone, Copy)]
 pub struct Header {
     pub magic: u8,

@@ -1,0 +1,47 @@
+menu "on9log"
+
+    choice ON9LOG_MAXIMUM_LEVEL_CHOICE
+        prompt "Maximum compiled on9log level"
+        default ON9LOG_MAXIMUM_LEVEL_INFO
+        help
+            Sets the default compile-time maximum level used by ON9_LOGx()
+            macros when ON9_LOG_LOCAL_LEVEL is not defined before including
+            on9log.h.
+
+        config ON9LOG_MAXIMUM_LEVEL_NONE
+            bool "None"
+
+        config ON9LOG_MAXIMUM_LEVEL_ERROR
+            bool "Error"
+
+        config ON9LOG_MAXIMUM_LEVEL_WARN
+            bool "Warning"
+
+        config ON9LOG_MAXIMUM_LEVEL_INFO
+            bool "Info"
+
+        config ON9LOG_MAXIMUM_LEVEL_DEBUG
+            bool "Debug"
+
+        config ON9LOG_MAXIMUM_LEVEL_VERBOSE
+            bool "Verbose"
+    endchoice
+
+    config ON9LOG_MAXIMUM_LEVEL
+        int
+        default 0 if ON9LOG_MAXIMUM_LEVEL_NONE
+        default 1 if ON9LOG_MAXIMUM_LEVEL_ERROR
+        default 2 if ON9LOG_MAXIMUM_LEVEL_WARN
+        default 3 if ON9LOG_MAXIMUM_LEVEL_INFO
+        default 4 if ON9LOG_MAXIMUM_LEVEL_DEBUG
+        default 5 if ON9LOG_MAXIMUM_LEVEL_VERBOSE
+
+    config ON9LOG_MAX_SINKS
+        int "Maximum on9log sinks"
+        range 1 16
+        default 4
+        help
+            Maximum number of callback sinks that the core on9log packet
+            producer can register.
+
+endmenu
