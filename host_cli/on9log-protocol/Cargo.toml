@@ -7,5 +7,6 @@ license.workspace = true
 
 [dependencies]
 addr2line.workspace = true
+crc.workspace = true
 goblin.workspace = true
 sprintf.workspace = true

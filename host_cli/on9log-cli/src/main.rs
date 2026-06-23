@@ -7,7 +7,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::ptr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
 use tokio::io::AsyncReadExt;
@@ -50,6 +50,14 @@ struct Cli {
     /// Do not reset ESP targets by toggling DTR/RTS when the port opens.
     #[arg(long)]
     no_esp_reset: bool,
+
+    /// Save decoded human-readable log output to a text file.
+    #[arg(short = 's', long)]
+    save: bool,
+
+    /// Path for --save output; defaults to on9log-UNIX_TIMESTAMP.log.
+    #[arg(long, value_name = "FILE", requires = "save")]
+    log_path: Option<PathBuf>,
 }
 
 fn level_color(level: Level) -> &'static str {
@@ -87,6 +95,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             None
         }
     };
+    let save = if cli.save {
+        Some(SaveLog::create(cli.log_path.clone())?)
+    } else {
+        None
+    };
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -99,6 +112,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         width,
         cli.timestamp,
         !cli.no_esp_reset,
+        save,
     ))?;
     Ok(())
 }
@@ -111,6 +125,7 @@ async fn run(
     width: usize,
     timestamp: bool,
     esp_reset: bool,
+    mut save: Option<SaveLog>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut serial = tokio_serial::new(&port, baud)
         .open_native_async()
@@ -124,15 +139,40 @@ async fn run(
     let mut decoder = Decoder::new();
     let mut crash_decoder = CrashDecoder::new();
     let mut buf = vec![0u8; 4096];
+    let mut stdin_buf = [0u8; 64];
     let mut plain_text = PlainTextState::new();
+    let mut save_plain_text = PlainTextState::new();
+    let mut monitor_keys = MonitorKeyState::new();
+    let mut stdin = tokio::io::stdin();
+    let raw_input = RawInputGuard::enter_if_interactive();
 
     eprintln!(
-        "on9log: listening on {port} @ {baud} baud (width {width}, esp-reset {})",
+        "on9log: listening on {port} @ {baud} baud (width {width}, esp-reset {}, quit Ctrl+] Ctrl+T)",
         if esp_reset { "on" } else { "off" }
     );
+    if let Some(save) = save.as_ref() {
+        eprintln!("on9log: saving decoded log to {}", save.path.display());
+    }
 
     loop {
-        let n = serial.read(&mut buf).await?;
+        let n = if raw_input.is_active() {
+            tokio::select! {
+                serial_read = serial.read(&mut buf) => serial_read?,
+                stdin_read = stdin.read(&mut stdin_buf) => {
+                    let n = stdin_read?;
+                    if n == 0 {
+                        continue;
+                    }
+                    if monitor_keys.feed(&stdin_buf[..n]) {
+                        eprintln!("on9log: quit requested");
+                        break;
+                    }
+                    continue;
+                }
+            }
+        } else {
+            serial.read(&mut buf).await?
+        };
         if n == 0 {
             // EOF on the device; stop.
             break;
@@ -147,12 +187,161 @@ async fn run(
                 timestamp,
                 &mut plain_text,
                 &mut crash_decoder,
+                save.as_mut(),
+                &mut save_plain_text,
             );
         }
     }
 
     Ok(())
 }
+
+struct SaveLog {
+    path: PathBuf,
+    file: std::fs::File,
+}
+
+impl SaveLog {
+    fn create(path: Option<PathBuf>) -> std::io::Result<Self> {
+        let path = path.unwrap_or_else(default_save_path);
+        let file = std::fs::File::create(&path)?;
+        Ok(Self { path, file })
+    }
+
+    fn write_all_immediate(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        self.file.write_all(bytes)?;
+        self.file.flush()?;
+        self.file.sync_data()
+    }
+
+    fn write_line(&mut self, line: &str) -> std::io::Result<()> {
+        self.file.write_all(line.as_bytes())?;
+        self.file.write_all(b"\n")?;
+        self.file.flush()?;
+        self.file.sync_data()
+    }
+}
+
+fn default_save_path() -> PathBuf {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    PathBuf::from(format!("on9log-{ts}.log"))
+}
+
+struct RawInputGuard {
+    active: bool,
+    #[cfg(unix)]
+    fd: std::os::fd::RawFd,
+    #[cfg(unix)]
+    original: libc::termios,
+}
+
+impl RawInputGuard {
+    fn enter_if_interactive() -> Self {
+        if !term::stdin_is_tty() {
+            return Self::inactive();
+        }
+        match enable_raw_input_mode() {
+            Ok(guard) => guard,
+            Err(e) => {
+                eprintln!("on9log: failed to enable terminal control keys: {e}");
+                Self::inactive()
+            }
+        }
+    }
+
+    fn inactive() -> Self {
+        Self {
+            active: false,
+            #[cfg(unix)]
+            fd: -1,
+            #[cfg(unix)]
+            original: unsafe { std::mem::zeroed() },
+        }
+    }
+
+    fn is_active(&self) -> bool {
+        self.active
+    }
+}
+
+impl Drop for RawInputGuard {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if self.active {
+            unsafe {
+                libc::tcsetattr(self.fd, libc::TCSANOW, &self.original);
+            }
+        }
+        #[cfg(not(unix))]
+        if self.active {
+            let _ = crossterm::terminal::disable_raw_mode();
+        }
+    }
+}
+
+#[cfg(unix)]
+fn enable_raw_input_mode() -> std::io::Result<RawInputGuard> {
+    use std::os::fd::AsRawFd;
+
+    let fd = std::io::stdin().as_raw_fd();
+    let mut original = std::mem::MaybeUninit::<libc::termios>::uninit();
+    if unsafe { libc::tcgetattr(fd, original.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let original = unsafe { original.assume_init() };
+    let mut raw = original;
+
+    // Non-canonical input lets Ctrl+] Ctrl+T arrive immediately. Keep output
+    // processing intact so monitor newlines are not affected.
+    raw.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ISIG | libc::IEXTEN);
+    raw.c_cc[libc::VMIN] = 1;
+    raw.c_cc[libc::VTIME] = 0;
+
+    if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    Ok(RawInputGuard {
+        active: true,
+        fd,
+        original,
+    })
+}
+
+#[cfg(not(unix))]
+fn enable_raw_input_mode() -> std::io::Result<RawInputGuard> {
+    crossterm::terminal::enable_raw_mode()?;
+    Ok(RawInputGuard { active: true })
+}
+
+struct MonitorKeyState {
+    saw_ctrl_rbracket: bool,
+}
+
+impl MonitorKeyState {
+    fn new() -> Self {
+        Self {
+            saw_ctrl_rbracket: false,
+        }
+    }
+
+    fn feed(&mut self, bytes: &[u8]) -> bool {
+        for &b in bytes {
+            match (self.saw_ctrl_rbracket, b) {
+                (true, CTRL_T) => return true,
+                (_, CTRL_RBRACKET) => self.saw_ctrl_rbracket = true,
+                _ => self.saw_ctrl_rbracket = false,
+            }
+        }
+        false
+    }
+}
+
+const CTRL_RBRACKET: u8 = 0x1d;
+const CTRL_T: u8 = 0x14;
 
 fn esp_hard_reset<P: SerialPort>(port: &mut P) -> tokio_serial::Result<()> {
     // ESP dev boards wire DTR to GPIO0 and RTS to EN through active-low
@@ -174,6 +363,8 @@ fn handle_outcome(
     timestamp: bool,
     plain_text: &mut PlainTextState,
     crash_decoder: &mut CrashDecoder,
+    mut save: Option<&mut SaveLog>,
+    save_plain_text: &mut PlainTextState,
 ) {
     match outcome {
         Outcome::Frame(frame) => match decoder.decode(&frame, elf) {
@@ -188,25 +379,30 @@ fn handle_outcome(
                 );
                 let indent = prefix.chars().count();
                 if let Some(gap) = l.meta.gap {
-                    warn_line(
-                        &format!("--- missed {gap} packet(s) before seq {} ---", l.meta.seq),
-                        use_color,
-                        timestamp,
-                    );
+                    let msg = format!("--- missed {gap} packet(s) before seq {} ---", l.meta.seq);
+                    warn_line(&msg, use_color, timestamp);
+                    if let Some(save) = save.as_deref_mut() {
+                        let _ = save.write_line(&format!("{}{}", timestamp_prefix(timestamp), msg));
+                    }
                 }
                 term::print_log_line(&prefix, &l.message, color_code, indent, width, use_color);
+                if let Some(save) = save.as_deref_mut() {
+                    let _ = save.write_line(&format!("{prefix}{}", l.message));
+                }
                 plain_text.reset_line();
+                save_plain_text.reset_line();
             }
             DecodedPacket::Dropped(d) => {
-                warn_line(
-                    &format!(
-                        "--- device dropped {} packet(s) at seq {} (t={}ms) ---",
-                        d.count, d.meta.seq, d.meta.time_ms
-                    ),
-                    use_color,
-                    timestamp,
+                let msg = format!(
+                    "--- device dropped {} packet(s) at seq {} (t={}ms) ---",
+                    d.count, d.meta.seq, d.meta.time_ms
                 );
+                warn_line(&msg, use_color, timestamp);
+                if let Some(save) = save.as_deref_mut() {
+                    let _ = save.write_line(&format!("{}{}", timestamp_prefix(timestamp), msg));
+                }
                 plain_text.reset_line();
+                save_plain_text.reset_line();
             }
             DecodedPacket::Buffer(b) => {
                 let color_code = level_color(b.level);
@@ -231,8 +427,15 @@ fn handle_outcome(
                 } else {
                     println!("{header}");
                 }
+                if let Some(save) = save.as_deref_mut() {
+                    let _ = save.write_line(&header);
+                }
                 print_hexdump(&b.bytes, color_code, use_color, timestamp);
+                if let Some(save) = save.as_deref_mut() {
+                    let _ = write_hexdump_to_file(save, &b.bytes, timestamp);
+                }
                 plain_text.reset_line();
+                save_plain_text.reset_line();
             }
             DecodedPacket::Other {
                 meta,
@@ -266,8 +469,15 @@ fn handle_outcome(
         Outcome::PlainText(bytes) => {
             let mut out = std::io::stdout().lock();
             let _ = write_plain_text(&mut out, &bytes, timestamp, plain_text);
+            if let Some(save) = save.as_deref_mut() {
+                let _ = write_plain_text_saved(save, &bytes, timestamp, save_plain_text);
+            }
             for annotation in crash_decoder.feed(&bytes, elf) {
                 let _ = write_plain_annotation(&mut out, &annotation, timestamp);
+                if let Some(save) = save.as_deref_mut() {
+                    let _ =
+                        save.write_line(&format!("{}{}", timestamp_prefix(timestamp), annotation));
+                }
             }
             let _ = out.flush();
         }
@@ -276,16 +486,28 @@ fn handle_outcome(
 
 struct PlainTextState {
     line_start: bool,
+    ansi: AnsiStripState,
 }
 
 impl PlainTextState {
     fn new() -> Self {
-        Self { line_start: true }
+        Self {
+            line_start: true,
+            ansi: AnsiStripState::Ground,
+        }
     }
 
     fn reset_line(&mut self) {
         self.line_start = true;
+        self.ansi = AnsiStripState::Ground;
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AnsiStripState {
+    Ground,
+    Escape,
+    Csi,
 }
 
 fn warn_line(msg: &str, use_color: bool, timestamp: bool) {
@@ -336,6 +558,32 @@ fn print_hexdump(bytes: &[u8], color_code: &str, use_color: bool, timestamp: boo
     }
 }
 
+fn write_hexdump_to_file(save: &mut SaveLog, bytes: &[u8], timestamp: bool) -> std::io::Result<()> {
+    const BYTES_PER_LINE: usize = 16;
+    for (i, chunk) in bytes.chunks(BYTES_PER_LINE).enumerate() {
+        let addr = (i * BYTES_PER_LINE) as u32;
+        let hex: Vec<String> = chunk.iter().map(|b| format!("{:02x}", b)).collect();
+        let ascii: String = chunk
+            .iter()
+            .map(|&b| {
+                if (0x20..0x7f).contains(&b) {
+                    b as char
+                } else {
+                    '.'
+                }
+            })
+            .collect();
+        save.write_line(&format!(
+            "{}{:08x}  {:<48}  {}",
+            timestamp_prefix(timestamp),
+            addr,
+            hex.join(" "),
+            ascii
+        ))?;
+    }
+    Ok(())
+}
+
 fn write_plain_text<W: Write>(
     out: &mut W,
     bytes: &[u8],
@@ -363,6 +611,62 @@ fn write_plain_annotation<W: Write>(
     out.write_all(timestamp_prefix(timestamp).as_bytes())?;
     out.write_all(line.as_bytes())?;
     out.write_all(b"\n")
+}
+
+fn write_plain_text_saved(
+    save: &mut SaveLog,
+    bytes: &[u8],
+    timestamp: bool,
+    state: &mut PlainTextState,
+) -> std::io::Result<()> {
+    let clean = strip_ansi_stream(bytes, &mut state.ansi);
+    let mut out = Vec::with_capacity(clean.len() + 32);
+    for &b in &clean {
+        if timestamp && state.line_start {
+            out.extend_from_slice(timestamp_prefix(true).as_bytes());
+            state.line_start = false;
+        }
+        out.push(b);
+        if b == b'\n' {
+            state.line_start = true;
+        }
+    }
+    save.write_all_immediate(&out)?;
+    Ok(())
+}
+
+#[cfg(test)]
+fn strip_ansi(bytes: &[u8]) -> Vec<u8> {
+    let mut state = AnsiStripState::Ground;
+    strip_ansi_stream(bytes, &mut state)
+}
+
+fn strip_ansi_stream(bytes: &[u8], state: &mut AnsiStripState) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    for &b in bytes {
+        match *state {
+            AnsiStripState::Ground => {
+                if b == 0x1b {
+                    *state = AnsiStripState::Escape;
+                } else {
+                    out.push(b);
+                }
+            }
+            AnsiStripState::Escape => {
+                if b == b'[' {
+                    *state = AnsiStripState::Csi;
+                } else {
+                    *state = AnsiStripState::Ground;
+                }
+            }
+            AnsiStripState::Csi => {
+                if (0x40..=0x7e).contains(&b) {
+                    *state = AnsiStripState::Ground;
+                }
+            }
+        }
+    }
+    out
 }
 
 fn timestamp_prefix(enabled: bool) -> String {
@@ -472,5 +776,59 @@ mod tests {
             String::from_utf8(out).unwrap(),
             "--- 0x42000000: app_main\n"
         );
+    }
+
+    #[test]
+    fn default_save_path_uses_unix_timestamp_shape() {
+        let path = default_save_path();
+        let name = path.file_name().unwrap().to_string_lossy();
+        assert!(name.starts_with("on9log-"));
+        assert!(name.ends_with(".log"));
+        assert!(
+            name["on9log-".len()..name.len() - ".log".len()]
+                .chars()
+                .all(|c| c.is_ascii_digit())
+        );
+    }
+
+    #[test]
+    fn strip_ansi_removes_color_sequences() {
+        assert_eq!(
+            strip_ansi(b"\x1b[0;32mI (1) tag: colored\x1b[0m\n"),
+            b"I (1) tag: colored\n"
+        );
+    }
+
+    #[test]
+    fn strip_ansi_stream_handles_split_sequences() {
+        let mut state = AnsiStripState::Ground;
+        let mut out = strip_ansi_stream(b"\x1b[0;", &mut state);
+        assert_eq!(out, b"");
+        out.extend(strip_ansi_stream(b"32mgreen\x1b", &mut state));
+        out.extend(strip_ansi_stream(b"[0m\n", &mut state));
+        assert_eq!(out, b"green\n");
+        assert_eq!(state, AnsiStripState::Ground);
+    }
+
+    #[test]
+    fn monitor_keys_quit_on_ctrl_rbracket_then_ctrl_t() {
+        let mut keys = MonitorKeyState::new();
+        assert!(!keys.feed(&[CTRL_RBRACKET]));
+        assert!(keys.feed(&[CTRL_T]));
+    }
+
+    #[test]
+    fn monitor_keys_quit_sequence_can_span_chunks() {
+        let mut keys = MonitorKeyState::new();
+        assert!(!keys.feed(b"abc"));
+        assert!(!keys.feed(&[CTRL_RBRACKET]));
+        assert!(keys.feed(&[CTRL_T]));
+    }
+
+    #[test]
+    fn monitor_keys_reset_on_other_byte() {
+        let mut keys = MonitorKeyState::new();
+        assert!(!keys.feed(&[CTRL_RBRACKET, b'x', CTRL_T]));
+        assert!(!keys.feed(&[CTRL_T]));
     }
 }

@@ -147,7 +147,7 @@ host_cli/
   Cargo.toml                 workspace root and shared dependency versions
   Cargo.lock
   on9log-protocol/
-    Cargo.toml               protocol library; deps: goblin, addr2line, sprintf
+    Cargo.toml               protocol library; deps: crc, goblin, addr2line, sprintf
     src/
       lib.rs                 protocol crate root, public re-exports
       wire.rs                header/types/levels/arg-type constants and Header::parse
@@ -302,13 +302,16 @@ function+offset or `<unresolved>`.
 
 `main.rs` is the CLI. It uses clap with derive: `-p/--port` (required), `-b/--baud`
 (default 115200), `--elf` (optional firmware ELF path), `--no-color`,
-`-t/--timestamp`, `--width` (0 = auto-detect), and `--no-esp-reset`. It loads the
-ELF up front, builds a tokio runtime, opens the serial port via
+`-t/--timestamp`, `--width` (0 = auto-detect), `--no-esp-reset`, `-s/--save`,
+and `--log-path`. It loads the ELF up front, builds a tokio runtime, opens the serial port via
 `tokio_serial::new(port, baud).open_native_async()`, and by default performs an
 ESP hard reset by releasing DTR/GPIO0, asserting RTS/EN for 100 ms, then
 releasing RTS/EN and waiting another 100 ms. `--no-esp-reset` disables this
 startup reset. The read loop uses 4096-byte chunks and feeds each chunk to the
-deframer.
+deframer. When stdin is a TTY, the CLI also puts stdin into non-canonical,
+no-echo input mode and exits on the two-key monitor sequence `Ctrl+]` followed
+by `Ctrl+T`. On Unix this preserves output processing, so normal `\n` log output
+continues to render correctly.
 
 Verified plain-text transport frames and printable raw UART text are written to
 stdout byte-for-byte unless `--timestamp` is set, in which case a local
@@ -317,6 +320,15 @@ infer colors from `I/W/E/D/V` prefixes; ANSI SGR color bytes emitted by the
 device are preserved. Verified on9log frames are decoded and printed with the
 normal colored/wrapped presentation. Crash annotations are appended after the
 original plain-text crash lines.
+
+When `-s/--save` is enabled, the CLI writes a decoded human-readable text log to
+disk. `--log-path <FILE>` chooses the output path; otherwise the default is
+`on9log-UNIX_TIMESTAMP.log`, where the timestamp is seconds since the UTC Unix
+epoch. Binary on9log packets are saved after host decoding, not as raw binary
+frames. Plain-text device output is saved with ANSI escape sequences stripped so
+the file stays readable. If `-t/--timestamp` is enabled, the same local timestamp
+prefix is included in the saved file. File writes are flushed and `sync_data()`ed
+after each decoded/logged item so the file is updated immediately.
 
 ## ELF No-Load String Resolution
 
@@ -470,6 +482,14 @@ decoding.
   active-low wiring: DTR false (GPIO0 released), RTS true (EN asserted low),
   100 ms delay, RTS false (EN released), 100 ms delay. Use `--no-esp-reset` for
   RAM-loaded apps or when attaching without rebooting.
+- **Monitor quit sequence.** Interactive CLI sessions quit with `Ctrl+]` then
+  `Ctrl+T`, matching monitor-style tools that avoid using `Ctrl-C` as the normal
+  escape path. The sequence is detected from stdin while serial reads continue
+  asynchronously.
+- **Save file output.** `-s/--save` writes decoded text, not transport bytes.
+  ANSI is stripped only for the file sink; stdout still preserves device ANSI
+  bytes. Immediate persistence uses `flush()` plus `sync_data()` after writes,
+  favoring crash-time durability over maximum throughput.
 - **Crash decoding is opportunistic.** Panic text is still printed exactly as
   received. The host adds best-effort annotation lines when it sees known ESP
   panic/backtrace patterns and has enough ELF/DWARF information to resolve PCs.
@@ -506,6 +526,8 @@ CLI flags:
 -t, --timestamp       prefix logs/text lines with local wall time
     --width <WIDTH>   override terminal width (0 = auto-detect)    default 0
     --no-esp-reset    do not toggle DTR/RTS to reset on startup
+-s, --save            save decoded human-readable text log to file
+    --log-path <FILE> path for --save output; default on9log-UNIX_TIMESTAMP.log
 ```
 
 Tests:

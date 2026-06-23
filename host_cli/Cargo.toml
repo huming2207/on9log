@@ -17,5 +17,6 @@ crossterm = "0.29.0"
 goblin = "0.10"
 libc = "0.2"
 sprintf = "0.4.3"
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "io-util"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "io-util", "io-std"] }
 tokio-serial = "5.5.0"
+crc = "3.4.0"

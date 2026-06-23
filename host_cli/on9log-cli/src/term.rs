@@ -27,6 +27,11 @@ pub fn stdout_is_tty() -> bool {
     std::io::stdout().is_terminal()
 }
 
+/// Whether stdin is an interactive terminal (so monitor control keys can be read).
+pub fn stdin_is_tty() -> bool {
+    std::io::stdin().is_terminal()
+}
+
 /// ANSI SGR color codes used for log levels.
 pub mod color {
     pub const RESET: &str = "\x1b[0m";

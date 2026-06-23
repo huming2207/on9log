@@ -3,38 +3,14 @@
 //! Initial value `0xffff`, polynomial `0x1021`, no reflection, no final xor.
 //! The firmware appends the little-endian result before SLIP-escaping it.
 
-const POLY: u16 = 0x1021;
-
-/// Table-driven update identical to the firmware's LUT implementation:
-/// `crc = (crc << 8) ^ table[((crc >> 8) ^ byte) & 0xff]`.
-fn update(crc: u16, data: &[u8]) -> u16 {
-    let mut crc = crc;
-    for &b in data {
-        let idx = ((crc >> 8) ^ b as u16) & 0xff;
-        crc = (crc << 8) ^ table_entry(idx);
-    }
-    crc
-}
-
-#[inline]
-fn table_entry(idx: u16) -> u16 {
-    let mut crc = idx << 8;
-    for _ in 0..8 {
-        if crc & 0x8000 != 0 {
-            crc = (crc << 1) ^ POLY;
-        } else {
-            crc <<= 1;
-        }
-    }
-    crc
-}
+const CRC16_CCITT_FALSE: crc::Crc<u16> = crc::Crc::<u16>::new(&crc::CRC_16_IBM_3740);
 
 /// Compute CRC-16-CCITT over `header` followed by `payload`.
 pub fn compute(header: &[u8], payload: &[u8]) -> u16 {
-    let mut crc = super::wire::CRC16_CCITT_INIT;
-    crc = update(crc, header);
-    crc = update(crc, payload);
-    crc
+    let mut digest = CRC16_CCITT_FALSE.digest();
+    digest.update(header);
+    digest.update(payload);
+    digest.finalize()
 }
 
 /// Verify a frame: `crc_bytes` is the little-endian trailing checksum.
@@ -46,12 +22,10 @@ pub fn verify(header: &[u8], payload: &[u8], crc_bytes: &[u8; 2]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wire::CRC16_CCITT_INIT;
 
     // "123456789" with CRC-16/CCITT-FALSE = 0x29B1 (standard check value).
     #[test]
     fn ccitt_false_check_value() {
-        let crc = update(CRC16_CCITT_INIT, b"123456789");
-        assert_eq!(crc, 0x29b1);
+        assert_eq!(compute(b"123456789", b""), 0x29b1);
     }
 }
