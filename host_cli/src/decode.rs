@@ -173,8 +173,8 @@ impl Decoder {
             args.push(arg);
         }
 
-        let tag = resolve_cstr(elf, frame.header.tag_id);
-        let message = match elf.and_then(|e| e.read_cstr(frame.header.fmt_id)) {
+        let tag = resolve_tag(elf, frame.header.tag_id);
+        let message = match elf.and_then(|e| e.read_format(frame.header.fmt_id)) {
             Some(fmt) => printf::render(fmt, &args),
             None => {
                 // No format string available: show address and a compact arg dump.
@@ -220,7 +220,7 @@ impl Decoder {
         DecodedPacket::Buffer(BufferRecord {
             meta,
             level: frame.header.level,
-            tag: resolve_cstr(elf, frame.header.tag_id),
+            tag: resolve_tag(elf, frame.header.tag_id),
             total_len,
             offset,
             bytes,
@@ -295,9 +295,9 @@ fn take_u64(b: &mut &[u8]) -> Result<u64, String> {
     Ok(v)
 }
 
-fn resolve_cstr(elf: Option<&ElfStrings>, addr: u32) -> String {
+fn resolve_tag(elf: Option<&ElfStrings>, addr: u32) -> String {
     match elf {
-        Some(e) => match e.read_cstr(addr) {
+        Some(e) => match e.read_tag(addr) {
             Some(s) => s.to_string(),
             None => format!("@0x{:08x}", addr),
         },

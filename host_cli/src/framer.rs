@@ -103,6 +103,9 @@ impl Deframer {
                 }
             }
         }
+        if !self.in_frame && !self.plain.is_empty() {
+            out.push(Outcome::PlainText(std::mem::take(&mut self.plain)));
+        }
         out
     }
 
@@ -274,11 +277,28 @@ mod tests {
     #[test]
     fn preserves_plain_text_across_split_feeds() {
         let mut d = Deframer::new();
-        assert!(d.feed(b"I (").is_empty());
+        let outcomes = d.feed(b"I (");
+        assert_eq!(outcomes.len(), 1);
+        match &outcomes[0] {
+            Outcome::PlainText(text) => assert_eq!(text, b"I ("),
+            o => panic!("expected PlainText, got {o:?}"),
+        }
+
         let outcomes = d.feed(b"1) tag: msg\n\xc0");
         assert_eq!(outcomes.len(), 1);
         match &outcomes[0] {
-            Outcome::PlainText(text) => assert_eq!(text, b"I (1) tag: msg\n"),
+            Outcome::PlainText(text) => assert_eq!(text, b"1) tag: msg\n"),
+            o => panic!("expected PlainText, got {o:?}"),
+        }
+    }
+
+    #[test]
+    fn emits_plain_text_without_slip_frame() {
+        let mut d = Deframer::new();
+        let outcomes = d.feed(b"I (42) tag: text only\n");
+        assert_eq!(outcomes.len(), 1);
+        match &outcomes[0] {
+            Outcome::PlainText(text) => assert_eq!(text, b"I (42) tag: text only\n"),
             o => panic!("expected PlainText, got {o:?}"),
         }
     }

@@ -170,10 +170,10 @@ at runtime from polynomial `0x1021`; the standard check value "123456789" ->
 
 `framer.rs` holds the streaming `Deframer`. Feed it arbitrary byte slices. Bytes
 seen outside a SLIP frame are accumulated as third-party/plain-text output and
-returned as `Outcome::PlainText(Vec<u8>)` when the next `0xc0` is observed.
-Seeing `0xc0` outside a frame is treated as an on9log frame start; bytes are then
-SLIP-unescaped until the next `0xc0`, which ends the frame and triggers CRC and
-header validation. `decode_frame` returns one of:
+returned as `Outcome::PlainText(Vec<u8>)` at the end of each feed call. Seeing
+`0xc0` outside a frame first flushes any pending plain text, then starts an
+on9log frame; bytes are then SLIP-unescaped until the next `0xc0`, which ends
+the frame and triggers CRC and header validation. `decode_frame` returns one of:
 
 - `Outcome::Frame(RawFrame)` — header parsed, CRC verified;
 - `Outcome::PlainText(Vec<u8>)` — non-on9log text bytes seen before a frame;
@@ -189,13 +189,19 @@ packets (`payload_len != 0xffff`) the deframer also checks that the payload
 length matches the declared value.
 
 `elf_resolv.rs` parses the firmware ELF with goblin and builds an
-address-indexed table of every section that has both a non-zero virtual address
-and on-file bytes (skipping NOBITS/SHT_NOBITS sections, which carry no strings).
-`read_cstr(addr)` binary-searches for the section whose `[addr, end)` range
-contains the address and returns the NUL-terminated UTF-8 string. This resolves
-both format strings (in `.noload_keep_in_elf.*` sections) and tag strings (in
-normal read-only sections). When no ELF is supplied, addresses render as
-`@0x........`.
+address-indexed table of string-bearing sections. It skips NOBITS/SHT_NOBITS
+sections, which carry no file bytes. It normally skips VMA-0 sections too, but
+keeps VMA-0 sections whose name contains `.noload`, because ESP-IDF's no-load
+format-string output section is kept in the ELF with file bytes at address 0.
+
+Format and tag resolution are intentionally separate:
+
+- `read_format(addr)` only reads from section names containing `.noload`;
+- `read_tag(addr)` reads from non-`.noload` sections.
+
+If multiple matching sections cover the same address and produce different
+strings, lookup fails instead of silently choosing one. When no ELF is supplied,
+or lookup fails, addresses render as `@0x........` / `<fmt @0x........>`.
 
 `printf.rs` renders a format string against decoded `Arg` values using the
 `sprintf` crate (`sprintf::vsprintf`), which performs all digit conversion,
@@ -251,6 +257,64 @@ and reads in a 4096-byte loop, feeding each chunk to the deframer. Plain-text
 outcomes are written to stdout as-is. Verified on9log frames are decoded and
 printed with the normal colored/wrapped presentation.
 
+## ELF No-Load String Resolution
+
+Format and tag strings take **different ELF addresses**, which is why the
+resolver splits lookup by section family rather than doing one generic scan:
+
+- **`fmt_id`** — `ON9_LOG_NOLOAD_STR(format)` wraps constant format strings in
+  `ON9_LOG_NOLOAD_ATTR`, which emits input sections `.noload_keep_in_elf.<n>`.
+  ESP-IDF's linker captures these into a dedicated ELF-only output section, so
+  `fmt_id` is a **small offset near 0**, not a loadable rodata address.
+- **`tag_id`** — tags are passed straight through (`ON9_LOG_LEVEL(tag, ...)`)
+  and land in ordinary `.rodata`, so `tag_id` is a real loadable address
+  (e.g. `0x3f4xxxxx` on ESP32-S3).
+
+The ESP-IDF linker rule that produces this lives in
+`components/esp_system/ld/ld.debug.sections`:
+
+```text
+.noload 0 (INFO) :
+{
+    . = 0;
+    LONG(0);                                   /* 4-byte NULL reservation */
+    _noload_keep_in_elf_start = ABSOLUTE(.);
+    SECTION_MAPPINGS(noload_keep_in_elf)
+    KEEP(*(.noload_keep_in_elf .noload_keep_in_elf.*))
+    _noload_keep_in_elf_end = ABSOLUTE(.);
+}
+```
+
+Consequences the resolver depends on:
+
+- `0` → output section VMA is 0; the first real format string starts at offset 4
+  (after `LONG(0)`).
+- `(INFO)` → non-allocatable (`SHF_ALLOC` unset), so it is excluded from the
+  flashed binary image and from `PT_LOAD` segments, but **retained in the ELF**.
+- `KEEP(...)` → file bytes are not garbage-collected; the section is **PROGBITS**
+  with a real file offset, never NOBITS (initialized `const char[]` data is
+  PROGBITS by nature; NOBITS is reserved for the `(NOLOAD)` BSS-style sections
+  fed by `.bss`-class input).
+
+This is why `elf_resolv.rs` keeps VMA-0 sections whose name contains `.noload`
+(and skips all other VMA-0 sections such as `.debug_*` / `.comment`, which the
+firmware never points into). `is_noload_section` uses `name.contains(".noload")`;
+ESP-IDF also has a `.flash.rodata_noload (NOLOAD)` BSS section, but that is
+NOBITS and excluded by the `sh_type == 8` check, and the firmware never emits a
+`fmt`/`tag` address into it.
+
+If format strings ever stop resolving (lines render as `<fmt @0x...>`), confirm
+the built ELF still matches these assumptions:
+
+```bash
+readelf -S <firmware.elf> | grep noload   # expect: .noload at 00000000, PROGBITS, non-zero size
+readelf -x .noload <firmware.elf> | head  # expect: format strings as ASCII starting at offset 4
+```
+
+If the section name, type, or addressing changes (e.g. a future linker-script
+rewrite makes it NOBITS or moves it to a real VMA), the resolver's
+`.noload`-name and VMA-0 special-casing must be revisited.
+
 ## Output Format
 
 A decoded LOG line looks like:
@@ -285,10 +349,10 @@ decoding.
 - **Library / binary split.** The decoding core has no `tokio` dependency; only
   the binary needs the runtime. This keeps a future `napi-rs` binding small and
   sync-friendly.
-- **goblin for ELF.** Resolves `fmt_id`/`tag_id` addresses to C strings by
-  indexing every section with a virtual address and file bytes (covers both
-  `.noload_keep_in_elf.*` format strings and normal tag sections). goblin is the
-  user-chosen parser.
+- **goblin for ELF.** Resolves `fmt_id`/`tag_id` addresses to C strings. Format
+  strings are resolved only from section names containing `.noload`, including
+  ESP-IDF's VMA-0 ELF-only no-load output section. Tags are resolved from normal
+  non-`.noload` sections. goblin is the user-chosen parser.
 - **sprintf for printf rendering.** Format strings are rendered by the `sprintf`
   crate, not a hand-rolled renderer. Because `sprintf` dispatches by Rust type
   and the wire carries no signedness, `printf.rs` scans the format to coerce each
@@ -339,7 +403,7 @@ CLI flags:
 Tests:
 
 ```bash
-cargo test       # CRC, sprintf rendering, SLIP/plain-text framing, decode tests
+cargo test       # CRC, sprintf rendering, SLIP/plain-text framing, decode, ELF resolution
 cargo clippy     # 0 warnings
 ```
 
