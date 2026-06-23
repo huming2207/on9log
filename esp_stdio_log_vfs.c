@@ -31,6 +31,8 @@
 #define ESP_STDIO_LOG_VFS_SLIP_ESC_END 0xdcu
 #define ESP_STDIO_LOG_VFS_SLIP_ESC_ESC 0xddu
 #define ESP_STDIO_LOG_VFS_SLIP_ESC_START 0xdeu
+#define ESP_STDIO_LOG_VFS_SLIP_ESC_CR 0xd0u
+#define ESP_STDIO_LOG_VFS_SLIP_ESC_LF 0xd1u
 
 #define ESP_STDIO_LOG_VFS_CRC16_CCITT_INIT 0xffffu
 
@@ -160,6 +162,14 @@ static bool esp_stdio_log_vfs_write_slip_byte(uint8_t byte)
     }
     if (byte == ESP_STDIO_LOG_VFS_SLIP_ESC) {
         const uint8_t escaped[] = {ESP_STDIO_LOG_VFS_SLIP_ESC, ESP_STDIO_LOG_VFS_SLIP_ESC_ESC};
+        return esp_stdio_log_vfs_write_raw(escaped, sizeof(escaped));
+    }
+    if (byte == (uint8_t)'\r') {
+        const uint8_t escaped[] = {ESP_STDIO_LOG_VFS_SLIP_ESC, ESP_STDIO_LOG_VFS_SLIP_ESC_CR};
+        return esp_stdio_log_vfs_write_raw(escaped, sizeof(escaped));
+    }
+    if (byte == (uint8_t)'\n') {
+        const uint8_t escaped[] = {ESP_STDIO_LOG_VFS_SLIP_ESC, ESP_STDIO_LOG_VFS_SLIP_ESC_LF};
         return esp_stdio_log_vfs_write_raw(escaped, sizeof(escaped));
     }
 

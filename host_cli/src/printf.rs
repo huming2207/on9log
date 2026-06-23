@@ -347,6 +347,22 @@ mod tests {
     }
 
     #[test]
+    fn mixed_star_widths_and_precision_strings() {
+        let s = render(
+            "widths [%*s] [%-*s] [%.*s]",
+            &[
+                Arg::U32(10),
+                Arg::Str(Some(b"right".to_vec())),
+                Arg::U32((-8i32) as u32),
+                Arg::Str(Some(b"left".to_vec())),
+                Arg::U32(5),
+                Arg::Str(Some(b"truncate-me".to_vec())),
+            ],
+        );
+        assert_eq!(s, "widths [     right] [left    ] [trunc]");
+    }
+
+    #[test]
     fn null_string() {
         let s = render("s=%s", &[Arg::Str(None)]);
         assert_eq!(s, "s=(null)");

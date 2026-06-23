@@ -7,8 +7,8 @@
 use crate::crc;
 use crate::wire::{
     HEADER_LEN, Header, PAYLOAD_LEN_STREAMING, SLIP_END, SLIP_ESC, SLIP_ESC_END, SLIP_ESC_ESC,
-    SLIP_ESC_START, SLIP_START, TRANSPORT_FRAME_ON9LOG, TRANSPORT_FRAME_TEXT,
-    TRANSPORT_MAX_PAYLOAD,
+    SLIP_ESC_CR, SLIP_ESC_LF, SLIP_ESC_START, SLIP_START, TRANSPORT_FRAME_ON9LOG,
+    TRANSPORT_FRAME_TEXT, TRANSPORT_MAX_PAYLOAD,
 };
 
 /// A fully decoded on9log packet carried inside a CRC-verified transport frame.
@@ -75,6 +75,8 @@ impl Deframer {
                     SLIP_ESC_END => Some(SLIP_END),
                     SLIP_ESC_ESC => Some(SLIP_ESC),
                     SLIP_ESC_START => Some(SLIP_START),
+                    SLIP_ESC_CR => Some(b'\r'),
+                    SLIP_ESC_LF => Some(b'\n'),
                     _ => None,
                 };
                 if let Some(v) = unescaped {
@@ -216,6 +218,14 @@ mod tests {
                 out.push(SLIP_ESC);
                 out.push(SLIP_ESC_ESC);
             }
+            b'\r' => {
+                out.push(SLIP_ESC);
+                out.push(SLIP_ESC_CR);
+            }
+            b'\n' => {
+                out.push(SLIP_ESC);
+                out.push(SLIP_ESC_LF);
+            }
             other => out.push(other),
         }
     }
@@ -311,6 +321,20 @@ mod tests {
         assert_eq!(outcomes.len(), 1);
         match &outcomes[0] {
             Outcome::PlainText(text) => assert_eq!(text, b"I (123) boot: hello\n"),
+            o => panic!("expected PlainText, got {o:?}"),
+        }
+    }
+
+    #[test]
+    fn text_newline_is_escaped_for_uart_vfs() {
+        let wire = build_transport_frame(TRANSPORT_FRAME_TEXT, b"line\n");
+        assert!(!wire[1..wire.len() - 1].contains(&b'\n'));
+
+        let mut d = Deframer::new();
+        let outcomes = d.feed(&wire);
+        assert_eq!(outcomes.len(), 1);
+        match &outcomes[0] {
+            Outcome::PlainText(text) => assert_eq!(text, b"line\n"),
             o => panic!("expected PlainText, got {o:?}"),
         }
     }
