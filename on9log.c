@@ -200,28 +200,28 @@ static void on9log_emit_u64(on9log_stream_t *stream, uint64_t val, size_t total_
 
 static void on9log_emit_arg(on9log_stream_t *stream,
                             uint8_t arg_type,
-                            va_list args,
+                            va_list *args,
                             size_t total_arg_cnt,
                             size_t curr_arg_index)
 {
     switch (arg_type) {
     case ON9_LOG_ARGS_TYPE_32BITS: {
-        uint32_t val = va_arg(args, uint32_t);
+        uint32_t val = va_arg(*args, uint32_t);
         on9log_emit_u32(stream, val, total_arg_cnt, curr_arg_index);
         return;
     }
     case ON9_LOG_ARGS_TYPE_64BITS: {
-        uint64_t val = va_arg(args, uint64_t);
+        uint64_t val = va_arg(*args, uint64_t);
         on9log_emit_u64(stream, val, total_arg_cnt, curr_arg_index);
         return;
     }
     case ON9_LOG_ARGS_TYPE_POINTER: {
-        const void *ptr = va_arg(args, const void *);
+        const void *ptr = va_arg(*args, const void *);
         on9log_emit_u32(stream, (uint32_t)(uintptr_t)ptr, total_arg_cnt, curr_arg_index);
         return;
     }
     case ON9_LOG_ARGS_TYPE_DYNAMIC_STRING: {
-        const char *str = va_arg(args, const char *);
+        const char *str = va_arg(*args, const char *);
         if (str == NULL) {
             on9log_emit_u32(stream, ON9LOG_NULL_STRING_LEN, total_arg_cnt, curr_arg_index);
             return;
@@ -240,7 +240,7 @@ static void on9log_emit_arg(on9log_stream_t *stream,
     }
 }
 
-static void on9log_emit_payload_args(on9log_stream_t *stream, const char *arg_types, va_list args, size_t total_arg_cnt)
+static void on9log_emit_payload_args(on9log_stream_t *stream, const char *arg_types, va_list *args, size_t total_arg_cnt)
 {
     for (unsigned idx = 0; on9log_arg_type_at(arg_types, idx) != ON9_LOG_ARGS_TYPE_NONE; ++idx) {
         on9log_emit_arg(stream, on9log_arg_type_at(arg_types, idx), args, total_arg_cnt, idx);
@@ -414,7 +414,7 @@ void on9log_write(on9log_level_t level,
     if (arg_count != 0) {
         on9log_stream_payload(&stream, (const uint8_t *)arg_types, arg_count, arg_count, ON9LOG_PAYLOAD_META_ARG_INDEX);
     }
-    on9log_emit_payload_args(&stream, arg_types, args, arg_count);
+    on9log_emit_payload_args(&stream, arg_types, &args, arg_count);
     on9log_stream_end(&stream);
 
     va_end(args);

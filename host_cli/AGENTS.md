@@ -81,7 +81,14 @@ SLIP escaping:
 0xa5 -> 0xdb 0xde
 0xc0 -> 0xdb 0xdc
 0xdb -> 0xdb 0xdd
+0x0d -> 0xdb 0xd0
+0x0a -> 0xdb 0xd1
 ```
+
+The CR/LF escapes are required because firmware frames are written through
+ESP-IDF console VFS outputs that can translate `\n` to `\r\n`. The host must
+reverse these escapes before CRC verification; the CRC is over the original
+unescaped bytes.
 
 CRC is CRC-16-CCITT (CCITT-FALSE): polynomial `0x1021`, initial value `0xffff`,
 no reflection, no final xor. It is computed over the unescaped frame type byte

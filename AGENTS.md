@@ -66,7 +66,9 @@ a framing layer outside this raw byte stream.
 
 ## Default ESP VFS Sink
 
-`on9log_esp_vfs.c` provides the default framed ESP VFS sink. It calls
+`on9log_esp_vfs.c` provides the default framed ESP VFS sink. This VFS path
+has been validated with ESP-IDF v6.0.1; ESP-IDF v6.0 had an ISR WDT issue in
+this usage. It calls
 `esp_stdio_log_vfs_init()`, registers an `on9log_sink_t`, buffers each raw on9log
 packet until `end_cb()`, and forwards it through the shared stdio transport
 framer as frame type `0x01`. Output fanout to ESP console VFS devices is owned
@@ -100,7 +102,12 @@ Frame type values:
 
 Frame start is `0xa5`; frame end is `0xc0`. Payload byte `0xa5` is escaped as
 `0xdb 0xde`; payload byte `0xc0` is escaped as `0xdb 0xdc`; payload byte `0xdb`
-is escaped as `0xdb 0xdd`.
+is escaped as `0xdb 0xdd`. Because this transport is written through ESP-IDF
+console VFS devices that can perform newline conversion, original byte `0x0d`
+is escaped as `0xdb 0xd0` and original byte `0x0a` is escaped as `0xdb 0xd1`.
+This CR/LF escaping applies to both payload bytes and CRC bytes; otherwise the
+UART VFS can inject `0x0d` before `0x0a` after CRC calculation and make the host
+reject the frame.
 
 The CRC is CRC-16-CCITT with initial value `0xffff`, calculated over the
 unescaped frame type byte and payload bytes. The final two CRC bytes are
@@ -157,7 +164,10 @@ null dynamic string   uint32_t 0xffffffff, no copied bytes
 
 For `%.*s`, the precision argument is still encoded as its normal 32-bit
 argument before the string. The firmware does not parse no-load format strings
-at runtime, so the host decoder applies the precision when rendering.
+at runtime, so the host decoder applies the precision when rendering. Argument
+emission must pass one `va_list *` through all argument helpers; passing `va_list`
+by value can restart or duplicate the cursor on ESP32-S3 and causes width or
+precision integers such as `%*s`/`%.*s` arguments to be read as string pointers.
 
 The host decoder is expected to recover the format string from the ELF, parse
 the format string, read the argument type table, and consume the payload
@@ -214,8 +224,12 @@ void on9log_port_write(const uint8_t *data, size_t len);
 ```
 
 `on9log_port_weak.c` provides weak no-op/default implementations so the core can
-link on non-ESP targets. `on9log_esp_port.c` provides the ESP-IDF implementation
-using `esp_log_impl_lock()` and `esp_log_timestamp()`. It deliberately does not
+link on non-ESP targets. In ESP-IDF builds it must not define
+`on9log_port_lock()`, `on9log_port_unlock()`, or `on9log_port_timestamp_ms()`;
+otherwise the static archive linker can satisfy those references from the weak
+object before pulling in `on9log_esp_port.c`, causing all timestamps to remain
+zero. `on9log_esp_port.c` provides the ESP-IDF implementation using
+`esp_log_impl_lock()` and `esp_log_timestamp()`. It deliberately does not
 override `on9log_port_write()`: ESP-IDF console output should be provided by
 `on9log_esp_vfs.c`, which buffers a complete on9log packet and passes it to
 `esp_stdio_log_vfs_write_frame()`.

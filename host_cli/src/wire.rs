@@ -21,6 +21,8 @@ pub const SLIP_ESC: u8 = 0xdb;
 pub const SLIP_ESC_END: u8 = 0xdc;
 pub const SLIP_ESC_ESC: u8 = 0xdd;
 pub const SLIP_ESC_START: u8 = 0xde;
+pub const SLIP_ESC_CR: u8 = 0xd0;
+pub const SLIP_ESC_LF: u8 = 0xd1;
 
 /// Packet type, stored in the high nibble of `type_level`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
