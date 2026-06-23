@@ -17,6 +17,7 @@ path = "src/main.rs"
 clap = { version = "4.6.1", features = ["derive"] }
 tokio-serial = "5.5.0"
 goblin = "0.10"
+addr2line = "0.25.1"
 # Runtime required to drive tokio-serial's async serial stream.
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "io-util"] }
 crossterm = "0.29.0"

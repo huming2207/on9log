@@ -37,6 +37,7 @@ pub enum Outcome {
 /// Streaming transport deframer. Feed it arbitrary byte slices from the UART.
 pub struct Deframer {
     buf: Vec<u8>,
+    raw_text: Vec<u8>,
     in_frame: bool,
     escape: bool,
 }
@@ -51,6 +52,7 @@ impl Deframer {
     pub fn new() -> Self {
         Self {
             buf: Vec::with_capacity(256),
+            raw_text: Vec::with_capacity(256),
             in_frame: false,
             escape: false,
         }
@@ -63,9 +65,15 @@ impl Deframer {
         for &b in data {
             if !self.in_frame {
                 if b == SLIP_START {
+                    self.flush_raw_text(&mut out);
                     self.in_frame = true;
                     self.escape = false;
                     self.buf.clear();
+                } else if is_raw_text_byte(b) {
+                    self.raw_text.push(b);
+                    if b == b'\n' || self.raw_text.len() >= 256 {
+                        self.flush_raw_text(&mut out);
+                    }
                 }
                 continue;
             }
@@ -110,6 +118,7 @@ impl Deframer {
                 }
             }
         }
+        self.flush_raw_text(&mut out);
         out
     }
 
@@ -123,6 +132,12 @@ impl Deframer {
             return;
         }
         self.buf.push(byte);
+    }
+
+    fn flush_raw_text(&mut self, out: &mut Vec<Outcome>) {
+        if !self.raw_text.is_empty() {
+            out.push(Outcome::PlainText(std::mem::take(&mut self.raw_text)));
+        }
     }
 
     /// Decode one unescaped transport frame buffer into an `Outcome`.
@@ -171,6 +186,10 @@ impl Deframer {
             payload: inner_payload.to_vec(),
         }))
     }
+}
+
+fn is_raw_text_byte(b: u8) -> bool {
+    matches!(b, b'\n' | b'\r' | b'\t' | 0x1b | 0x20..=0x7e)
 }
 
 #[cfg(test)]
@@ -372,10 +391,38 @@ mod tests {
     }
 
     #[test]
-    fn ignores_bytes_outside_transport_frames() {
+    fn emits_printable_text_outside_transport_frames() {
         let mut d = Deframer::new();
         let outcomes = d.feed(b"I (42) tag: text only\n");
-        assert!(outcomes.is_empty());
+        assert_eq!(outcomes.len(), 1);
+        match &outcomes[0] {
+            Outcome::PlainText(text) => assert_eq!(text, b"I (42) tag: text only\n"),
+            o => panic!("expected PlainText, got {o:?}"),
+        }
+    }
+
+    #[test]
+    fn drops_non_text_bytes_outside_transport_frames() {
+        let mut d = Deframer::new();
+        let outcomes = d.feed(&[0x00, 0x01, b'O', b'K', b'\n']);
+        assert_eq!(outcomes.len(), 1);
+        match &outcomes[0] {
+            Outcome::PlainText(text) => assert_eq!(text, b"OK\n"),
+            o => panic!("expected PlainText, got {o:?}"),
+        }
+    }
+
+    #[test]
+    fn preserves_ansi_escape_bytes_outside_transport_frames() {
+        let mut d = Deframer::new();
+        let outcomes = d.feed(b"\x1b[0;32mI (42) tag: colored\x1b[0m\n");
+        assert_eq!(outcomes.len(), 1);
+        match &outcomes[0] {
+            Outcome::PlainText(text) => {
+                assert_eq!(text, b"\x1b[0;32mI (42) tag: colored\x1b[0m\n")
+            }
+            o => panic!("expected PlainText, got {o:?}"),
+        }
     }
 
     #[test]
@@ -389,10 +436,11 @@ mod tests {
 
         let mut d = Deframer::new();
         let outcomes = d.feed(&wire);
-        assert_eq!(outcomes.len(), 1);
-        match &outcomes[0] {
-            Outcome::Frame(f) => assert_eq!(f.header.seq, 6),
-            o => panic!("expected Frame, got {o:?}"),
+        assert!(!outcomes.is_empty());
+        match outcomes.iter().find(|o| matches!(o, Outcome::Frame(_))) {
+            Some(Outcome::Frame(f)) => assert_eq!(f.header.seq, 6),
+            Some(o) => panic!("expected Frame, got {o:?}"),
+            None => panic!("expected recovered Frame, got {outcomes:?}"),
         }
     }
 

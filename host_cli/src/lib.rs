@@ -22,6 +22,7 @@
 //! }
 //! ```
 
+pub mod crash;
 pub mod crc;
 pub mod decode;
 pub mod elf_resolv;
@@ -30,8 +31,9 @@ pub mod printf;
 pub mod term;
 pub mod wire;
 
+pub use crash::CrashDecoder;
 pub use decode::{BufferRecord, DecodedPacket, Decoder, DroppedRecord, LogRecord, PacketMeta};
-pub use elf_resolv::ElfStrings;
+pub use elf_resolv::{ElfStrings, ResolvedSymbol, SourceLocation};
 pub use framer::{Deframer, Outcome, RawFrame};
 pub use printf::Arg;
 pub use term::color;

@@ -7,12 +7,15 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::ptr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::Parser;
 use tokio::io::AsyncReadExt;
-use tokio_serial::SerialPortBuilderExt;
+use tokio_serial::{SerialPort, SerialPortBuilderExt};
 
-use on9log_host::{DecodedPacket, Decoder, Deframer, ElfStrings, Level, Outcome, color, term};
+use on9log_host::{
+    CrashDecoder, DecodedPacket, Decoder, Deframer, ElfStrings, Level, Outcome, color, term,
+};
 
 /// Host-side decoder for on9log binary log streams.
 #[derive(Parser, Debug)]
@@ -41,6 +44,10 @@ struct Cli {
     /// Override detected terminal width (0 = auto-detect).
     #[arg(long, default_value_t = 0)]
     width: usize,
+
+    /// Do not reset ESP targets by toggling DTR/RTS when the port opens.
+    #[arg(long)]
+    no_esp_reset: bool,
 }
 
 fn level_color(level: Level) -> &'static str {
@@ -64,8 +71,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let elf = match &cli.elf {
         Some(p) => {
-            let bytes = std::fs::read(p)?;
-            match ElfStrings::from_bytes(&bytes) {
+            match ElfStrings::from_path(p) {
                 Ok(e) => {
                     eprintln!("on9log: loaded ELF {}", p.display());
                     Some(Arc::new(e))
@@ -85,7 +91,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    rt.block_on(run(cli.port, cli.baud, elf, use_color, width, cli.timestamp))?;
+    rt.block_on(run(
+        cli.port,
+        cli.baud,
+        elf,
+        use_color,
+        width,
+        cli.timestamp,
+        !cli.no_esp_reset,
+    ))?;
     Ok(())
 }
 
@@ -96,17 +110,26 @@ async fn run(
     use_color: bool,
     width: usize,
     timestamp: bool,
+    esp_reset: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut serial = tokio_serial::new(&port, baud)
         .open_native_async()
         .map_err(|e| format!("opening {port}: {e}"))?;
 
+    if esp_reset {
+        esp_hard_reset(&mut serial).map_err(|e| format!("resetting ESP target on {port}: {e}"))?;
+    }
+
     let mut deframer = Deframer::new();
     let mut decoder = Decoder::new();
+    let mut crash_decoder = CrashDecoder::new();
     let mut buf = vec![0u8; 4096];
-    let mut plain_text_line_start = true;
+    let mut plain_text = PlainTextState::new();
 
-    eprintln!("on9log: listening on {port} @ {baud} baud (width {width})");
+    eprintln!(
+        "on9log: listening on {port} @ {baud} baud (width {width}, esp-reset {})",
+        if esp_reset { "on" } else { "off" }
+    );
 
     loop {
         let n = serial.read(&mut buf).await?;
@@ -122,11 +145,23 @@ async fn run(
                 use_color,
                 width,
                 timestamp,
-                &mut plain_text_line_start,
+                &mut plain_text,
+                &mut crash_decoder,
             );
         }
     }
 
+    Ok(())
+}
+
+fn esp_hard_reset<P: SerialPort>(port: &mut P) -> tokio_serial::Result<()> {
+    // ESP dev boards wire DTR to GPIO0 and RTS to EN through active-low
+    // transistor circuits. Release GPIO0, pulse EN low, then release EN.
+    port.write_data_terminal_ready(false)?;
+    port.write_request_to_send(true)?;
+    std::thread::sleep(Duration::from_millis(100));
+    port.write_request_to_send(false)?;
+    std::thread::sleep(Duration::from_millis(100));
     Ok(())
 }
 
@@ -137,7 +172,8 @@ fn handle_outcome(
     use_color: bool,
     width: usize,
     timestamp: bool,
-    plain_text_line_start: &mut bool,
+    plain_text: &mut PlainTextState,
+    crash_decoder: &mut CrashDecoder,
 ) {
     match outcome {
         Outcome::Frame(frame) => match decoder.decode(&frame, elf) {
@@ -159,7 +195,7 @@ fn handle_outcome(
                     );
                 }
                 term::print_log_line(&prefix, &l.message, color_code, indent, width, use_color);
-                *plain_text_line_start = true;
+                plain_text.reset_line();
             }
             DecodedPacket::Dropped(d) => {
                 warn_line(
@@ -170,7 +206,7 @@ fn handle_outcome(
                     use_color,
                     timestamp,
                 );
-                *plain_text_line_start = true;
+                plain_text.reset_line();
             }
             DecodedPacket::Buffer(b) => {
                 let color_code = level_color(b.level);
@@ -196,7 +232,7 @@ fn handle_outcome(
                     println!("{header}");
                 }
                 print_hexdump(&b.bytes, color_code, use_color, timestamp);
-                *plain_text_line_start = true;
+                plain_text.reset_line();
             }
             DecodedPacket::Other {
                 meta,
@@ -229,9 +265,26 @@ fn handle_outcome(
         Outcome::InvalidEscape => eprintln!("on9log: invalid SLIP escape, discarded"),
         Outcome::PlainText(bytes) => {
             let mut out = std::io::stdout().lock();
-            let _ = write_plain_text(&mut out, &bytes, timestamp, plain_text_line_start);
+            let _ = write_plain_text(&mut out, &bytes, timestamp, plain_text);
+            for annotation in crash_decoder.feed(&bytes, elf) {
+                let _ = write_plain_annotation(&mut out, &annotation, timestamp);
+            }
             let _ = out.flush();
         }
+    }
+}
+
+struct PlainTextState {
+    line_start: bool,
+}
+
+impl PlainTextState {
+    fn new() -> Self {
+        Self { line_start: true }
+    }
+
+    fn reset_line(&mut self) {
+        self.line_start = true;
     }
 }
 
@@ -287,19 +340,29 @@ fn write_plain_text<W: Write>(
     out: &mut W,
     bytes: &[u8],
     timestamp: bool,
-    line_start: &mut bool,
+    state: &mut PlainTextState,
 ) -> std::io::Result<()> {
     for &b in bytes {
-        if timestamp && *line_start {
+        if timestamp && state.line_start {
             out.write_all(timestamp_prefix(true).as_bytes())?;
-            *line_start = false;
+            state.line_start = false;
         }
         out.write_all(&[b])?;
         if b == b'\n' {
-            *line_start = true;
+            state.line_start = true;
         }
     }
     Ok(())
+}
+
+fn write_plain_annotation<W: Write>(
+    out: &mut W,
+    line: &str,
+    timestamp: bool,
+) -> std::io::Result<()> {
+    out.write_all(timestamp_prefix(timestamp).as_bytes())?;
+    out.write_all(line.as_bytes())?;
+    out.write_all(b"\n")
 }
 
 fn timestamp_prefix(enabled: bool) -> String {
@@ -353,24 +416,61 @@ mod tests {
     #[test]
     fn timestamps_each_plain_text_line() {
         let mut out = Vec::new();
-        let mut line_start = true;
-        write_plain_text(&mut out, b"a\nb", true, &mut line_start).unwrap();
+        let mut state = PlainTextState::new();
+        write_plain_text(&mut out, b"a\nb", true, &mut state).unwrap();
         let s = String::from_utf8(out).unwrap();
 
         assert_eq!(s.matches('[').count(), 2);
         assert!(s.ends_with("b"));
-        assert!(!line_start);
+        assert!(!state.line_start);
     }
 
     #[test]
     fn plain_text_timestamp_state_spans_chunks() {
         let mut out = Vec::new();
-        let mut line_start = true;
-        write_plain_text(&mut out, b"a", true, &mut line_start).unwrap();
-        write_plain_text(&mut out, b"b\n", true, &mut line_start).unwrap();
+        let mut state = PlainTextState::new();
+        write_plain_text(&mut out, b"a", true, &mut state).unwrap();
+        write_plain_text(&mut out, b"b\n", true, &mut state).unwrap();
         let s = String::from_utf8(out).unwrap();
 
         assert_eq!(s.matches('[').count(), 1);
-        assert!(line_start);
+        assert!(state.line_start);
+    }
+
+    #[test]
+    fn preserves_device_ansi_plain_text_colors() {
+        let mut out = Vec::new();
+        let mut state = PlainTextState::new();
+        write_plain_text(
+            &mut out,
+            b"\x1b[0;32mI (1519) demo: esp_log plain text main heartbeat 2\x1b[0m\n",
+            false,
+            &mut state,
+        )
+        .unwrap();
+
+        assert_eq!(
+            out,
+            b"\x1b[0;32mI (1519) demo: esp_log plain text main heartbeat 2\x1b[0m\n"
+        );
+    }
+
+    #[test]
+    fn does_not_infer_plain_text_color_from_prefix() {
+        let mut out = Vec::new();
+        let mut state = PlainTextState::new();
+        write_plain_text(&mut out, b"I (1519) demo: uncolored\n", false, &mut state).unwrap();
+
+        assert_eq!(out, b"I (1519) demo: uncolored\n");
+    }
+
+    #[test]
+    fn plain_annotation_honors_timestamp_flag() {
+        let mut out = Vec::new();
+        write_plain_annotation(&mut out, "--- 0x42000000: app_main", false).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "--- 0x42000000: app_main\n"
+        );
     }
 }

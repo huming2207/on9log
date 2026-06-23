@@ -1,16 +1,25 @@
-//! Resolve `fmt_id` / `tag_id` ELF addresses back to their C strings.
+//! Resolve ELF addresses back to their C strings and symbols.
 //!
 //! The firmware places format strings in `.noload_keep_in_elf.*` sections and
 //! tags in normal read-only sections, then sends only the address. The host
 //! opens the matching ELF and maps each address to the NUL-terminated string
 //! stored in any section that carries file bytes at that virtual address.
 
-use goblin::elf::{Elf, SectionHeader};
+use std::path::Path;
+
+use goblin::{
+    elf::{Elf, SectionHeader, sym::STT_FUNC},
+    strtab::Strtab,
+};
 
 /// Address-indexed ELF string table.
 pub struct ElfStrings {
     /// Sections sorted by start address, each carrying its file bytes.
     sections: Vec<Section>,
+    /// Function symbols sorted by start address.
+    symbols: Vec<Symbol>,
+    /// DWARF-backed source location resolver, when this ELF was loaded by path.
+    lines: Option<addr2line::Loader>,
 }
 
 struct Section {
@@ -18,6 +27,25 @@ struct Section {
     addr: u32,
     end: u32,
     data: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedSymbol<'a> {
+    pub name: &'a str,
+    pub address: u32,
+    pub offset: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceLocation {
+    pub file: String,
+    pub line: Option<u32>,
+}
+
+struct Symbol {
+    name: String,
+    addr: u32,
+    size: u32,
 }
 
 impl ElfStrings {
@@ -31,9 +59,26 @@ impl ElfStrings {
             collect_section(bytes, sh, name, &mut sections);
         }
 
+        let mut symbols = Vec::new();
+        collect_symbols(&elf, &mut symbols);
+
         // Sort by start address; drop overlaps by preferring earlier entry.
         sections.sort_by_key(|s| s.addr);
-        Ok(Self { sections })
+        symbols.sort_by_key(|s| (s.addr, std::cmp::Reverse(s.size)));
+        Ok(Self {
+            sections,
+            symbols,
+            lines: None,
+        })
+    }
+
+    /// Parse an ELF file from disk and enable DWARF source location lookups.
+    pub fn from_path(path: impl AsRef<Path>) -> Result<Self, String> {
+        let path = path.as_ref();
+        let bytes = std::fs::read(path).map_err(|e| format!("read: {e}"))?;
+        let mut elf = Self::from_bytes(&bytes)?;
+        elf.lines = addr2line::Loader::new(path).ok();
+        Ok(elf)
     }
 
     /// Read a NUL-terminated string starting at `addr`, if it falls inside a
@@ -52,6 +97,47 @@ impl ElfStrings {
     /// sections, not the no-load format-string section.
     pub fn read_tag(&self, addr: u32) -> Option<&str> {
         self.read_cstr_from(addr, |name| !is_noload_section(name))
+    }
+
+    /// Resolve an instruction address to the nearest containing function
+    /// symbol. If the symbol has no size, the next symbol address bounds it.
+    pub fn resolve_symbol(&self, addr: u32) -> Option<ResolvedSymbol<'_>> {
+        let idx = self.symbols.partition_point(|s| s.addr <= addr);
+        for i in (0..idx).rev() {
+            let sym = &self.symbols[i];
+            let end = if sym.size > 0 {
+                sym.addr.saturating_add(sym.size)
+            } else {
+                self.symbols
+                    .iter()
+                    .skip(i + 1)
+                    .find(|next| next.addr > sym.addr)
+                    .map(|next| next.addr)
+                    .unwrap_or(u32::MAX)
+            };
+            if addr < end {
+                return Some(ResolvedSymbol {
+                    name: &sym.name,
+                    address: sym.addr,
+                    offset: addr.saturating_sub(sym.addr),
+                });
+            }
+        }
+        None
+    }
+
+    /// Resolve an instruction address to a DWARF source file and line.
+    pub fn resolve_location(&self, addr: u32) -> Option<SourceLocation> {
+        let loc = self
+            .lines
+            .as_ref()?
+            .find_location(u64::from(addr))
+            .ok()??;
+        let file = loc.file?;
+        Some(SourceLocation {
+            file: file.to_string(),
+            line: loc.line,
+        })
     }
 
     fn read_cstr_from<P>(&self, addr: u32, section_matches: P) -> Option<&str>
@@ -122,6 +208,39 @@ fn collect_section(file: &[u8], sh: &SectionHeader, name: &str, out: &mut Vec<Se
     });
 }
 
+fn collect_symbols(elf: &Elf<'_>, out: &mut Vec<Symbol>) {
+    collect_symbol_table(elf.syms.iter(), &elf.strtab, out);
+    collect_symbol_table(elf.dynsyms.iter(), &elf.dynstrtab, out);
+}
+
+fn collect_symbol_table(
+    symbols: impl Iterator<Item = goblin::elf::Sym>,
+    names: &Strtab<'_>,
+    out: &mut Vec<Symbol>,
+) {
+    for sym in symbols {
+        if sym.st_value == 0 || sym.st_type() != STT_FUNC {
+            continue;
+        }
+        let Some(name) = names.get_at(sym.st_name).filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        let addr = match u32::try_from(sym.st_value) {
+            Ok(addr) => addr,
+            Err(_) => continue,
+        };
+        let size = u32::try_from(sym.st_size).unwrap_or(0);
+        if out.iter().any(|s| s.addr == addr && s.name == name) {
+            continue;
+        }
+        out.push(Symbol {
+            name: name.to_string(),
+            addr,
+            size,
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -148,6 +267,8 @@ mod tests {
                     data: [0, 0, 0, 0, b'f', b'm', b't', b'\0'].to_vec(),
                 },
             ],
+            symbols: Vec::new(),
+            lines: None,
         };
 
         assert_eq!(strings.read_format(4), Some("fmt"));
@@ -172,8 +293,41 @@ mod tests {
                     data: b"b\0".to_vec(),
                 },
             ],
+            symbols: Vec::new(),
+            lines: None,
         };
 
         assert_eq!(strings.read_format(4), None);
+    }
+
+    #[test]
+    fn symbol_lookup_uses_containing_function() {
+        let strings = ElfStrings {
+            sections: Vec::new(),
+            symbols: vec![
+                Symbol {
+                    name: "first".to_string(),
+                    addr: 0x1000,
+                    size: 0x20,
+                },
+                Symbol {
+                    name: "second".to_string(),
+                    addr: 0x1040,
+                    size: 0,
+                },
+            ],
+            lines: None,
+        };
+
+        assert_eq!(
+            strings.resolve_symbol(0x1014),
+            Some(ResolvedSymbol {
+                name: "first",
+                address: 0x1000,
+                offset: 0x14,
+            })
+        );
+        assert_eq!(strings.resolve_symbol(0x1030), None);
+        assert_eq!(strings.resolve_symbol(0x1044).unwrap().name, "second");
     }
 }
