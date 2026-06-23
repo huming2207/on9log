@@ -128,11 +128,7 @@ impl ElfStrings {
 
     /// Resolve an instruction address to a DWARF source file and line.
     pub fn resolve_location(&self, addr: u32) -> Option<SourceLocation> {
-        let loc = self
-            .lines
-            .as_ref()?
-            .find_location(u64::from(addr))
-            .ok()??;
+        let loc = self.lines.as_ref()?.find_location(u64::from(addr)).ok()??;
         let file = loc.file?;
         Some(SourceLocation {
             file: file.to_string(),

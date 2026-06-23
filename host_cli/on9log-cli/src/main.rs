@@ -13,9 +13,11 @@ use clap::Parser;
 use tokio::io::AsyncReadExt;
 use tokio_serial::{SerialPort, SerialPortBuilderExt};
 
-use on9log_host::{
-    CrashDecoder, DecodedPacket, Decoder, Deframer, ElfStrings, Level, Outcome, color, term,
-};
+use on9log_protocol::{CrashDecoder, DecodedPacket, Decoder, Deframer, ElfStrings, Level, Outcome};
+
+mod term;
+
+use term::color;
 
 /// Host-side decoder for on9log binary log streams.
 #[derive(Parser, Debug)]
@@ -70,18 +72,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let elf = match &cli.elf {
-        Some(p) => {
-            match ElfStrings::from_path(p) {
-                Ok(e) => {
-                    eprintln!("on9log: loaded ELF {}", p.display());
-                    Some(Arc::new(e))
-                }
-                Err(e) => {
-                    eprintln!("on9log: failed to parse ELF {}: {e}", p.display());
-                    None
-                }
+        Some(p) => match ElfStrings::from_path(p) {
+            Ok(e) => {
+                eprintln!("on9log: loaded ELF {}", p.display());
+                Some(Arc::new(e))
             }
-        }
+            Err(e) => {
+                eprintln!("on9log: failed to parse ELF {}: {e}", p.display());
+                None
+            }
+        },
         None => {
             eprintln!("on9log: no --elf given; format/tag addresses will render as hex");
             None

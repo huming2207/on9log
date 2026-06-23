@@ -459,17 +459,24 @@ dependencies = [
 ]
 
 [[package]]
-name = "on9log_host"
+name = "on9log_cli"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "crossterm",
+ "libc",
+ "on9log_protocol",
+ "tokio",
+ "tokio-serial",
+]
+
+[[package]]
+name = "on9log_protocol"
 version = "0.1.0"
 dependencies = [
  "addr2line",
- "clap",
- "crossterm",
  "goblin",
- "libc",
  "sprintf",
- "tokio",
- "tokio-serial",
 ]
 
 [[package]]

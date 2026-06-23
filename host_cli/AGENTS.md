@@ -1,14 +1,14 @@
 # on9log host_cli Notes
 
-This crate (`on9log_host`) is the host-side decoder and CLI for the `on9log`
-binary log stream produced by the C component in the parent directory. It is a
-Rust **library + binary** crate:
+This directory is the host-side Rust workspace for the `on9log` binary log
+stream produced by the C component in the parent directory. It is split into a
+protocol library crate and a CLI binary crate:
 
-- the `on9log_host` library implements the pure decoding pipeline (no runtime
-  dependency) so it can be reused by a future `napi-rs` binding for programmatic
-  access;
-- the `on9log` binary is a CLI that opens a UART port, decodes the stream, and
-  prints colorized, terminal-width-wrapped log lines.
+- `on9log_protocol` implements the decoding pipeline, crash text recognizer,
+  printf rendering, and ELF/DWARF resolution with no async runtime dependency,
+  so it can be reused by a future `napi-rs` binding for programmatic access;
+- `on9log_cli` builds the `on9log` binary, opens a UART port, handles command
+  line parsing/reset/timestamps, and prints colorized terminal output.
 
 See the parent `../AGENTS.md` for the firmware-side packet format, SLIP framing,
 CRC, and ELF string strategy. This document only describes the host side.
@@ -22,8 +22,9 @@ firmware ELF, and render human-readable colored log output that wraps to the
 current terminal width.
 
 The decoder must also be usable as a library (e.g. from a Node.js binding via
-`napi-rs`), so the decoding core is kept free of any I/O / runtime dependency.
-Only the CLI binary pulls in `tokio` (the runtime `tokio-serial` requires).
+`napi-rs`), so the protocol crate is kept free of any I/O / async runtime
+dependency. Only the CLI crate pulls in `tokio` (the runtime `tokio-serial`
+requires).
 
 ## Wire Format Recap (host view)
 
@@ -143,26 +144,31 @@ distinct from transport loss detected by sequence gaps).
 
 ```text
 host_cli/
-  Cargo.toml         lib + bin; deps: clap, tokio-serial, goblin, addr2line,
-                     tokio, crossterm (terminal size), sprintf (printf
-                     rendering), libc (local timestamp formatting on Unix)
-  src/
-    lib.rs           crate root, public re-exports
-    wire.rs          header/types/levels/arg-type constants and Header::parse
-    crc.rs           CRC-16-CCITT-FALSE (table-generated to match firmware LUT)
-    framer.rs        typed transport SLIP deframer + CRC verification + raw text
-    elf_resolv.rs    goblin/addr2line-based address -> string/symbol/location resolver
-    printf.rs        printf rendering via the `sprintf` crate (+ minimal scan)
-    decode.rs        stateful Decoder: arg decode + packet dispatch + seq gaps
-    crash.rs         ESP panic reason/backtrace recognizer and annotator
-    term.rs          terminal width via `crossterm` + ANSI colors + word wrap
-    main.rs          CLI binary (clap + tokio-serial)
+  Cargo.toml                 workspace root and shared dependency versions
+  Cargo.lock
+  on9log-protocol/
+    Cargo.toml               protocol library; deps: goblin, addr2line, sprintf
+    src/
+      lib.rs                 protocol crate root, public re-exports
+      wire.rs                header/types/levels/arg-type constants and Header::parse
+      crc.rs                 CRC-16-CCITT-FALSE (table-generated to match firmware LUT)
+      framer.rs              typed transport SLIP deframer + CRC verification + raw text
+      elf_resolv.rs          goblin/addr2line address -> string/symbol/location resolver
+      printf.rs              printf rendering via the `sprintf` crate (+ minimal scan)
+      decode.rs              stateful Decoder: arg decode + packet dispatch + seq gaps
+      crash.rs               ESP panic reason/backtrace recognizer and annotator
+  on9log-cli/
+    Cargo.toml               CLI binary; deps: clap, tokio-serial, tokio,
+                              crossterm, libc, on9log_protocol
+    src/
+      term.rs                terminal width via `crossterm` + ANSI colors + word wrap
+      main.rs                CLI binary (clap + tokio-serial)
 ```
 
 ### Library public surface
 
 ```rust
-use on9log_host::{Deframer, Decoder, DecodedPacket, ElfStrings, Outcome};
+use on9log_protocol::{Deframer, Decoder, DecodedPacket, ElfStrings, Outcome};
 
 let mut deframer = Deframer::new();
 let mut decoder = Decoder::new();
@@ -181,6 +187,8 @@ The decoding pipeline is intentionally synchronous and allocation-light so a
 and feed chunks from any transport.
 
 ### Module responsibilities
+
+The following modules live in `on9log-protocol/src`.
 
 `wire.rs` mirrors `on9log_fmt.h` and the `ON9_LOG_ARGS_TYPE_*` values from
 `on9log.h`: `PacketType`, `Level`, `ArgType`, and `Header::parse` (returns
@@ -271,6 +279,8 @@ sequence gaps using wrapping arithmetic (`gap = seq - (last + 1)`, correct acros
 - any decode failure -> `DecodedPacket::Malformed { meta, reason }`.
 
 `Decoder::reset()` clears sequence tracking (e.g. after a device reboot).
+
+The following modules live in `on9log-cli/src`.
 
 `term.rs` handles presentation. Terminal width is detected with
 `crossterm::terminal::size()`, which performs the platform-specific
@@ -431,9 +441,9 @@ decoding.
 - **18-byte header.** AGENTS.md describes the header as "fixed-header" without
   restating the size; the packed `on9log_packet_header_t` is
   1+1+2+4+4+4+2 = 18 bytes, so `HEADER_LEN = 18`.
-- **Library / binary split.** The decoding core has no `tokio` dependency; only
-  the binary needs the runtime. This keeps a future `napi-rs` binding small and
-  sync-friendly.
+- **Workspace split.** `on9log_protocol` has no `tokio`, serial-port, terminal,
+  or clap dependency; only `on9log_cli` needs those runtime/presentation crates.
+  This keeps a future `napi-rs` binding small and sync-friendly.
 - **goblin for ELF.** Resolves `fmt_id`/`tag_id` addresses to C strings. Format
   strings are resolved only from section names containing `.noload`, including
   ESP-IDF's VMA-0 ELF-only no-load output section. Tags are resolved from normal
@@ -501,18 +511,20 @@ CLI flags:
 Tests:
 
 ```bash
-cargo test       # CRC, sprintf rendering, framing/raw text, crash decode, ELF resolution
+cargo test --workspace
+                 # CRC, sprintf rendering, framing/raw text, crash decode,
+                 # ELF resolution, terminal wrapping, and CLI helpers
 cargo clippy     # 0 warnings
 ```
 
 ## Future Work
 
-- `napi-rs` binding exposing `Deframer`, `Decoder`, `ElfStrings`, and the
-  decoded record types to Node.js.
+- `napi-rs` binding exposing `on9log_protocol::{Deframer, Decoder, ElfStrings}`
+  and the decoded record types to Node.js.
 - TIME_SYNC / BOOT packet decoding once the firmware emits them (currently
   surfaced as opaque `Other` payloads). Time sync would let the host map
   boot-relative `time_ms` to UTC.
 - Optional sequence-gap statistics / loss-rate reporting.
 - Optional JSON output mode for piping into other tooling.
 - TCP / WebSocket transport sources alongside UART (the decoder is transport-
-  agnostic; only `main.rs` is UART-specific).
+  agnostic; only `on9log-cli/src/main.rs` is UART-specific).
