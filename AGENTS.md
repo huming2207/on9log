@@ -544,4 +544,11 @@ The host decoder must:
 - read the payload argument type table;
 - decode pointer, scalar, and copied dynamic-string arguments;
 - use sink/transport framing to find the end of streamed packets;
-- decode `ON9LOG_PKT_BUFFER` copied memory dump bytes.
+- decode `ON9LOG_PKT_BUFFER` copied memory dump bytes;
+- pass through verified type `0x02` text and printable raw UART text, preserving
+  device-emitted ANSI bytes rather than inferring colors from text prefixes;
+- recognize ESP panic text (`abort() was called`, `Backtrace:`, Guru
+  Meditation, assertions, stack canary messages) and annotate crash PCs/backtrace
+  entries using the matching ELF/DWARF data when available;
+- reset ESP targets on monitor startup by default with DTR/RTS, unless the user
+  passes `--no-esp-reset`.

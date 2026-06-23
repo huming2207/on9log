@@ -143,17 +143,18 @@ distinct from transport loss detected by sequence gaps).
 
 ```text
 host_cli/
-  Cargo.toml         lib + bin; deps: clap, tokio-serial, goblin, tokio,
-                     crossterm (terminal size), sprintf (printf rendering),
-                     libc (local timestamp formatting on Unix)
+  Cargo.toml         lib + bin; deps: clap, tokio-serial, goblin, addr2line,
+                     tokio, crossterm (terminal size), sprintf (printf
+                     rendering), libc (local timestamp formatting on Unix)
   src/
     lib.rs           crate root, public re-exports
     wire.rs          header/types/levels/arg-type constants and Header::parse
     crc.rs           CRC-16-CCITT-FALSE (table-generated to match firmware LUT)
-    framer.rs        typed transport SLIP deframer + CRC verification -> RawFrame/plain text
-    elf_resolv.rs    goblin-based address -> C-string resolver
+    framer.rs        typed transport SLIP deframer + CRC verification + raw text
+    elf_resolv.rs    goblin/addr2line-based address -> string/symbol/location resolver
     printf.rs        printf rendering via the `sprintf` crate (+ minimal scan)
     decode.rs        stateful Decoder: arg decode + packet dispatch + seq gaps
+    crash.rs         ESP panic reason/backtrace recognizer and annotator
     term.rs          terminal width via `crossterm` + ANSI colors + word wrap
     main.rs          CLI binary (clap + tokio-serial)
 ```
@@ -190,16 +191,19 @@ and feed chunks from any transport.
 at runtime from polynomial `0x1021`; the standard check value "123456789" ->
 `0x29b1` is covered by a unit test.
 
-`framer.rs` holds the streaming `Deframer`. Feed it arbitrary byte slices. Bytes
-seen outside a transport frame are ignored; this prevents a missed start marker
-from dumping binary packet debris to the terminal. Seeing `0xa5` starts a
-transport frame. Bytes are then SLIP-unescaped until `0xc0`, which ends the frame
-and triggers CRC/type validation. An unescaped `0xa5` inside a frame is treated
-as a resync point: the partial frame is discarded and a fresh frame begins.
+`framer.rs` holds the streaming `Deframer`. Feed it arbitrary byte slices.
+Seeing `0xa5` starts a transport frame. Bytes are then SLIP-unescaped until
+`0xc0`, which ends the frame and triggers CRC/type validation. Outside explicit
+transport frames, printable ASCII plus CR/LF/TAB and ESC are surfaced as
+`Outcome::PlainText` so ESP-ROM/panic text and ANSI color escapes remain visible;
+other unframed control/binary bytes are dropped. An unescaped `0xa5` inside a
+frame is treated as a resync point: the partial frame is discarded and a fresh
+frame begins.
 `decode_frame` returns one of:
 
 - `Outcome::Frame(RawFrame)` — header parsed, CRC verified;
-- `Outcome::PlainText(Vec<u8>)` — verified transport frame type `0x02`;
+- `Outcome::PlainText(Vec<u8>)` — verified transport frame type `0x02` or
+  printable raw UART text outside transport frames;
 - `Outcome::BadMagic` — magic byte not `0x9a`;
 - `Outcome::CrcMismatch` — CRC did not verify;
 - `Outcome::Truncated` — fewer than header + CRC bytes;
@@ -215,10 +219,12 @@ deframer returns to start-marker hunt mode. For non-streaming on9log packets
 matches the declared value.
 
 `elf_resolv.rs` parses the firmware ELF with goblin and builds an
-address-indexed table of string-bearing sections. It skips NOBITS/SHT_NOBITS
-sections, which carry no file bytes. It normally skips VMA-0 sections too, but
-keeps VMA-0 sections whose name contains `.noload`, because ESP-IDF's no-load
-format-string output section is kept in the ELF with file bytes at address 0.
+address-indexed table of string-bearing sections and function symbols. When
+loaded from a path (`ElfStrings::from_path`), it also creates an `addr2line`
+loader for DWARF file/line resolution. It skips NOBITS/SHT_NOBITS sections,
+which carry no file bytes. It normally skips VMA-0 sections too, but keeps VMA-0
+sections whose name contains `.noload`, because ESP-IDF's no-load format-string
+output section is kept in the ELF with file bytes at address 0.
 
 Format and tag resolution are intentionally separate:
 
@@ -275,15 +281,32 @@ word-wraps to a column count (hard-breaking tokens longer than the width), and
 width, then indents continuation lines under the message. Color emission is
 suppressed when stdout is not a TTY (or when `--no-color` is passed).
 
+`crash.rs` is a streaming recognizer for ESP panic text carried in plain-text
+frames or raw UART text. It watches complete text lines for panic/crash markers
+such as `abort() was called`, `Guru Meditation Error:`, `assert failed:`, and
+`Backtrace:`. Backtrace entries are parsed as `PC:SP` pairs; only the PC half is
+symbolicated. With an ELF loaded from a path, the CLI uses DWARF line info via
+`addr2line` and function symbols via `goblin`, so annotations can include
+`function at file:line`. Without matching debug info, addresses fall back to
+function+offset or `<unresolved>`.
+
 `main.rs` is the CLI. It uses clap with derive: `-p/--port` (required), `-b/--baud`
 (default 115200), `--elf` (optional firmware ELF path), `--no-color`,
-`-t/--timestamp`, and `--width` (0 = auto-detect). It loads the ELF up front,
-builds a tokio runtime, opens the serial port via
-`tokio_serial::new(port, baud).open_native_async()`, and reads in a 4096-byte
-loop, feeding each chunk to the deframer. Verified plain-text transport frames
-are written to stdout as-is unless `--timestamp` is set, in which case a local
-wall-clock prefix is inserted at each text line start. Verified on9log frames are
-decoded and printed with the normal colored/wrapped presentation.
+`-t/--timestamp`, `--width` (0 = auto-detect), and `--no-esp-reset`. It loads the
+ELF up front, builds a tokio runtime, opens the serial port via
+`tokio_serial::new(port, baud).open_native_async()`, and by default performs an
+ESP hard reset by releasing DTR/GPIO0, asserting RTS/EN for 100 ms, then
+releasing RTS/EN and waiting another 100 ms. `--no-esp-reset` disables this
+startup reset. The read loop uses 4096-byte chunks and feeds each chunk to the
+deframer.
+
+Verified plain-text transport frames and printable raw UART text are written to
+stdout byte-for-byte unless `--timestamp` is set, in which case a local
+wall-clock prefix is inserted at each text line start. The host does **not**
+infer colors from `I/W/E/D/V` prefixes; ANSI SGR color bytes emitted by the
+device are preserved. Verified on9log frames are decoded and printed with the
+normal colored/wrapped presentation. Crash annotations are appended after the
+original plain-text crash lines.
 
 ## ELF No-Load String Resolution
 
@@ -363,12 +386,12 @@ warnings`, but these review findings are still open:
   coverage.
 - **Decoded on9log messages lose repeated whitespace when wrapped.** `term::wrap`
   splits on whitespace, so multiple spaces/tabs inside decoded messages are
-  collapsed. Verified type `0x02` text transport frames are written raw and are
-  not affected.
-- **Unframed bytes are intentionally ignored.** The host now only trusts
-  transport frames beginning with `0xa5`. Early boot output or third-party bytes
-  written before the stdio VFS transport is installed will not be displayed
-  unless they are wrapped as type `0x02` text frames.
+  collapsed. Verified type `0x02` text transport frames and printable raw UART
+  text are written raw and are not affected.
+- **Raw UART passthrough is printable-text only.** Outside explicit transport
+  frames, the deframer forwards printable ASCII, CR/LF/TAB, and ESC (`0x1b`) so
+  ESP-ROM/panic text and device ANSI colors remain visible. Other unframed
+  control/binary bytes are dropped to avoid dumping damaged transport debris.
 
 ## Output Format
 
@@ -427,10 +450,19 @@ decoding.
   `crossterm::terminal::size()` (cross-platform `ioctl`); colors remain raw ANSI
   SGR codes emitted inline so wrapped lines stay colored.
 - **Streaming deframer.** The deframer accepts arbitrary byte boundaries,
-  ignores bytes outside explicit-start transport frames, and accumulates from a
-  starting `0xa5` until a frame-ending `0xc0`, so partial reads and split frames
-  are handled naturally. If the opening `0xa5` is missed, the parser hunts until
-  the next unescaped `0xa5` and resynchronizes.
+  forwards printable raw text outside frames, and accumulates from a starting
+  `0xa5` until a frame-ending `0xc0`, so partial reads and split frames are
+  handled naturally. If the opening `0xa5` is missed, printable fragments from
+  the damaged data may be shown, but the parser still hunts until the next
+  unescaped `0xa5` and resynchronizes.
+- **ESP reset on monitor startup.** The CLI resets by default because it is
+  primarily a monitor-like UART tool. The sequence mirrors the common ESP
+  active-low wiring: DTR false (GPIO0 released), RTS true (EN asserted low),
+  100 ms delay, RTS false (EN released), 100 ms delay. Use `--no-esp-reset` for
+  RAM-loaded apps or when attaching without rebooting.
+- **Crash decoding is opportunistic.** Panic text is still printed exactly as
+  received. The host adds best-effort annotation lines when it sees known ESP
+  panic/backtrace patterns and has enough ELF/DWARF information to resolve PCs.
 - **Lenient recovery.** Bad magic, CRC mismatch, invalid escapes, oversized
   frames, and truncation are reported but do not halt the stream; the next
   unescaped `0xa5` resynchronizes.
@@ -463,12 +495,13 @@ CLI flags:
     --no-color        disable colored output
 -t, --timestamp       prefix logs/text lines with local wall time
     --width <WIDTH>   override terminal width (0 = auto-detect)    default 0
+    --no-esp-reset    do not toggle DTR/RTS to reset on startup
 ```
 
 Tests:
 
 ```bash
-cargo test       # CRC, sprintf rendering, typed SLIP framing, decode, ELF resolution
+cargo test       # CRC, sprintf rendering, framing/raw text, crash decode, ELF resolution
 cargo clippy     # 0 warnings
 ```
 
