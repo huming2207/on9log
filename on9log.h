@@ -88,6 +88,16 @@ void on9log_write_buffer(on9log_level_t level,
 
 #define ON9_LOG_ATTR_STR(str) (__builtin_constant_p(str) ? ON9_LOG_NOLOAD_STR(str) : (str))
 
+#if defined(__GNUC__)
+#define ON9_LOG_DIAG_PUSH _Pragma("GCC diagnostic push")
+#define ON9_LOG_DIAG_POP _Pragma("GCC diagnostic pop")
+#define ON9_LOG_DIAG_IGNORE_FORMAT_OVERFLOW _Pragma("GCC diagnostic ignored \"-Wformat-overflow\"")
+#else
+#define ON9_LOG_DIAG_PUSH
+#define ON9_LOG_DIAG_POP
+#define ON9_LOG_DIAG_IGNORE_FORMAT_OVERFLOW
+#endif
+
 typedef enum {
     ON9_LOG_ARGS_TYPE_NONE = 0,
     ON9_LOG_ARGS_TYPE_32BITS = 1,
@@ -222,7 +232,10 @@ constexpr unsigned long long ON9_LOG_DETECT_TYPE_IMPL(const T &, bool is_constan
 
 #define ON9_LOG_LEVEL(level, tag, format, ...) do { \
         if (ON9_LOG_ENABLED(level)) { \
+            ON9_LOG_DIAG_PUSH; \
+            ON9_LOG_DIAG_IGNORE_FORMAT_OVERFLOW; \
             on9log_write((level), (tag), ON9_LOG_ATTR_STR(format), ON9_LOG_ARGS_TYPE(__VA_ARGS__), ##__VA_ARGS__); \
+            ON9_LOG_DIAG_POP; \
         } \
     } while (0)
 
