@@ -69,7 +69,7 @@ impl Deframer {
                     self.in_frame = true;
                     self.escape = false;
                     self.buf.clear();
-                } else if is_raw_text_byte(b) {
+                } else {
                     self.raw_text.push(b);
                     if b == b'\n' || self.raw_text.len() >= 256 {
                         self.flush_raw_text(&mut out);
@@ -186,10 +186,6 @@ impl Deframer {
             payload: inner_payload.to_vec(),
         }))
     }
-}
-
-fn is_raw_text_byte(b: u8) -> bool {
-    matches!(b, b'\n' | b'\r' | b'\t' | 0x1b | 0x20..=0x7e)
 }
 
 #[cfg(test)]
@@ -402,12 +398,12 @@ mod tests {
     }
 
     #[test]
-    fn drops_non_text_bytes_outside_transport_frames() {
+    fn preserves_arbitrary_raw_text_bytes_outside_transport_frames() {
         let mut d = Deframer::new();
-        let outcomes = d.feed(&[0x00, 0x01, b'O', b'K', b'\n']);
+        let outcomes = d.feed(&[0x00, 0x01, b'O', b'K', 0xff, b'\n']);
         assert_eq!(outcomes.len(), 1);
         match &outcomes[0] {
-            Outcome::PlainText(text) => assert_eq!(text, b"OK\n"),
+            Outcome::PlainText(text) => assert_eq!(text, &[0x00, 0x01, b'O', b'K', 0xff, b'\n']),
             o => panic!("expected PlainText, got {o:?}"),
         }
     }

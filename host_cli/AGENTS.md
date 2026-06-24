@@ -164,7 +164,23 @@ host_cli/
     src/
       term.rs                terminal width via `crossterm` + ANSI colors + word wrap
       main.rs                CLI binary (clap + tokio-serial)
+  on9log-capture/
+    Cargo.toml               capture/replay binary; deps: clap, tokio-serial,
+                              tokio, crossterm, libc, rusqlite, on9log_protocol
+    src/
+      term.rs                colors, width, word wrap, host-time formatting
+      db.rs                  SQLite capture store/replay (raw outcomes + timestamps)
+      main.rs                `capture` + `decode` subcommands (clap)
 ```
+
+`on9log-capture` is the customer/developer split tool. `capture` records the
+deframed transport stream verbatim to SQLite (on9log binary frames, SLIP-framed
+plain text, raw plain text, and deframer diagnostics), each stamped with the
+host wall-clock millisecond at receive time; it needs no ELF, because the
+customer does not have the secret format strings. `decode` replays a captured
+database through the same `Decoder`/`CrashDecoder` pipeline against an optional
+`--elf`, producing human-readable text. Storage is ELF-independent: only the
+developer who holds the ELF can turn the captured addresses into strings.
 
 ### Library public surface
 
@@ -203,11 +219,10 @@ at runtime from polynomial `0x1021`; the standard check value "123456789" ->
 `framer.rs` holds the streaming `Deframer`. Feed it arbitrary byte slices.
 Seeing `0xa5` starts a transport frame. Bytes are then SLIP-unescaped until
 `0xc0`, which ends the frame and triggers CRC/type validation. Outside explicit
-transport frames, printable ASCII plus CR/LF/TAB and ESC are surfaced as
-`Outcome::PlainText` so ESP-ROM/panic text and ANSI color escapes remain visible;
-other unframed control/binary bytes are dropped. An unescaped `0xa5` inside a
-frame is treated as a resync point: the partial frame is discarded and a fresh
-frame begins.
+transport frames, every byte except the explicit `0xa5` frame-start marker is
+surfaced as `Outcome::PlainText`, so arbitrary raw console text is preserved
+byte-for-byte. An unescaped `0xa5` inside a frame is treated as a resync point:
+the partial frame is discarded and a fresh frame begins.
 `decode_frame` returns one of:
 
 - `Outcome::Frame(RawFrame)` — header parsed, CRC verified;
@@ -409,6 +424,73 @@ the file stays readable. If `-t/--timestamp` is enabled, the same local timestam
 prefix is included in the saved file. File writes are flushed and `sync_data()`ed
 after each decoded/logged item so the file is updated immediately.
 
+## on9log-capture: capture to SQLite and replay against an ELF
+
+`on9log-capture` is a second host binary (crate `on9log-capture`, binary
+`on9log-capture`) that splits the workflow the `on9log` CLI conflates:
+
+- **`capture`** (run by the customer, who does **not** have the firmware ELF with
+  the secret format strings): opens a UART, deframes the typed SLIP+CRC transport
+  with `on9log_protocol::Deframer`, and stores every raw outcome to a SQLite
+  database. No ELF is loaded; nothing is decoded against an ELF at capture time.
+  Each row is stamped with `captured_at_ms`, the host wall-clock millisecond at
+  which that outcome was received (per-outcome, recorded before the store
+  transaction commits, so the timestamp is receive time, not commit time).
+  `capture` does not accept `--elf` and never prints captured log contents,
+  including decoded messages, plain text, or argument dumps. It exits on
+  `Ctrl+C` and stores plain-text bytes byte-for-byte, including ANSI color
+  sequences.
+- **`decode`** (run by the developer, who holds the matching `--elf`): opens a
+  captured database and replays its rows in capture order through the same
+  `Decoder` / `CrashDecoder` pipeline as the live `on9log` CLI. Without
+  `--save`, it prints human-readable text to stdout. With `--save`, rendered
+  text is written only to the requested file. `--no-color` disables generated
+  colors and strips ANSI escape sequences from captured plain text before
+  writing the selected output sink.
+
+Storage is deliberately **ELF-independent**. The capture database holds the raw
+18-byte on9log header and payload BLOBs (for frames), the raw text bytes (for
+plain text), and a short code (for deframer diagnostics such as `crc_mismatch` or
+`unknown_frame_type`). The parsed header fields are also written as normal
+columns so a capture file can be queried directly (`WHERE level = 1`,
+`ORDER BY seq`) without re-parsing. Reconstructing an `Outcome` from a row
+re-parses the stored header bytes, so the decoded output is byte-identical to
+what the live `on9log` CLI would have produced from the same stream.
+
+Schema (`db.rs`):
+
+```text
+meta(key TEXT PRIMARY KEY, value TEXT)
+events(
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  captured_at_ms  INTEGER NOT NULL,        -- host receive time, UTC ms
+  kind            TEXT NOT NULL,           -- on9log | text | <error code>
+  seq, device_time_ms, level, ptype, tag_id, fmt_id, payload_len  -- denormalized header
+  header          BLOB,                    -- 18-byte on9log header (frames only)
+  payload         BLOB,                    -- frame payload | text bytes
+  detail          TEXT                     -- e.g. frame-type byte for unknown_frame_type
+)
+```
+
+`capture` opens the database in WAL mode with `synchronous=NORMAL` and writes
+each UART read's outcomes in one transaction. Appending to an existing capture
+file is supported (AUTOINCREMENT continues). `decode` opens with SQLite
+read-only flags plus the `query_only` pragma and errors if the path is missing
+or lacks the `events` table, so it can never mutate a customer's capture.
+
+`decode` uses one stateful `Renderer` (in `main.rs`) that wraps `Decoder` +
+`CrashDecoder` and renders an `Outcome` exactly as the live CLI does. The
+difference from the live tool is the timestamp source: the prefix is always
+derived from the stored per-event `captured_at_ms`. `decode` defaults to width 0
+(no wrapping) so its output stays grep- and file-friendly; `--width` restores
+wrapping. Crash backtrace addresses are re-symbolicated on decode against the
+supplied ELF, so a customer captures raw panic text and the developer resolves
+the symbols later.
+
+`term.rs` mirrors `on9log-cli`'s `term.rs` (colors, width, word wrap) and adds
+`host_now_ms()` (portable `SystemTime`) and `local_ts_string(unix_ms)`, which
+uses `localtime_r` on Unix and falls back to a UTC breakdown otherwise.
+
 ## ELF No-Load String Resolution
 
 Format and tag strings take **different ELF addresses**, which is why the
@@ -505,12 +587,12 @@ warnings`, but these review findings are still open:
   repeating C++ field parsing and printf/C++ dispatch for hot log sites.
 - **Decoded on9log messages lose repeated whitespace when wrapped.** `term::wrap`
   splits on whitespace, so multiple spaces/tabs inside decoded messages are
-  collapsed. Verified type `0x02` text transport frames and printable raw UART
-  text are written raw and are not affected.
-- **Raw UART passthrough is printable-text only.** Outside explicit transport
-  frames, the deframer forwards printable ASCII, CR/LF/TAB, and ESC (`0x1b`) so
-  ESP-ROM/panic text and device ANSI colors remain visible. Other unframed
-  control/binary bytes are dropped to avoid dumping damaged transport debris.
+  collapsed. Verified type `0x02` text transport frames and raw UART text are
+  written raw and are not affected.
+- **Raw UART passthrough treats `0xa5` as transport start.** Outside explicit
+  transport frames, every other byte is forwarded as raw text. A literal `0xa5`
+  byte in unframed output starts a candidate transport frame; if arbitrary
+  binary output can contain that byte, wrap it in a type `0x02` text frame.
 
 ## Output Format
 

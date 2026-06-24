@@ -228,6 +228,32 @@ types, and is compatible with `-fno-exceptions` and `-fno-rtti`. Plain
 define `ON9_LOG_LOCAL_LEVEL` before including `on9log.h` or `on9log.hpp` to
 override the default for one translation unit.
 
+Runtime filtering is available before packet construction:
+
+```c
+void on9log_set_level(on9log_level_t level);
+on9log_level_t on9log_get_level(void);
+on9log_err_t on9log_set_tag_level(const char *tag, on9log_level_t level);
+on9log_err_t on9log_clear_tag_level(const char *tag);
+```
+
+and through C++ static wrappers:
+
+```c++
+on9log::Logger::set_level(ON9_LOG_LEVEL_INFO);
+on9log::Logger::set_tag_level("wifi", ON9_LOG_LEVEL_WARN);
+on9log::Logger::clear_tag_level("wifi");
+```
+
+`ON9_LOG_LOCAL_LEVEL` remains a hard compile-time ceiling; runtime filtering can
+only suppress logs that pass that ceiling. A filtered log emits no packet and no
+bytes. Per-tag filters are stored in an internal `SLIST` and are matched by tag
+pointer first, then by string contents. The no-filter hot path checks only the
+runtime default level and the compile-time ceiling. When tag filters are active,
+readers traverse an atomically published SLIST without taking the port lock;
+writers use `on9log_port_lock()`. Cleared tag-filter nodes are marked inactive
+but not freed, so in-flight lock-free readers cannot observe freed memory.
+
 In ESP-IDF builds, `Kconfig` exposes:
 
 ```text

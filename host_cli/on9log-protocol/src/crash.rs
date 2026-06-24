@@ -39,7 +39,9 @@ impl CrashDecoder {
             out.push(format!("--- crash reason: {reason}"));
         }
 
-        if is_abort_pc_line(line) && let Some(pc) = first_hex_addr(line) {
+        if is_abort_pc_line(line)
+            && let Some(pc) = first_hex_addr(line)
+        {
             out.push(format!("--- abort PC: {}", format_addr(pc, elf)));
         }
 

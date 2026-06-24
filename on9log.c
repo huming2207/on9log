@@ -5,6 +5,9 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/queue.h>
 
 #include "on9log_config.h"
 #include "on9log_fmt.h"
@@ -36,7 +39,20 @@ typedef struct {
     on9log_stream_sink_t sinks[ON9LOG_MAX_SINKS];
 } on9log_stream_t;
 
+typedef struct on9log_tag_filter_node {
+    SLIST_ENTRY(on9log_tag_filter_node) entries;
+    const char *tag;
+    atomic_int level;
+    atomic_bool active;
+} on9log_tag_filter_node_t;
+
+SLIST_HEAD(on9log_tag_filter_list, on9log_tag_filter_node);
+
 static on9log_sink_entry_t s_sinks[ON9LOG_MAX_SINKS];
+static struct on9log_tag_filter_list s_tag_filters = SLIST_HEAD_INITIALIZER(s_tag_filters);
+static atomic_uintptr_t s_tag_filter_head = ATOMIC_VAR_INIT((uintptr_t)NULL);
+static atomic_uint_fast32_t s_active_tag_filter_count = ATOMIC_VAR_INIT(0);
+static atomic_int s_default_level = ATOMIC_VAR_INIT(ON9_LOG_LEVEL_VERBOSE);
 static atomic_bool s_uart_enabled = ATOMIC_VAR_INIT(true);
 static atomic_uint_fast16_t s_seq = ATOMIC_VAR_INIT(0);
 static atomic_uint_fast32_t s_dropped_count = ATOMIC_VAR_INIT(0);
@@ -415,16 +431,57 @@ static void on9log_emit_buffer_packet(on9log_level_t level,
     on9log_stream_end(&stream);
 }
 
+static bool on9log_valid_level(on9log_level_t level)
+{
+    return level >= ON9_LOG_LEVEL_NONE && level <= ON9_LOG_LEVEL_VERBOSE;
+}
+
+static bool on9log_tag_matches(const char *configured, const char *tag)
+{
+    if (configured == tag) {
+        return true;
+    }
+    if (configured == NULL || tag == NULL) {
+        return false;
+    }
+    return strcmp(configured, tag) == 0;
+}
+
+static on9log_level_t on9log_filter_level_for_tag(const char *tag)
+{
+    if (atomic_load_explicit(&s_active_tag_filter_count, memory_order_acquire) == 0) {
+        return (on9log_level_t)atomic_load_explicit(&s_default_level, memory_order_relaxed);
+    }
+
+    const on9log_tag_filter_node_t *node = (const on9log_tag_filter_node_t *)atomic_load_explicit(
+        &s_tag_filter_head,
+        memory_order_acquire);
+    while (node != NULL) {
+        if (atomic_load_explicit(&node->active, memory_order_acquire) &&
+            on9log_tag_matches(node->tag, tag)) {
+            return (on9log_level_t)atomic_load_explicit(&node->level, memory_order_relaxed);
+        }
+        node = SLIST_NEXT(node, entries);
+    }
+
+    return (on9log_level_t)atomic_load_explicit(&s_default_level, memory_order_relaxed);
+}
+
 static bool on9log_level_enabled(on9log_level_t level, const char *tag)
 {
-    (void)tag;
+    on9log_level_t runtime_level;
 
     if (level == ON9_LOG_LEVEL_NONE ||
         level > ON9_LOG_LEVEL_VERBOSE ||
         level > ON9_LOG_LOCAL_LEVEL) {
         return false;
     }
-    return true;
+
+    runtime_level = on9log_filter_level_for_tag(tag);
+    if (!on9log_valid_level(runtime_level) || runtime_level == ON9_LOG_LEVEL_NONE) {
+        return false;
+    }
+    return level <= runtime_level;
 }
 
 on9log_err_t on9log_add_sink(const on9log_sink_t *sink, void *ctx)
@@ -481,6 +538,80 @@ void on9log_set_uart_enabled(bool enabled)
 uint32_t on9log_get_dropped_count(void)
 {
     return (uint32_t)atomic_load_explicit(&s_dropped_count, memory_order_relaxed);
+}
+
+void on9log_set_level(on9log_level_t level)
+{
+    if (!on9log_valid_level(level)) {
+        return;
+    }
+    atomic_store_explicit(&s_default_level, (int)level, memory_order_relaxed);
+}
+
+on9log_level_t on9log_get_level(void)
+{
+    return (on9log_level_t)atomic_load_explicit(&s_default_level, memory_order_relaxed);
+}
+
+on9log_err_t on9log_set_tag_level(const char *tag, on9log_level_t level)
+{
+    if (tag == NULL || !on9log_valid_level(level)) {
+        return ON9LOG_ERR_INVALID_ARG;
+    }
+
+    on9log_port_lock();
+    on9log_tag_filter_node_t *node = NULL;
+    SLIST_FOREACH(node, &s_tag_filters, entries) {
+        if (on9log_tag_matches(node->tag, tag)) {
+            bool was_active = atomic_load_explicit(&node->active, memory_order_acquire);
+            atomic_store_explicit(&node->level, (int)level, memory_order_relaxed);
+            if (!was_active) {
+                atomic_store_explicit(&node->active, true, memory_order_release);
+                atomic_fetch_add_explicit(&s_active_tag_filter_count, 1, memory_order_acq_rel);
+            }
+            on9log_port_unlock();
+            return ON9LOG_OK;
+        }
+    }
+
+    node = (on9log_tag_filter_node_t *)calloc(1, sizeof(*node));
+    if (node == NULL) {
+        on9log_port_unlock();
+        return ON9LOG_ERR_NO_MEM;
+    }
+
+    node->tag = tag;
+    atomic_init(&node->level, (int)level);
+    atomic_init(&node->active, true);
+    SLIST_INSERT_HEAD(&s_tag_filters, node, entries);
+    atomic_fetch_add_explicit(&s_active_tag_filter_count, 1, memory_order_acq_rel);
+    atomic_store_explicit(&s_tag_filter_head, (uintptr_t)SLIST_FIRST(&s_tag_filters), memory_order_release);
+    on9log_port_unlock();
+
+    return ON9LOG_OK;
+}
+
+on9log_err_t on9log_clear_tag_level(const char *tag)
+{
+    if (tag == NULL) {
+        return ON9LOG_ERR_INVALID_ARG;
+    }
+
+    on9log_port_lock();
+    on9log_tag_filter_node_t *node = NULL;
+    SLIST_FOREACH(node, &s_tag_filters, entries) {
+        if (on9log_tag_matches(node->tag, tag)) {
+            bool was_active = atomic_exchange_explicit(&node->active, false, memory_order_acq_rel);
+            if (was_active) {
+                atomic_fetch_sub_explicit(&s_active_tag_filter_count, 1, memory_order_acq_rel);
+            }
+            on9log_port_unlock();
+            return ON9LOG_OK;
+        }
+    }
+    on9log_port_unlock();
+
+    return ON9LOG_ERR_NOT_FOUND;
 }
 
 on9log_err_t on9log_dispatch_packet(const uint8_t *packet, size_t packet_len)

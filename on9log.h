@@ -47,6 +47,16 @@ on9log_err_t on9log_remove_sink(const on9log_sink_t *sink, void *ctx);
 void on9log_set_uart_enabled(bool enabled);
 uint32_t on9log_get_dropped_count(void);
 
+/*
+ * Runtime level filtering. The compile-time ON9_LOG_LOCAL_LEVEL remains a hard
+ * ceiling; runtime levels can only suppress logs that survived that ceiling.
+ * Tag filters are matched by pointer first, then by string contents.
+ */
+void on9log_set_level(on9log_level_t level);
+on9log_level_t on9log_get_level(void);
+on9log_err_t on9log_set_tag_level(const char *tag, on9log_level_t level);
+on9log_err_t on9log_clear_tag_level(const char *tag);
+
 /* on9log_write() and ON9_LOGx() must not be called from ISR context. */
 void on9log_write(on9log_level_t level,
                   const char *tag,

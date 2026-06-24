@@ -321,7 +321,11 @@ fn parse_field<I: Iterator<Item = char>>(
     let arg_id = if id_str.is_empty() {
         None
     } else {
-        Some(id_str.parse::<usize>().map_err(|_| "bad arg id".to_string())?)
+        Some(
+            id_str
+                .parse::<usize>()
+                .map_err(|_| "bad arg id".to_string())?,
+        )
     };
 
     let spec = match chars.peek() {
@@ -440,7 +444,9 @@ fn parse_count(chars: &[char], i: &mut usize) -> Result<Count, String> {
             Ok(Count::Auto)
         } else {
             Ok(Count::Explicit(
-                id_str.parse::<usize>().map_err(|_| "bad nested arg id".to_string())?,
+                id_str
+                    .parse::<usize>()
+                    .map_err(|_| "bad nested arg id".to_string())?,
             ))
         }
     } else {
@@ -453,7 +459,8 @@ fn parse_count(chars: &[char], i: &mut usize) -> Result<Count, String> {
             Ok(Count::None)
         } else {
             Ok(Count::Literal(
-                w.parse::<usize>().map_err(|_| "bad width/precision".to_string())?,
+                w.parse::<usize>()
+                    .map_err(|_| "bad width/precision".to_string())?,
             ))
         }
     }
@@ -528,7 +535,11 @@ fn render_core(arg: &Arg, spec: &Spec, precision: Option<usize>) -> Result<Core,
     }
 }
 
-fn render_str(opt: &Option<Vec<u8>>, tc: Option<char>, precision: Option<usize>) -> Result<Core, String> {
+fn render_str(
+    opt: &Option<Vec<u8>>,
+    tc: Option<char>,
+    precision: Option<usize>,
+) -> Result<Core, String> {
     if !matches!(tc, None | Some('s')) {
         return Err(format!("cannot format string as {:?}", tc));
     }
@@ -625,7 +636,12 @@ fn apply_int_precision(digits: &str, v: u64, precision: Option<usize>) -> String
     }
 }
 
-fn render_float(x: f64, tc: Option<char>, precision: Option<usize>, sign_flag: Option<char>) -> Result<Core, String> {
+fn render_float(
+    x: f64,
+    tc: Option<char>,
+    precision: Option<usize>,
+    sign_flag: Option<char>,
+) -> Result<Core, String> {
     let tc = match tc {
         Some(c @ ('f' | 'F' | 'e' | 'E' | 'g' | 'G')) => c,
         _ => return Err("not a float type".into()),
@@ -689,7 +705,11 @@ fn apply_padding(core: Core, spec: &Spec, width: Option<usize>, zero_pad: bool) 
     let (fill, align) = match spec.align {
         Some(a) => (spec.fill.unwrap_or(' '), a),
         None => {
-            let a = if core.is_numeric { Align::Right } else { Align::Left };
+            let a = if core.is_numeric {
+                Align::Right
+            } else {
+                Align::Left
+            };
             (' ', a)
         }
     };
@@ -757,7 +777,10 @@ mod tests {
     #[test]
     fn defaults_by_type() {
         assert_eq!(render("n={}", &[Arg::U32(42)]), "n=42");
-        assert_eq!(render("n={}", &[Arg::U64(u64::MAX)]), "n=18446744073709551615");
+        assert_eq!(
+            render("n={}", &[Arg::U64(u64::MAX)]),
+            "n=18446744073709551615"
+        );
         assert_eq!(render("p={}", &[Arg::Ptr(0x4002_1234)]), "p=0x40021234");
         assert_eq!(render("x={}", &[s("hi")]), "x=hi");
         assert_eq!(render("x={}", &[Arg::Str(None)]), "x=(null)");
@@ -885,14 +908,8 @@ mod tests {
 
     #[test]
     fn dynamic_width_precision_explicit() {
-        assert_eq!(
-            render("{0:{1}}", &[Arg::U32(42), Arg::U32(5)]),
-            "   42"
-        );
-        assert_eq!(
-            render("{0:.{1}f}", &[f(3.14159), Arg::U32(2)]),
-            "3.14"
-        );
+        assert_eq!(render("{0:{1}}", &[Arg::U32(42), Arg::U32(5)]), "   42");
+        assert_eq!(render("{0:.{1}f}", &[f(3.14159), Arg::U32(2)]), "3.14");
         // reuse: value and width both reference arg 0
         assert_eq!(render("{0:{0}}", &[Arg::U32(5)]), "    5");
     }

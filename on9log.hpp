@@ -253,6 +253,26 @@ public:
     constexpr const char *tag() const noexcept { return tag_; }
     constexpr void set_tag(const char *tag) noexcept { tag_ = tag; }
 
+    static void set_level(on9log_level_t level) noexcept
+    {
+        on9log_set_level(level);
+    }
+
+    static on9log_level_t level() noexcept
+    {
+        return on9log_get_level();
+    }
+
+    static on9log_err_t set_tag_level(const char *tag, on9log_level_t level) noexcept
+    {
+        return on9log_set_tag_level(tag, level);
+    }
+
+    static on9log_err_t clear_tag_level(const char *tag) noexcept
+    {
+        return on9log_clear_tag_level(tag);
+    }
+
     template <typename... Args>
     void error(const char *format, Args &&...args) const noexcept
     {
@@ -509,5 +529,7 @@ public:
 private:
     const char *tag_;
 };
+
+inline constexpr Logger debug{"default"};
 
 } // namespace on9log

@@ -90,8 +90,21 @@ pub fn has_printf_conversion(fmt: &str) -> bool {
         if i < chars.len()
             && matches!(
                 chars[i],
-                'd' | 'i' | 'o' | 'u' | 'x' | 'X' | 'e' | 'E' | 'f' | 'F' | 'g' | 'G' | 'c' | 's'
-                    | 'p' | 'n'
+                'd' | 'i'
+                    | 'o'
+                    | 'u'
+                    | 'x'
+                    | 'X'
+                    | 'e'
+                    | 'E'
+                    | 'f'
+                    | 'F'
+                    | 'g'
+                    | 'G'
+                    | 'c'
+                    | 's'
+                    | 'p'
+                    | 'n'
             )
         {
             return true;
