@@ -6,7 +6,7 @@
 use std::io::Write;
 use std::path::PathBuf;
 use std::ptr;
-use std::sync::Arc;
+use std::rc::Rc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
@@ -83,7 +83,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(p) => match ElfStrings::from_path(p) {
             Ok(e) => {
                 eprintln!("on9log: loaded ELF {}", p.display());
-                Some(Arc::new(e))
+                Some(Rc::new(e))
             }
             Err(e) => {
                 eprintln!("on9log: failed to parse ELF {}: {e}", p.display());
@@ -104,55 +104,63 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    rt.block_on(run(
-        cli.port,
-        cli.baud,
+    rt.block_on(run(RunConfig {
+        port: cli.port,
+        baud: cli.baud,
         elf,
         use_color,
         width,
-        cli.timestamp,
-        !cli.no_esp_reset,
+        timestamp: cli.timestamp,
+        esp_reset: !cli.no_esp_reset,
         save,
-    ))?;
+    }))?;
     Ok(())
 }
 
-async fn run(
+struct RunConfig {
     port: String,
     baud: u32,
-    elf: Option<Arc<ElfStrings>>,
+    elf: Option<Rc<ElfStrings>>,
     use_color: bool,
     width: usize,
     timestamp: bool,
     esp_reset: bool,
-    mut save: Option<SaveLog>,
-) -> Result<(), Box<dyn std::error::Error>> {
+    save: Option<SaveLog>,
+}
+
+async fn run(mut cfg: RunConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let port = cfg.port;
+    let baud = cfg.baud;
     let mut serial = tokio_serial::new(&port, baud)
         .open_native_async()
         .map_err(|e| format!("opening {port}: {e}"))?;
 
-    if esp_reset {
+    if cfg.esp_reset {
         esp_hard_reset(&mut serial).map_err(|e| format!("resetting ESP target on {port}: {e}"))?;
     }
 
     let mut deframer = Deframer::new();
-    let mut decoder = Decoder::new();
-    let mut crash_decoder = CrashDecoder::new();
+    let mut state = DecodeState::new();
     let mut buf = vec![0u8; 4096];
     let mut stdin_buf = [0u8; 64];
-    let mut plain_text = PlainTextState::new();
-    let mut save_plain_text = PlainTextState::new();
     let mut monitor_keys = MonitorKeyState::new();
     let mut stdin = tokio::io::stdin();
     let raw_input = RawInputGuard::enter_if_interactive();
 
     eprintln!(
         "on9log: listening on {port} @ {baud} baud (width {width}, esp-reset {}, quit Ctrl+] Ctrl+T)",
-        if esp_reset { "on" } else { "off" }
+        if cfg.esp_reset { "on" } else { "off" },
+        width = cfg.width
     );
-    if let Some(save) = save.as_ref() {
+    if let Some(save) = cfg.save.as_ref() {
         eprintln!("on9log: saving decoded log to {}", save.path.display());
     }
+
+    let opts = RenderOptions {
+        use_color: cfg.use_color,
+        width: cfg.width,
+        timestamp: cfg.timestamp,
+    };
 
     loop {
         let n = if raw_input.is_active() {
@@ -180,15 +188,10 @@ async fn run(
         for outcome in deframer.feed(&buf[..n]) {
             handle_outcome(
                 outcome,
-                &mut decoder,
-                elf.as_deref(),
-                use_color,
-                width,
-                timestamp,
-                &mut plain_text,
-                &mut crash_decoder,
-                save.as_mut(),
-                &mut save_plain_text,
+                &mut state,
+                cfg.elf.as_deref(),
+                opts,
+                cfg.save.as_mut(),
             );
         }
     }
@@ -354,20 +357,45 @@ fn esp_hard_reset<P: SerialPort>(port: &mut P) -> tokio_serial::Result<()> {
     Ok(())
 }
 
-fn handle_outcome(
-    outcome: Outcome,
-    decoder: &mut Decoder,
-    elf: Option<&ElfStrings>,
+#[derive(Clone, Copy)]
+struct RenderOptions {
     use_color: bool,
     width: usize,
     timestamp: bool,
-    plain_text: &mut PlainTextState,
-    crash_decoder: &mut CrashDecoder,
+}
+
+struct DecodeState {
+    decoder: Decoder,
+    plain_text: PlainTextState,
+    crash_decoder: CrashDecoder,
+    save_plain_text: PlainTextState,
+}
+
+impl DecodeState {
+    fn new() -> Self {
+        Self {
+            decoder: Decoder::new(),
+            plain_text: PlainTextState::new(),
+            crash_decoder: CrashDecoder::new(),
+            save_plain_text: PlainTextState::new(),
+        }
+    }
+}
+
+fn handle_outcome(
+    outcome: Outcome,
+    state: &mut DecodeState,
+    elf: Option<&ElfStrings>,
+    opts: RenderOptions,
     mut save: Option<&mut SaveLog>,
-    save_plain_text: &mut PlainTextState,
 ) {
+    let RenderOptions {
+        use_color,
+        width,
+        timestamp,
+    } = opts;
     match outcome {
-        Outcome::Frame(frame) => match decoder.decode(&frame, elf) {
+        Outcome::Frame(frame) => match state.decoder.decode(&frame, elf) {
             DecodedPacket::Log(l) => {
                 let color_code = level_color(l.level);
                 let prefix = format!(
@@ -389,8 +417,8 @@ fn handle_outcome(
                 if let Some(save) = save.as_deref_mut() {
                     let _ = save.write_line(&format!("{prefix}{}", l.message));
                 }
-                plain_text.reset_line();
-                save_plain_text.reset_line();
+                state.plain_text.reset_line();
+                state.save_plain_text.reset_line();
             }
             DecodedPacket::Dropped(d) => {
                 let msg = format!(
@@ -401,8 +429,8 @@ fn handle_outcome(
                 if let Some(save) = save.as_deref_mut() {
                     let _ = save.write_line(&format!("{}{}", timestamp_prefix(timestamp), msg));
                 }
-                plain_text.reset_line();
-                save_plain_text.reset_line();
+                state.plain_text.reset_line();
+                state.save_plain_text.reset_line();
             }
             DecodedPacket::Buffer(b) => {
                 let color_code = level_color(b.level);
@@ -434,8 +462,8 @@ fn handle_outcome(
                 if let Some(save) = save.as_deref_mut() {
                     let _ = write_hexdump_to_file(save, &b.bytes, timestamp);
                 }
-                plain_text.reset_line();
-                save_plain_text.reset_line();
+                state.plain_text.reset_line();
+                state.save_plain_text.reset_line();
             }
             DecodedPacket::Other {
                 meta,
@@ -468,11 +496,11 @@ fn handle_outcome(
         Outcome::InvalidEscape => eprintln!("on9log: invalid SLIP escape, discarded"),
         Outcome::PlainText(bytes) => {
             let mut out = std::io::stdout().lock();
-            let _ = write_plain_text(&mut out, &bytes, timestamp, plain_text);
+            let _ = write_plain_text(&mut out, &bytes, timestamp, &mut state.plain_text);
             if let Some(save) = save.as_deref_mut() {
-                let _ = write_plain_text_saved(save, &bytes, timestamp, save_plain_text);
+                let _ = write_plain_text_saved(save, &bytes, timestamp, &mut state.save_plain_text);
             }
-            for annotation in crash_decoder.feed(&bytes, elf) {
+            for annotation in state.crash_decoder.feed(&bytes, elf) {
                 let _ = write_plain_annotation(&mut out, &annotation, timestamp);
                 if let Some(save) = save.as_deref_mut() {
                     let _ =

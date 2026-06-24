@@ -175,7 +175,7 @@ impl Decoder {
 
         let tag = resolve_tag(elf, frame.header.tag_id);
         let message = match elf.and_then(|e| e.read_format(frame.header.fmt_id)) {
-            Some(fmt) => printf::render(fmt, &args),
+            Some(fmt) => printf::render_format(fmt, &args),
             None => {
                 // No format string available: show address and a compact arg dump.
                 format!(

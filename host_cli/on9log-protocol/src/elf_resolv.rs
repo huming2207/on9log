@@ -87,10 +87,13 @@ impl ElfStrings {
         self.read_cstr_from(addr, |_| true)
     }
 
-    /// Read a format string. Format strings are expected to live in ESP-IDF's
-    /// ELF-only no-load section family.
+    /// Read a format string. C macro logs place formats in ESP-IDF's ELF-only
+    /// no-load section family. The C++ header wrapper accepts normal function
+    /// string arguments, so those literals remain in ordinary string-bearing
+    /// sections and are used as a fallback.
     pub fn read_format(&self, addr: u32) -> Option<&str> {
         self.read_cstr_from(addr, is_noload_section)
+            .or_else(|| self.read_cstr_from(addr, |_| true))
     }
 
     /// Read a normal tag string. Tags are expected in ordinary string-bearing
@@ -270,6 +273,23 @@ mod tests {
         assert_eq!(strings.read_format(4), Some("fmt"));
         assert_eq!(strings.read_tag(0x3f00_0000), Some("TAG"));
         assert_eq!(strings.read_tag(4), None);
+    }
+
+    #[test]
+    fn format_lookup_falls_back_to_rodata_for_cpp_wrapper() {
+        let strings = ElfStrings {
+            sections: vec![Section {
+                name: ".rodata".to_string(),
+                addr: 0x3f00_0000,
+                end: 0x3f00_0020,
+                data: b"value={}\0TAG\0".to_vec(),
+            }],
+            symbols: Vec::new(),
+            lines: None,
+        };
+
+        assert_eq!(strings.read_format(0x3f00_0000), Some("value={}"));
+        assert_eq!(strings.read_tag(0x3f00_0009), Some("TAG"));
     }
 
     #[test]

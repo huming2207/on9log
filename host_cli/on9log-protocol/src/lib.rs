@@ -23,6 +23,7 @@
 //! ```
 
 pub mod crash;
+pub mod cppfmt;
 pub mod crc;
 pub mod decode;
 pub mod elf_resolv;
@@ -34,5 +35,5 @@ pub use crash::CrashDecoder;
 pub use decode::{BufferRecord, DecodedPacket, Decoder, DroppedRecord, LogRecord, PacketMeta};
 pub use elf_resolv::{ElfStrings, ResolvedSymbol, SourceLocation};
 pub use framer::{Deframer, Outcome, RawFrame};
-pub use printf::Arg;
+pub use printf::{render_format, Arg};
 pub use wire::{ArgType, Header, Level, PacketType};

@@ -106,7 +106,12 @@ on9log_err_t on9log_dispatch_packet(const uint8_t *packet, size_t packet_len);
 #if defined(__GNUC__)
 #define ON9_LOG_DIAG_PUSH _Pragma("GCC diagnostic push")
 #define ON9_LOG_DIAG_POP _Pragma("GCC diagnostic pop")
-#define ON9_LOG_DIAG_IGNORE_FORMAT_OVERFLOW _Pragma("GCC diagnostic ignored \"-Wformat-overflow\"")
+
+// Avoid some weird issues on false-positive string formatting warning/errors from Clangd
+#define ON9_LOG_DIAG_IGNORE_FORMAT_OVERFLOW \
+    _Pragma("GCC diagnostic ignored \"-Wformat-overflow\"") \
+    _Pragma("GCC diagnostic ignored \"-Wformat-nonliteral\"") \
+    _Pragma("GCC diagnostic ignored \"-Wformat-security\"")
 #else
 #define ON9_LOG_DIAG_PUSH
 #define ON9_LOG_DIAG_POP

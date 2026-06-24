@@ -202,9 +202,31 @@ typedef enum {
 ```
 
 `ON9_LOGE/W/I/D/V()` and `ON9_LOG_BUF*()` use these on9log levels, not
-`ESP_LOG_*`. `ON9_LOG_ENABLED(level)` is controlled by `ON9_LOG_LOCAL_LEVEL`;
-users can define `ON9_LOG_LOCAL_LEVEL` before including `on9log.h` to override
-the default for one translation unit.
+`ESP_LOG_*`. C++ users can include `on9log.hpp` and use the header-only
+`on9log::Logger` wrapper instead:
+
+```c++
+using namespace on9log::literals;
+
+on9log::Logger log("demo");
+log.info("value={} name={}", value, name);
+log.info(ON9FMT("value={} name={}"), value, name);
+log.info<"value={} name={}">(value, name);
+log.info("value={} name={}"_on9fmt, value, name);
+log.warn("value=%d", value);
+log.buffer_info(bytes, len);
+```
+
+The wrapper calls the same `on9log_write()` / `on9log_write_buffer()` C APIs,
+builds the argument type table with C++ templates, avoids heap-allocating STL
+types, and is compatible with `-fno-exceptions` and `-fno-rtti`. Plain
+`logger.info("...", ...)` keeps the format literal in normal read-only flash.
+`ON9FMT("...")`, `logger.info<"...">(...)`, and
+`"..."_on9fmt` route through attributed static storage so the format can live in
+`.noload_keep_in_elf.*` instead.
+`ON9_LOG_ENABLED(level)` is controlled by `ON9_LOG_LOCAL_LEVEL`; users can
+define `ON9_LOG_LOCAL_LEVEL` before including `on9log.h` or `on9log.hpp` to
+override the default for one translation unit.
 
 In ESP-IDF builds, `Kconfig` exposes:
 
@@ -283,6 +305,20 @@ the ESP-IDF/ELF `.noload_keep_in_elf.<counter>` section attribute, but is empty
 on Apple/Mach-O targets where that section spelling is invalid. This keeps the
 core header usable outside ESP-IDF while preserving the ESP-IDF no-load behavior
 for firmware builds.
+
+`on9log.hpp` supports both flash-resident and no-load format strings. The plain
+`Logger::info("...", ...)` style API sends the normal string literal pointer as
+`fmt_id`; the host can still resolve it from the ELF, but the literal is kept in
+the flashed binary. Use `ON9FMT("...")`, the NTTP form
+`Logger::info<"...">(...)`, or the user-defined literal form
+`Logger::info("..."_on9fmt, ...)` when the format should be emitted into
+`.noload_keep_in_elf.*`.
+
+Both C++ forms are still address-only on the wire. Plain
+`Logger::info("...", ...)` does **not** copy the format string into the log
+packet; it sends the `.rodata` address as `fmt_id`. The no-load forms also send
+only an address, but that address points into the ELF-only no-load section. The
+only difference is whether the format literal is present in the flashed binary.
 
 Tags are currently passed as pointer values too. If a tag is static, the host can
 resolve it from the ELF or from normal read-only sections.
@@ -485,6 +521,11 @@ misleading: every helper it calls and every data object it reads, directly or
 indirectly, would also need to live in IRAM/DRAM. ESP interrupts registered with
 `ESP_INTR_FLAG_IRAM` should not use this path unless a future dedicated
 IRAM/DRAM-safe variant is added and audited end-to-end.
+
+The C++ `on9log::Logger` wrapper exposes matching
+`isr_error/warn/info/debug/verbose()` methods that call `on9log_write_isr()`.
+They are also header-only templates and reject dynamic string arguments at
+compile time, matching the C ISR path's runtime restriction.
 
 ## Locking And Atomics
 

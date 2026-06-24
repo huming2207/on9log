@@ -39,10 +39,8 @@ impl CrashDecoder {
             out.push(format!("--- crash reason: {reason}"));
         }
 
-        if is_abort_pc_line(line) {
-            if let Some(pc) = first_hex_addr(line) {
-                out.push(format!("--- abort PC: {}", format_addr(pc, elf)));
-            }
+        if is_abort_pc_line(line) && let Some(pc) = first_hex_addr(line) {
+            out.push(format!("--- abort PC: {}", format_addr(pc, elf)));
         }
 
         if let Some(backtrace) = line.find("Backtrace:") {

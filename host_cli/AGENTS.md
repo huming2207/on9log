@@ -155,6 +155,7 @@ host_cli/
       framer.rs              typed transport SLIP deframer + CRC verification + raw text
       elf_resolv.rs          goblin/addr2line address -> string/symbol/location resolver
       printf.rs              printf rendering via the `sprintf` crate (+ minimal scan)
+      cppfmt.rs              C++23 `std::format`-style rendering via `std::fmt` (+ spec pre-processor)
       decode.rs              stateful Decoder: arg decode + packet dispatch + seq gaps
       crash.rs               ESP panic reason/backtrace recognizer and annotator
   on9log-cli/
@@ -236,7 +237,9 @@ output section is kept in the ELF with file bytes at address 0.
 
 Format and tag resolution are intentionally separate:
 
-- `read_format(addr)` only reads from section names containing `.noload`;
+- `read_format(addr)` reads from section names containing `.noload` first, then
+  falls back to any string-bearing ELF section for plain `on9log.hpp`
+  `logger.info("...", ...)` formats;
 - `read_tag(addr)` reads from non-`.noload` sections.
 
 If multiple matching sections cover the same address and produce different
@@ -265,6 +268,82 @@ around `vsprintf`:
 The scanner does no formatting itself. `%.*s` consumes the precision argument
 before the string argument, matching the firmware's argument ordering. Null
 dynamic strings render as `(null)`.
+
+`printf.rs` also exposes `render_format(fmt, args)`, the dispatcher used by
+`decode.rs`. The dispatch rule is **C++ only if the string contains a C++23
+replacement field *and* no active printf conversion** (`has_printf_conversion`
+scans for a non-`%%` `%` ending in a conversion char). Mixed strings such as
+`"payload={} status=%d"` stay on the printf path so `%d` consumes its argument
+and `{}` is treated as a literal — this matches the firmware macro's
+`format(printf, 3, 5)` annotation, which is how the compiler interprets the
+string. Pure `{}`-style strings (no `%` conversions) route to `cppfmt::render`,
+so a single firmware ELF can carry a mix of `%`-style and `{}`-style format
+strings and each is decoded by the appropriate renderer. Note: a bare `%`
+followed by a conversion-looking sequence (e.g. `% d`, which is a valid printf
+space-flag conversion) wins the printf path; C++-style authors must not leave an
+unescaped `%` immediately before a conversion letter.
+
+`cppfmt.rs` renders C++23 `std::format`-style format strings (`{}`, `{:d}`,
+`{0:>10.2f}`, ...) against the same decoded `Arg` values, using Rust's
+`std::fmt` for the core value conversion. `std::fmt` cannot parse a *runtime*
+format string (`format!`/`format_args!` require a literal and
+`fmt::Arguments` has no public dynamic constructor), so the module is split
+into a spec pre-processor and a value renderer:
+
+- The pre-processor parses the C++23 field grammar
+  (`[fill align][sign][#][0][width][.precision][type]`) into a `Spec` and
+  interprets the type character. Rust's format spec has no `d` (decimal-forced),
+  `s` (string-forced), or `c` (char-from-codepoint) type characters, so those
+  are handled here by picking the right Rust trait/conversion before padding.
+  `x`/`X`/`o`/`b`/`e`/`E` map to `LowerHex`/`UpperHex`/`Octal`/`Binary`/
+  `LowerExp`/`UpperExp`; `p` renders `0x` + lowercase hex; `f`/`F` use `Display`
+  with precision (fixed); `g`/`G` use `{:?}` shortest round-trip. Width and
+  precision may themselves be nested replacement fields (`{:{}}`, `{:.{}}`,
+  `{0:{1}}`); a referenced argument must be an integer, and a negative dynamic
+  width/precision is a render error (C++23 semantics, also guards against a
+  stray `0xffffffff` producing a multi-gigabyte pad). Auto arg-id assignment
+  order within one field is value -> width -> precision.
+- The renderer produces the core string via `format!` with literal specs
+  (`format!("{:x}", v)`, `format!("{:.prec$e}", xa, prec = p)`, ...), then
+  applies sign, `#` prefix, `0` zero-pad-inside, integer precision (minimum
+  digits, zero-padded after the prefix; precision 0 with value 0 yields the
+  empty string), and width/fill/align itself. The `0` flag is ignored when an
+  align is present (any type) or when a precision is specified for integer
+  types.
+
+`{}` defaults follow the wire argument type: `Arg::Str` -> string, `Arg::Ptr`
+-> `0x` address, `Arg::U32`/`Arg::U64` -> unsigned decimal, `Arg::U64` with a
+float type -> `f64` (bit-cast). Automatic (`{}`) and explicit (`{0}`) arg ids
+cannot be mixed anywhere in the string, including in nested width/precision
+refs (C++ format error). Supported type characters are `b B c d e E f F g G o p
+s x X` plus empty. The intentionally unsupported C++ format features are:
+`L` locale formatting (`{:L}` and friends), `a`/`A` hex-float formatting,
+chrono format specs, tuple formatters, and range formatters. Using any of these
+should yield a `<render error: ...>` marker so the log line stays visible rather
+than being silently misdecoded. Detection (`looks_like_cpp`) treats a token as a
+field only if `{` is followed by optional digits and then `:` or `}`, so printf
+strings with literal braces like `json {key=%d}` are not misrouted.
+
+Known limitations: `g` precision is not exactly C++ significant-digit
+semantics; Rust's `LowerExp`/`UpperExp` use a 1-digit exponent (`e0`) versus
+C++'s `e+00`; `#` for floats (forced decimal point) is ignored. The wire
+carries no signedness and no int/float distinction for 64-bit values, so `{}`
+on an `Arg::U64` renders the raw bit pattern as an unsigned integer — use
+explicit type chars (`{:f}`, `{:d}`) when the default is ambiguous. Correcting
+the `{}` default for signed/float 64-bit values is not a pure host fix: it
+requires richer firmware wire metadata (e.g. separate signed/float type codes
+in `ON9_LOG_ARGS_TYPE_*`), since `Arg::U64` today cannot tell `int64_t` /
+`uint64_t` / `double` apart.
+
+C++ formatting is host-side only: it does not change firmware logging cost or
+wire size. The current implementation reparses each `{}`-style format string on
+every decoded packet, which is acceptable for normal UART monitor rates but is
+the obvious performance cost for high-rate replay or very chatty logs. If this
+becomes measurable, the preferred fix is to cache parsed format plans by
+`fmt_id` in `Decoder`: first resolve the ELF string, decide printf vs C++ once,
+parse C++ specs once, then render future packets from the cached plan. Cache
+parse failures too so a bad format string is not reparsed forever. Avoid deeper
+micro-optimizations until a benchmark shows parsed-plan caching is insufficient.
 
 `decode.rs` owns the stateful `Decoder`. It tracks `last_seq` and reports
 sequence gaps using wrapping arithmetic (`gap = seq - (last + 1)`, correct across
@@ -338,7 +417,13 @@ resolver splits lookup by section family rather than doing one generic scan:
 - **`fmt_id`** — `ON9_LOG_NOLOAD_STR(format)` wraps constant format strings in
   `ON9_LOG_NOLOAD_ATTR`, which emits input sections `.noload_keep_in_elf.<n>`.
   ESP-IDF's linker captures these into a dedicated ELF-only output section, so
-  `fmt_id` is a **small offset near 0**, not a loadable rodata address.
+  `fmt_id` is a **small offset near 0**, not a loadable rodata address. The
+  `on9log.hpp` C++ wrapper can also produce no-load formats via `ON9FMT("...")`,
+  `logger.info<"...">(...)`, or `"..."_on9fmt`. Its plain
+  `logger.info("...", ...)` overload uses ordinary function arguments, so those
+  literals remain in normal read-only sections; `ElfStrings::read_format()`
+  checks no-load sections first, then falls back to ordinary string-bearing ELF
+  sections for that wrapper.
 - **`tag_id`** — tags are passed straight through (`ON9_LOG_LEVEL(tag, ...)`)
   and land in ordinary `.rodata`, so `tag_id` is a real loadable address
   (e.g. `0x3f4xxxxx` on ESP32-S3).
@@ -406,6 +491,18 @@ warnings`, but these review findings are still open:
   `sprintf` error the CLI preserves the log by printing `<render error: ...>` plus
   the original format string. This is intentional recovery, not complete printf
   coverage.
+- **C++23 `{}` defaults cannot recover signedness/float-ness from the wire.**
+  `cppfmt.rs` `{}`
+  renders `Arg::U64` as an unsigned integer because the on9log wire
+  (`ON9_LOG_ARGS_TYPE_*`) only distinguishes 32-bit / 64-bit / pointer / string,
+  not signed vs. unsigned vs. `double`. `{:d}`, `{:f}`, etc. work correctly via
+  explicit type chars; the ambiguous `{}` default is a firmware wire-format
+  limitation, not a pure host bug, and needs richer argument type metadata to
+  fix.
+- **C++23 rendering reparses format strings today.** This is a host-side CPU
+  cost only. The first performance fix should be a `fmt_id` keyed cache of
+  parsed render plans in `Decoder`, including cached parse failures. That avoids
+  repeating C++ field parsing and printf/C++ dispatch for hot log sites.
 - **Decoded on9log messages lose repeated whitespace when wrapped.** `term::wrap`
   splits on whitespace, so multiple spaces/tabs inside decoded messages are
   collapsed. Verified type `0x02` text transport frames and printable raw UART
@@ -457,17 +554,26 @@ decoding.
   or clap dependency; only `on9log_cli` needs those runtime/presentation crates.
   This keeps a future `napi-rs` binding small and sync-friendly.
 - **goblin for ELF.** Resolves `fmt_id`/`tag_id` addresses to C strings. Format
-  strings are resolved only from section names containing `.noload`, including
-  ESP-IDF's VMA-0 ELF-only no-load output section. Tags are resolved from normal
-  non-`.noload` sections. goblin is the user-chosen parser.
-- **sprintf for printf rendering.** Format strings are rendered by the `sprintf`
-  crate, not a hand-rolled renderer. Because `sprintf` dispatches by Rust type
-  and the wire carries no signedness, `printf.rs` scans the format to coerce each
-  argument to the correct type (`i8`/`u8` for `hh`, `i16`/`u16` for `h`,
-  `i32`/`u32` for default/32-bit ESP32 `long`, `i64`/`u64` for `ll`, `f64` for
-  floats, raw pointer for `%p`, `String` for `%s`). It also resolves `*`
-  width/precision to literals to work around a `sprintf` 0.4.3 bug where `%.*s`
-  rejects its `*` argument. The scanner does no formatting.
+  strings are resolved from section names containing `.noload` first, including
+  ESP-IDF's VMA-0 ELF-only no-load output section, then from ordinary
+  string-bearing sections for plain `on9log.hpp` formats. Tags are resolved
+  from normal non-`.noload` sections. goblin is the user-chosen parser.
+- **sprintf for printf rendering.** `%`-style format strings are rendered by
+  the `sprintf` crate, not a hand-rolled renderer. Because `sprintf` dispatches
+  by Rust type and the wire carries no signedness, `printf.rs` scans the format
+  to coerce each argument to the correct type (`i8`/`u8` for `hh`, `i16`/`u16`
+  for `h`, `i32`/`u32` for default/32-bit ESP32 `long`, `i64`/`u64` for `ll`,
+  `f64` for floats, raw pointer for `%p`, `String` for `%s`). It also resolves
+  `*` width/precision to literals to work around a `sprintf` 0.4.3 bug where
+  `%.*s` rejects its `*` argument. The scanner does no formatting.
+- **std::fmt for C++23 rendering, with a spec pre-processor.** `{}`-style
+  format strings are rendered by `cppfmt.rs`, which uses Rust's `std::fmt`
+  traits for core value conversion and a hand-written pre-processor for the
+  C++23 spec grammar (because `std::fmt` cannot parse a runtime format string).
+  `printf::render_format` dispatches per string: C++ only if there is a C++
+  field and no active printf conversion, so mixed strings stay on the printf
+  path. `d`/`s`/`c` type chars (which Rust's format spec lacks) and nested
+  dynamic width/precision (`{:{}}`) are handled by the pre-processor.
 - **crossterm for terminal size.** Window width comes from
   `crossterm::terminal::size()` (cross-platform `ioctl`); colors remain raw ANSI
   SGR codes emitted inline so wrapped lines stay colored.
@@ -499,6 +605,12 @@ decoding.
 - **printf scope.** Rendering is delegated to `sprintf`, which covers the
   conversions used by ESP-IDF-style log formats. On a `sprintf` error the format
   string is returned with a marker so the log line is not lost.
+- **C++23 renderer scope.** `cppfmt.rs` implements the common `std::format`
+  cases used in firmware logs. It intentionally does not support `{:L}` locale
+  formatting, `{:a}`/`{:A}` hex-float formatting, C++ chrono format specs, tuple
+  formatters, or range formatters; those should surface as `<render error: ...>`
+  markers. `{}` cannot recover signed/float 64-bit semantics from the wire (see
+  Known Implementation Risks); explicit type chars work.
 - **Cross-platform.** Linux and macOS are supported; `crossterm` handles the
   platform-specific terminal-size syscall. Other platforms fall back to the
   `COLUMNS` env var / default width.

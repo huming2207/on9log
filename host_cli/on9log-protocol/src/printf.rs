@@ -22,6 +22,85 @@
 
 use sprintf::{Printf, vsprintf};
 
+/// Dispatch `fmt` to the right renderer.
+///
+/// A format string is routed to the C++23 ([`crate::cppfmt`]) renderer only if
+/// it contains a C++23-style replacement field *and* no active printf
+/// conversion. Mixed strings such as `"payload={} status=%d"` stay on the
+/// printf path so the `%d` consumes its argument and `{}` is treated as a
+/// literal — this matches the firmware macro's `format(printf, 3, 5)`
+/// annotation, which is how the compiler interprets the string. Pure `{}`-style
+/// strings (no `%` conversions) route to the C++ renderer.
+pub fn render_format(fmt: &str, args: &[Arg]) -> String {
+    if crate::cppfmt::looks_like_cpp(fmt) && !has_printf_conversion(fmt) {
+        crate::cppfmt::render(fmt, args)
+    } else {
+        render(fmt, args)
+    }
+}
+
+/// True if `fmt` contains at least one active printf conversion — a `%` (not
+/// `%%`) followed by optional flags/width/precision/length modifiers and then a
+/// conversion character in `[diouxXeEfgGcspn]`. Used by [`render_format`] to
+/// keep mixed strings on the printf path.
+pub fn has_printf_conversion(fmt: &str) -> bool {
+    let chars: Vec<char> = fmt.chars().collect();
+    let mut i = 0usize;
+    while i < chars.len() {
+        if chars[i] != '%' {
+            i += 1;
+            continue;
+        }
+        i += 1;
+        if i >= chars.len() {
+            break;
+        }
+        if chars[i] == '%' {
+            i += 1;
+            continue;
+        }
+        // flags
+        while i < chars.len() && matches!(chars[i], '-' | '+' | ' ' | '#' | '0') {
+            i += 1;
+        }
+        // width
+        if i < chars.len() && chars[i] == '*' {
+            i += 1;
+        } else {
+            while i < chars.len() && chars[i].is_ascii_digit() {
+                i += 1;
+            }
+        }
+        // precision
+        if i < chars.len() && chars[i] == '.' {
+            i += 1;
+            if i < chars.len() && chars[i] == '*' {
+                i += 1;
+            } else {
+                while i < chars.len() && chars[i].is_ascii_digit() {
+                    i += 1;
+                }
+            }
+        }
+        // length modifiers (handles hh/ll by consuming runs)
+        while i < chars.len() && matches!(chars[i], 'h' | 'l' | 'j' | 'z' | 't' | 'L') {
+            i += 1;
+        }
+        // conversion character
+        if i < chars.len()
+            && matches!(
+                chars[i],
+                'd' | 'i' | 'o' | 'u' | 'x' | 'X' | 'e' | 'E' | 'f' | 'F' | 'g' | 'G' | 'c' | 's'
+                    | 'p' | 'n'
+            )
+        {
+            return true;
+        }
+        // not a valid conversion; keep scanning from here
+    }
+    false
+}
+
 /// One decoded argument value, already typed via the payload's arg-type table.
 #[derive(Debug, Clone)]
 pub enum Arg {
@@ -316,6 +395,24 @@ fn unsigned_int(v: u64, len: Length) -> Owned {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn has_printf_conversion_detects_active_conversions() {
+        assert!(has_printf_conversion("n=%d"));
+        assert!(has_printf_conversion("v=0x%04x s=%s"));
+        assert!(has_printf_conversion("%llu %c %p %f %%trailer"));
+        // length modifiers and mixed flags
+        assert!(has_printf_conversion("%hhd %ld %lf"));
+        assert!(has_printf_conversion("%*d %.*s"));
+        // escaped percent is not a conversion
+        assert!(!has_printf_conversion("load=50%%"));
+        // bare trailing percent (no conversion char after) is not a conversion
+        assert!(!has_printf_conversion("100%"));
+        // `% d` (space flag + d) IS a real conversion, so this is true
+        assert!(has_printf_conversion("100% done"));
+        // `%` followed by a non-conversion letter is not a conversion
+        assert!(!has_printf_conversion("foo %bar"));
+    }
 
     #[test]
     fn simple_int_and_string() {
