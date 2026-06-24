@@ -304,6 +304,84 @@ static void on9log_emit_header(on9log_stream_t *stream,
     }
 }
 
+static bool on9log_arg_types_are_isr_safe(const char *arg_types)
+{
+    for (unsigned idx = 0;; ++idx) {
+        uint8_t arg_type = on9log_arg_type_at(arg_types, idx);
+        switch (arg_type) {
+        case ON9_LOG_ARGS_TYPE_NONE:
+            return true;
+        case ON9_LOG_ARGS_TYPE_32BITS:
+        case ON9_LOG_ARGS_TYPE_64BITS:
+        case ON9_LOG_ARGS_TYPE_POINTER:
+            break;
+        case ON9_LOG_ARGS_TYPE_DYNAMIC_STRING:
+        default:
+            return false;
+        }
+        if (idx == UINT8_MAX) {
+            return false;
+        }
+    }
+}
+
+static bool on9log_encode_isr_log_packet(uint8_t *packet,
+                                         size_t packet_cap,
+                                         size_t *packet_len,
+                                         on9log_level_t level,
+                                         const char *tag,
+                                         const char *format,
+                                         const char *arg_types,
+                                         va_list *args)
+{
+    on9log_encoder_t enc = {
+        .cap = packet_cap,
+        .data = packet,
+    };
+    uint8_t arg_count = on9log_arg_count(arg_types);
+
+    on9log_put_header(&enc,
+                      ON9LOG_PKT_LOG,
+                      level,
+                      (uint16_t)atomic_fetch_add_explicit(&s_seq, 1, memory_order_relaxed),
+                      on9log_port_isr_timestamp_ms(),
+                      (uint32_t)(uintptr_t)tag,
+                      (uint32_t)(uintptr_t)format,
+                      ON9LOG_PAYLOAD_LEN_STREAMING);
+    on9log_put_u8(&enc, arg_count);
+    for (unsigned idx = 0; idx < arg_count; ++idx) {
+        on9log_put_u8(&enc, on9log_arg_type_at(arg_types, idx));
+    }
+
+    for (unsigned idx = 0; idx < arg_count; ++idx) {
+        switch (on9log_arg_type_at(arg_types, idx)) {
+        case ON9_LOG_ARGS_TYPE_32BITS:
+            on9log_put_u32(&enc, va_arg(*args, uint32_t));
+            break;
+        case ON9_LOG_ARGS_TYPE_64BITS:
+            on9log_put_u64(&enc, va_arg(*args, uint64_t));
+            break;
+        case ON9_LOG_ARGS_TYPE_POINTER: {
+            const void *ptr = va_arg(*args, const void *);
+            on9log_put_u32(&enc, (uint32_t)(uintptr_t)ptr);
+            break;
+        }
+        case ON9_LOG_ARGS_TYPE_NONE:
+        case ON9_LOG_ARGS_TYPE_DYNAMIC_STRING:
+        default:
+            enc.overflow = true;
+            break;
+        }
+    }
+
+    if (enc.overflow) {
+        return false;
+    }
+
+    *packet_len = enc.len;
+    return true;
+}
+
 static void on9log_emit_dropped_packet(uint32_t dropped_count)
 {
     on9log_stream_t stream = {0};
@@ -405,6 +483,34 @@ uint32_t on9log_get_dropped_count(void)
     return (uint32_t)atomic_load_explicit(&s_dropped_count, memory_order_relaxed);
 }
 
+on9log_err_t on9log_dispatch_packet(const uint8_t *packet, size_t packet_len)
+{
+    uint32_t dropped_count = 0;
+    on9log_stream_t stream = {0};
+
+    if (packet == NULL || packet_len < sizeof(on9log_packet_header_t)) {
+        return ON9LOG_ERR_INVALID_ARG;
+    }
+    if (packet[0] != ON9LOG_PACKET_MAGIC) {
+        return ON9LOG_ERR_INVALID_ARG;
+    }
+
+    dropped_count = (uint32_t)atomic_exchange_explicit(&s_dropped_count, 0, memory_order_acq_rel);
+    if (dropped_count != 0) {
+        on9log_emit_dropped_packet(dropped_count);
+    }
+
+    on9log_stream_start(&stream, packet, sizeof(on9log_packet_header_t));
+    on9log_stream_payload(&stream,
+                          &packet[sizeof(on9log_packet_header_t)],
+                          packet_len - sizeof(on9log_packet_header_t),
+                          0,
+                          ON9LOG_PAYLOAD_META_ARG_INDEX);
+    on9log_stream_end(&stream);
+
+    return ON9LOG_OK;
+}
+
 void on9log_write(on9log_level_t level,
                   const char *tag,
                   const char *format,
@@ -442,6 +548,40 @@ void on9log_write(on9log_level_t level,
     on9log_stream_end(&stream);
 
     va_end(args);
+}
+
+bool on9log_write_isr(on9log_level_t level,
+                      const char *tag,
+                      const char *format,
+                      const char *arg_types,
+                      ...)
+{
+    uint8_t packet[ON9LOG_ISR_PACKET_MAX];
+    size_t packet_len = 0;
+    bool ok = false;
+
+    if (!on9log_level_enabled(level, tag)) {
+        return true;
+    }
+    if (!on9log_port_isr_ready()) {
+        return true;
+    }
+    if (!on9log_arg_types_are_isr_safe(arg_types)) {
+        atomic_fetch_add_explicit(&s_dropped_count, 1, memory_order_relaxed);
+        return false;
+    }
+
+    va_list args;
+    va_start(args, arg_types);
+    ok = on9log_encode_isr_log_packet(packet, sizeof(packet), &packet_len, level, tag, format, arg_types, &args);
+    va_end(args);
+
+    if (!ok || !on9log_port_isr_enqueue_packet(packet, packet_len)) {
+        atomic_fetch_add_explicit(&s_dropped_count, 1, memory_order_relaxed);
+        return false;
+    }
+
+    return true;
 }
 
 void on9log_write_buffer(on9log_level_t level,

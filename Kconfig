@@ -64,4 +64,38 @@ menu "on9log"
             default 3072-byte ESP stdio VFS transport frame; logs with multiple
             large dynamic strings can still exceed the transport frame cap.
 
+    config ON9LOG_ISR_PACKET_MAX
+        int "Maximum encoded ISR log packet size"
+        range 32 3072
+        default 128
+        help
+            Maximum complete on9log packet size encoded on the stack by
+            ON9_ISR_LOGx(). ISR logs that exceed this size are dropped.
+
+    config ON9LOG_ESP_ISR_RINGBUF_SIZE
+        int "ESP ISR log ringbuffer size"
+        range 256 65536
+        default 2048
+        help
+            Size in bytes of the ESP-IDF no-split ringbuffer used to transfer
+            ON9_ISR_LOGx() packets from ISR context to the drain task. No-split
+            ringbuffers require overhead and cannot use the whole buffer for one
+            item, so keep this comfortably larger than twice
+            CONFIG_ON9LOG_ISR_PACKET_MAX.
+
+    config ON9LOG_ESP_ISR_DRAIN_TASK_STACK_SIZE
+        int "ESP ISR log drain task stack size"
+        range 2048 8192
+        default 2048
+        help
+            Stack size in bytes for the ESP ISR log drain task.
+
+    config ON9LOG_ESP_ISR_DRAIN_TASK_PRIORITY
+        int "ESP ISR log drain task priority"
+        range 1 24
+        default 5
+        help
+            FreeRTOS priority for the task that drains ISR log packets and
+            dispatches them through the normal on9log sink path.
+
 endmenu

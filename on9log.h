@@ -54,11 +54,24 @@ void on9log_write(on9log_level_t level,
                   const char *arg_types,
                   ...) __attribute__((format(printf, 3, 5)));
 
+/*
+ * Encodes a bounded packet and enqueues it through the platform ISR backend.
+ * Dynamic string arguments are not supported on the ISR path.
+ */
+bool on9log_write_isr(on9log_level_t level,
+                      const char *tag,
+                      const char *format,
+                      const char *arg_types,
+                      ...) __attribute__((format(printf, 3, 5)));
+
 /* on9log_write_buffer() and ON9_LOG_BUF*() must not be called from ISR context. */
 void on9log_write_buffer(on9log_level_t level,
                          const char *tag,
                          const void *buffer,
                          size_t buffer_len);
+
+/* Dispatches one complete raw on9log packet through the normal sink path. */
+on9log_err_t on9log_dispatch_packet(const uint8_t *packet, size_t packet_len);
 
 #ifdef __cplusplus
 }
@@ -246,6 +259,22 @@ constexpr unsigned long long ON9_LOG_DETECT_TYPE_IMPL(const T &, bool is_constan
 #define ON9_LOGI(tag, format, ...) ON9_LOG_LEVEL(ON9_LOG_LEVEL_INFO, tag, format, ##__VA_ARGS__)
 #define ON9_LOGD(tag, format, ...) ON9_LOG_LEVEL(ON9_LOG_LEVEL_DEBUG, tag, format, ##__VA_ARGS__)
 #define ON9_LOGV(tag, format, ...) ON9_LOG_LEVEL(ON9_LOG_LEVEL_VERBOSE, tag, format, ##__VA_ARGS__)
+
+#define ON9_ISR_LOG_LEVEL(level, tag, format, ...) do { \
+        if (ON9_LOG_ENABLED(level)) { \
+            ON9_LOG_DIAG_PUSH; \
+            ON9_LOG_DIAG_IGNORE_FORMAT_OVERFLOW; \
+            const char __on9log_isr_arg_types[] = { __VA_OPT__(ON9_LOG_INIT_ARG_TYPE(ON9_LOG_VA_NARG(__VA_ARGS__), __VA_ARGS__), ) 0 }; \
+            (void)on9log_write_isr((level), (tag), ON9_LOG_ATTR_STR(format), (const char *)__on9log_isr_arg_types, ##__VA_ARGS__); \
+            ON9_LOG_DIAG_POP; \
+        } \
+    } while (0)
+
+#define ON9_ISR_LOGE(tag, format, ...) ON9_ISR_LOG_LEVEL(ON9_LOG_LEVEL_ERROR, tag, format, ##__VA_ARGS__)
+#define ON9_ISR_LOGW(tag, format, ...) ON9_ISR_LOG_LEVEL(ON9_LOG_LEVEL_WARN, tag, format, ##__VA_ARGS__)
+#define ON9_ISR_LOGI(tag, format, ...) ON9_ISR_LOG_LEVEL(ON9_LOG_LEVEL_INFO, tag, format, ##__VA_ARGS__)
+#define ON9_ISR_LOGD(tag, format, ...) ON9_ISR_LOG_LEVEL(ON9_LOG_LEVEL_DEBUG, tag, format, ##__VA_ARGS__)
+#define ON9_ISR_LOGV(tag, format, ...) ON9_ISR_LOG_LEVEL(ON9_LOG_LEVEL_VERBOSE, tag, format, ##__VA_ARGS__)
 
 #define ON9_LOG_BUF_LEVEL(level, tag, buffer, buffer_len) do { \
         if (ON9_LOG_ENABLED(level)) { \

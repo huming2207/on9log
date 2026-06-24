@@ -52,3 +52,15 @@
 #if ON9LOG_MAX_DYNAMIC_STRING_LEN > UINT32_MAX - 1u
 #error "ON9LOG_MAX_DYNAMIC_STRING_LEN must fit in a non-null uint32_t string length"
 #endif
+
+#ifndef ON9LOG_ISR_PACKET_MAX
+#ifdef CONFIG_ON9LOG_ISR_PACKET_MAX
+#define ON9LOG_ISR_PACKET_MAX CONFIG_ON9LOG_ISR_PACKET_MAX
+#else
+#define ON9LOG_ISR_PACKET_MAX 128u
+#endif
+#endif
+
+#if ON9LOG_ISR_PACKET_MAX < 32
+#error "ON9LOG_ISR_PACKET_MAX must be at least 32"
+#endif

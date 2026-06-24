@@ -213,6 +213,10 @@ CONFIG_ON9LOG_MAXIMUM_LEVEL
 CONFIG_ON9LOG_MAX_SINKS
 CONFIG_ON9LOG_BUFFER_CHUNK_SIZE
 CONFIG_ON9LOG_MAX_DYNAMIC_STRING_LEN
+CONFIG_ON9LOG_ISR_PACKET_MAX
+CONFIG_ON9LOG_ESP_ISR_RINGBUF_SIZE
+CONFIG_ON9LOG_ESP_ISR_DRAIN_TASK_STACK_SIZE
+CONFIG_ON9LOG_ESP_ISR_DRAIN_TASK_PRIORITY
 ```
 
 `on9log_config.h` maps `CONFIG_ON9LOG_MAXIMUM_LEVEL` to the default
@@ -221,7 +225,8 @@ CONFIG_ON9LOG_MAX_DYNAMIC_STRING_LEN
 3042 bytes, and `CONFIG_ON9LOG_MAX_DYNAMIC_STRING_LEN` to
 `ON9LOG_MAX_DYNAMIC_STRING_LEN`, defaulting to 1024 bytes. Outside ESP-IDF,
 `on9log_config.h` falls back to INFO level, 4 sinks, the same 3042-byte buffer
-chunk size, and the same 1024-byte dynamic string cap.
+chunk size, the same 1024-byte dynamic string cap, and a 128-byte maximum ISR
+packet size.
 
 Platform-specific services are isolated behind `on9log_port.h`:
 
@@ -437,6 +442,49 @@ ON9_LOG_BUFI(TAG, buffer, len);
 ON9_LOG_BUFD(TAG, buffer, len);
 ON9_LOG_BUFV(TAG, buffer, len);
 ```
+
+## ISR Logging
+
+Normal `ON9_LOGx()` and `ON9_LOG_BUF*()` remain task-context APIs and must not be
+called from ISR context.
+
+`ON9_ISR_LOGE/W/I/D/V()` provide a constrained ISR-safe ingress path. They encode
+one complete on9log packet into a fixed stack buffer of
+`ON9LOG_ISR_PACKET_MAX` bytes, defaulting to 128, and enqueue that packet through
+`on9log_port_isr_enqueue_packet()`. They do not call sinks, VFS, network APIs, or
+blocking UART writes directly from the ISR. Dynamic string arguments are rejected
+on this path; only 32-bit, 64-bit, and pointer arguments are supported. If packet
+encoding exceeds `ON9LOG_ISR_PACKET_MAX`, unsupported argument types are used, or
+the initialized queue is full, the logger increments the normal dropped-packet
+counter.
+
+On ESP-IDF, `on9log_esp_isr.c` implements the ISR enqueue backend using
+Espressif's `freertos/ringbuf.h` no-split ringbuffer. The user must call
+`on9log_esp_isr_init()` during startup, after registering the sinks/transports
+that should receive ISR logs, to create the ringbuffer and a drain task. The ISR
+path checks `on9log_port_isr_ready()` first; if the backend was not initialized,
+`ON9_ISR_LOGx()` is a no-op and does not increment the dropped counter. Once
+initialized, the ISR side uses `xRingbufferSendFromISR()` and returns immediately
+if there is not enough space. The drain task calls `on9log_dispatch_packet()` in
+normal task context, so configured sinks such as the default VFS sink, MQTT, or
+WebSocket forwarders still receive complete on9log packets without doing network
+or VFS I/O inside the ISR. Because ESP-IDF no-split ringbuffers reserve item
+overhead and cannot use the whole buffer for a single item, keep
+`CONFIG_ON9LOG_ESP_ISR_RINGBUF_SIZE` comfortably larger than twice
+`CONFIG_ON9LOG_ISR_PACKET_MAX`.
+
+This ESP ringbuffer backend is intentionally platform-specific. Future
+non-ESP ports should implement `on9log_port_isr_enqueue_packet()` using the
+platform's own ISR-safe queue, lock-free ring, or interrupt-safe handoff
+primitive.
+
+`ON9_ISR_LOGx()` is ISR-safe in the normal FreeRTOS sense, but it is not
+guaranteed IRAM-safe or flash-cache-disabled safe on ESP-IDF. The current path is
+not marked `IRAM_ATTR`, and marking only the public function would be
+misleading: every helper it calls and every data object it reads, directly or
+indirectly, would also need to live in IRAM/DRAM. ESP interrupts registered with
+`ESP_INTR_FLAG_IRAM` should not use this path unless a future dedicated
+IRAM/DRAM-safe variant is added and audited end-to-end.
 
 ## Locking And Atomics
 
