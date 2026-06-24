@@ -8,6 +8,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -36,6 +37,14 @@
 
 #define ESP_STDIO_LOG_VFS_CRC16_CCITT_INIT 0xffffu
 
+// Transport frame bytes are batched into this many bytes before calling
+// write(). Sized to the ESP32 UART TX FIFO depth (128 bytes): a batch that fits
+// in an empty FIFO returns without blocking on TX drain, and most on9log frames
+// fit in a single batch, so a typical packet costs one write() instead of one
+// per payload byte. Larger frames flush in 128-byte chunks; the SLIP start/end
+// markers delimit frames on the wire, not write() call boundaries.
+#define ESP_STDIO_LOG_VFS_WRITE_BATCH 128u
+
 typedef struct {
     int outputs[ESP_STDIO_LOG_VFS_MAX_OUTPUTS];
     size_t output_count;
@@ -48,19 +57,36 @@ static esp_stdio_log_vfs_t s_esp_stdio_log_vfs = {
     .installed = false,
 };
 static SemaphoreHandle_t s_transport_mutex = NULL;
+static StaticSemaphore_t s_transport_mutex_storage;
+static portMUX_TYPE s_transport_mutex_init_lock = portMUX_INITIALIZER_UNLOCKED;
+
+static SemaphoreHandle_t esp_stdio_log_vfs_get_transport_mutex(void)
+{
+    SemaphoreHandle_t mutex = s_transport_mutex;
+    if (mutex != NULL) {
+        return mutex;
+    }
+
+    taskENTER_CRITICAL(&s_transport_mutex_init_lock);
+    if (s_transport_mutex == NULL) {
+        s_transport_mutex = xSemaphoreCreateMutexStatic(&s_transport_mutex_storage);
+    }
+    mutex = s_transport_mutex;
+    taskEXIT_CRITICAL(&s_transport_mutex_init_lock);
+
+    return mutex;
+}
 
 static void esp_stdio_log_vfs_transport_lock(void)
 {
-    if (s_transport_mutex == NULL) {
-        s_transport_mutex = xSemaphoreCreateMutex();
-    }
-    if (s_transport_mutex == NULL) {
+    SemaphoreHandle_t mutex = esp_stdio_log_vfs_get_transport_mutex();
+    if (mutex == NULL) {
         return;
     }
     if (xTaskGetSchedulerState() == taskSCHEDULER_NOT_STARTED) {
         return;
     }
-    xSemaphoreTake(s_transport_mutex, portMAX_DELAY);
+    xSemaphoreTake(mutex, portMAX_DELAY);
 }
 
 static void esp_stdio_log_vfs_transport_unlock(void)
@@ -68,8 +94,9 @@ static void esp_stdio_log_vfs_transport_unlock(void)
     if (xTaskGetSchedulerState() == taskSCHEDULER_NOT_STARTED) {
         return;
     }
-    if (s_transport_mutex != NULL) {
-        xSemaphoreGive(s_transport_mutex);
+    SemaphoreHandle_t mutex = s_transport_mutex;
+    if (mutex != NULL) {
+        xSemaphoreGive(mutex);
     }
 }
 
@@ -131,62 +158,91 @@ static bool esp_stdio_log_vfs_write_all(int fd, const uint8_t *data, size_t len)
     return true;
 }
 
-static bool esp_stdio_log_vfs_write_raw(const uint8_t *data, size_t len)
+typedef struct {
+    uint8_t bytes[ESP_STDIO_LOG_VFS_WRITE_BATCH];
+    size_t len;
+    bool ok;
+} esp_stdio_log_vfs_frame_writer_t;
+
+static void esp_stdio_log_vfs_frame_writer_flush(esp_stdio_log_vfs_frame_writer_t *writer)
 {
-    bool ok = true;
+    if (writer->len == 0) {
+        return;
+    }
 
     for (size_t i = 0; i < s_esp_stdio_log_vfs.output_count; ++i) {
         if (s_esp_stdio_log_vfs.outputs[i] >= 0 &&
-            !esp_stdio_log_vfs_write_all(s_esp_stdio_log_vfs.outputs[i], data, len)) {
-            ok = false;
+            !esp_stdio_log_vfs_write_all(s_esp_stdio_log_vfs.outputs[i], writer->bytes, writer->len)) {
+            writer->ok = false;
         }
     }
 
-    return ok;
+    writer->len = 0;
 }
 
-static bool esp_stdio_log_vfs_write_raw_byte(uint8_t byte)
+static void esp_stdio_log_vfs_frame_writer_put_raw(esp_stdio_log_vfs_frame_writer_t *writer,
+                                                   const uint8_t *data,
+                                                   size_t len)
 {
-    return esp_stdio_log_vfs_write_raw(&byte, sizeof(byte));
+    while (len != 0) {
+        if (writer->len == sizeof(writer->bytes)) {
+            esp_stdio_log_vfs_frame_writer_flush(writer);
+        }
+
+        size_t available = sizeof(writer->bytes) - writer->len;
+        size_t chunk_len = len < available ? len : available;
+        memcpy(&writer->bytes[writer->len], data, chunk_len);
+        writer->len += chunk_len;
+        data += chunk_len;
+        len -= chunk_len;
+    }
 }
 
-static bool esp_stdio_log_vfs_write_slip_byte(uint8_t byte)
+static void esp_stdio_log_vfs_frame_writer_put_raw_byte(esp_stdio_log_vfs_frame_writer_t *writer,
+                                                        uint8_t byte)
+{
+    esp_stdio_log_vfs_frame_writer_put_raw(writer, &byte, sizeof(byte));
+}
+
+static void esp_stdio_log_vfs_frame_writer_put_slip_byte(esp_stdio_log_vfs_frame_writer_t *writer,
+                                                         uint8_t byte)
 {
     if (byte == ESP_STDIO_LOG_VFS_SLIP_START) {
         const uint8_t escaped[] = {ESP_STDIO_LOG_VFS_SLIP_ESC, ESP_STDIO_LOG_VFS_SLIP_ESC_START};
-        return esp_stdio_log_vfs_write_raw(escaped, sizeof(escaped));
+        esp_stdio_log_vfs_frame_writer_put_raw(writer, escaped, sizeof(escaped));
+        return;
     }
     if (byte == ESP_STDIO_LOG_VFS_SLIP_END) {
         const uint8_t escaped[] = {ESP_STDIO_LOG_VFS_SLIP_ESC, ESP_STDIO_LOG_VFS_SLIP_ESC_END};
-        return esp_stdio_log_vfs_write_raw(escaped, sizeof(escaped));
+        esp_stdio_log_vfs_frame_writer_put_raw(writer, escaped, sizeof(escaped));
+        return;
     }
     if (byte == ESP_STDIO_LOG_VFS_SLIP_ESC) {
         const uint8_t escaped[] = {ESP_STDIO_LOG_VFS_SLIP_ESC, ESP_STDIO_LOG_VFS_SLIP_ESC_ESC};
-        return esp_stdio_log_vfs_write_raw(escaped, sizeof(escaped));
+        esp_stdio_log_vfs_frame_writer_put_raw(writer, escaped, sizeof(escaped));
+        return;
     }
     if (byte == (uint8_t)'\r') {
         const uint8_t escaped[] = {ESP_STDIO_LOG_VFS_SLIP_ESC, ESP_STDIO_LOG_VFS_SLIP_ESC_CR};
-        return esp_stdio_log_vfs_write_raw(escaped, sizeof(escaped));
+        esp_stdio_log_vfs_frame_writer_put_raw(writer, escaped, sizeof(escaped));
+        return;
     }
     if (byte == (uint8_t)'\n') {
         const uint8_t escaped[] = {ESP_STDIO_LOG_VFS_SLIP_ESC, ESP_STDIO_LOG_VFS_SLIP_ESC_LF};
-        return esp_stdio_log_vfs_write_raw(escaped, sizeof(escaped));
+        esp_stdio_log_vfs_frame_writer_put_raw(writer, escaped, sizeof(escaped));
+        return;
     }
 
-    return esp_stdio_log_vfs_write_raw_byte(byte);
+    esp_stdio_log_vfs_frame_writer_put_raw_byte(writer, byte);
 }
 
-static bool esp_stdio_log_vfs_write_slip(const uint8_t *data, size_t len)
+static void esp_stdio_log_vfs_frame_writer_put_slip(esp_stdio_log_vfs_frame_writer_t *writer,
+                                                    const uint8_t *data,
+                                                    size_t len)
 {
-    bool ok = true;
-
     for (size_t i = 0; i < len; ++i) {
-        if (!esp_stdio_log_vfs_write_slip_byte(data[i])) {
-            ok = false;
-        }
+        esp_stdio_log_vfs_frame_writer_put_slip_byte(writer, data[i]);
     }
-
-    return ok;
 }
 
 esp_err_t esp_stdio_log_vfs_write_frame(uint8_t type, const uint8_t *payload, size_t payload_len)
@@ -202,22 +258,35 @@ esp_err_t esp_stdio_log_vfs_write_frame(uint8_t type, const uint8_t *payload, si
     crc = esp_stdio_log_vfs_crc16_ccitt_update(crc, &type, sizeof(type));
     crc = esp_stdio_log_vfs_crc16_ccitt_update(crc, payload, payload_len);
 
-    bool ok = true;
+    esp_stdio_log_vfs_frame_writer_t writer = {
+        .bytes = {0},
+        .len = 0,
+        .ok = true,
+    };
+
     esp_stdio_log_vfs_transport_lock();
-    ok &= esp_stdio_log_vfs_write_raw_byte(ESP_STDIO_LOG_VFS_SLIP_START);
-    ok &= esp_stdio_log_vfs_write_slip_byte(type);
-    ok &= esp_stdio_log_vfs_write_slip(payload, payload_len);
-    ok &= esp_stdio_log_vfs_write_slip_byte((uint8_t)(crc & 0xffu));
-    ok &= esp_stdio_log_vfs_write_slip_byte((uint8_t)(crc >> 8u));
-    ok &= esp_stdio_log_vfs_write_raw_byte(ESP_STDIO_LOG_VFS_SLIP_END);
+    esp_stdio_log_vfs_frame_writer_put_raw_byte(&writer, ESP_STDIO_LOG_VFS_SLIP_START);
+    esp_stdio_log_vfs_frame_writer_put_slip_byte(&writer, type);
+    esp_stdio_log_vfs_frame_writer_put_slip(&writer, payload, payload_len);
+    esp_stdio_log_vfs_frame_writer_put_slip_byte(&writer, (uint8_t)(crc & 0xffu));
+    esp_stdio_log_vfs_frame_writer_put_slip_byte(&writer, (uint8_t)(crc >> 8u));
+    esp_stdio_log_vfs_frame_writer_put_raw_byte(&writer, ESP_STDIO_LOG_VFS_SLIP_END);
+    esp_stdio_log_vfs_frame_writer_flush(&writer);
     esp_stdio_log_vfs_transport_unlock();
 
-    return ok ? ESP_OK : ESP_FAIL;
+    return writer.ok ? ESP_OK : ESP_FAIL;
 }
 
 esp_err_t esp_stdio_log_vfs_add_output(const char *path)
 {
+    if (path == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    esp_stdio_log_vfs_transport_lock();
+
     if (s_esp_stdio_log_vfs.output_count >= ESP_STDIO_LOG_VFS_MAX_OUTPUTS) {
+        esp_stdio_log_vfs_transport_unlock();
         return ESP_ERR_NO_MEM;
     }
 
@@ -225,6 +294,8 @@ esp_err_t esp_stdio_log_vfs_add_output(const char *path)
     if (fd >= 0) {
         s_esp_stdio_log_vfs.outputs[s_esp_stdio_log_vfs.output_count++] = fd;
     }
+
+    esp_stdio_log_vfs_transport_unlock();
 
     return ESP_OK;
 }
@@ -295,11 +366,13 @@ static int esp_stdio_log_vfs_fsync(void *ctx, int fd)
     esp_stdio_log_vfs_t *sink = (esp_stdio_log_vfs_t *)ctx;
     int result = 0;
 
+    esp_stdio_log_vfs_transport_lock();
     for (size_t i = 0; i < sink->output_count; ++i) {
         if (sink->outputs[i] >= 0 && fsync(sink->outputs[i]) != 0) {
             result = -1;
         }
     }
+    esp_stdio_log_vfs_transport_unlock();
 
     return result;
 }

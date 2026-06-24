@@ -117,9 +117,12 @@ implementation is LUT-based and does not use the ESP ROM CRC implementation.
 `ESP_STDIO_LOG_VFS_FRAME_MAX_PAYLOAD` is currently 3072 bytes. Text writes are
 chunked into multiple text frames if needed. On9log binary packets are emitted as
 one transport frame; if `header + payload` exceeds the 3072-byte transport
-payload cap, the VFS sink drops that UART transport frame. The core packet stream
-in `on9log.c` is intentionally unchanged so non-UART sinks such as MQTT or
-WebSocket can forward raw on9log packet bytes without SLIP wrapping.
+payload cap, the VFS sink drops that UART transport frame. `ON9_LOG_BUF*()`
+dumps are chunked by the core into multiple `ON9LOG_PKT_BUFFER` packets, and the
+default `ON9LOG_BUFFER_CHUNK_SIZE` is 3042 bytes so each default buffer packet
+fits this VFS transport cap (`3072 - 18 byte on9log header - 12 byte buffer
+metadata`). Non-UART sinks such as MQTT or WebSocket still receive raw on9log
+packet bytes without SLIP wrapping.
 
 The sink takes `esp_log_impl_lock()` from `start_cb()` through `end_cb()` so
 on9log packet buffering does not interleave across tasks/cores. It also takes
@@ -208,11 +211,17 @@ In ESP-IDF builds, `Kconfig` exposes:
 ```text
 CONFIG_ON9LOG_MAXIMUM_LEVEL
 CONFIG_ON9LOG_MAX_SINKS
+CONFIG_ON9LOG_BUFFER_CHUNK_SIZE
+CONFIG_ON9LOG_MAX_DYNAMIC_STRING_LEN
 ```
 
 `on9log_config.h` maps `CONFIG_ON9LOG_MAXIMUM_LEVEL` to the default
-`ON9_LOG_LOCAL_LEVEL` when the user has not defined it manually. Outside ESP-IDF,
-`on9log_config.h` falls back to INFO level and 4 sinks.
+`ON9_LOG_LOCAL_LEVEL` when the user has not defined it manually. It maps
+`CONFIG_ON9LOG_BUFFER_CHUNK_SIZE` to `ON9LOG_BUFFER_CHUNK_SIZE`, defaulting to
+3042 bytes, and `CONFIG_ON9LOG_MAX_DYNAMIC_STRING_LEN` to
+`ON9LOG_MAX_DYNAMIC_STRING_LEN`, defaulting to 1024 bytes. Outside ESP-IDF,
+`on9log_config.h` falls back to INFO level, 4 sinks, the same 3042-byte buffer
+chunk size, and the same 1024-byte dynamic string cap.
 
 Platform-specific services are isolated behind `on9log_port.h`:
 
@@ -245,9 +254,12 @@ uint8_t  bytes[chunk_len]
 ```
 
 The buffer pointer is always treated as dynamic memory and the bytes are copied
-into the streamed packet. The logger no longer imposes a fixed packet-size
-chunk limit. Transports may still split, buffer, reject, or frame the stream
-according to their own limits.
+into `ON9LOG_PKT_BUFFER` packets. Large dumps are split into multiple packets
+using `ON9LOG_BUFFER_CHUNK_SIZE`; each packet carries the same `total_len`, the
+packet's `offset`, and that packet's `chunk_len`. The default chunk size is
+chosen to fit the default ESP VFS transport, and can be overridden by
+`CONFIG_ON9LOG_BUFFER_CHUNK_SIZE` or `ON9LOG_BUFFER_CHUNK_SIZE` for transports
+with different limits.
 
 ## Format And Tag Strings
 
@@ -285,13 +297,23 @@ bytes[length]
 The copied bytes do not include a trailing NUL. A null dynamic string pointer is
 encoded as length `0xffffffff` with no following bytes.
 
+Dynamic string copying is bounded by `ON9LOG_MAX_DYNAMIC_STRING_LEN`, defaulting
+to 1024 bytes. If no NUL byte is found before that limit, the encoded string is
+truncated to the cap. The current wire format does not include a truncation flag,
+so the host sees the truncated byte sequence as the argument value. The default
+cap is below the 3072-byte ESP VFS transport payload limit for common logs, but
+the cap is per string argument; one log call with multiple large dynamic strings
+can still exceed the default transport frame cap and be dropped by that sink.
+The cap is byte-based, not UTF-8-aware. If a UTF-8 string is truncated in the
+middle of a multi-byte codepoint, the host receives invalid UTF-8 bytes for that
+argument and may render a replacement character.
+
 String arguments are not emitted as ELF pointer IDs. The host distinguishes
 copied dynamic strings from non-string pointers by reading the argument type
 table at the start of the payload.
 
-This makes dynamic strings self-contained in the log stream. Long strings are
-no longer rejected by a logger packet-size cap; transport-specific limits are
-handled by sinks.
+This makes dynamic strings self-contained in the log stream while bounding the
+amount of memory scanned for a malformed or non-NUL-terminated `char *`.
 
 ## Sequence Counter
 

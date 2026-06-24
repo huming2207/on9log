@@ -227,7 +227,7 @@ static void on9log_emit_arg(on9log_stream_t *stream,
             return;
         }
 
-        size_t str_len = on9log_bounded_strlen(str, UINT32_MAX - 1u);
+        size_t str_len = on9log_bounded_strlen(str, ON9LOG_MAX_DYNAMIC_STRING_LEN);
         on9log_emit_u32(stream, (uint32_t)str_len, total_arg_cnt, curr_arg_index);
         if (str_len != 0) {
             on9log_stream_payload(stream, (const uint8_t *)str, str_len, total_arg_cnt, curr_arg_index);
@@ -310,6 +310,30 @@ static void on9log_emit_dropped_packet(uint32_t dropped_count)
 
     on9log_emit_header(&stream, ON9LOG_PKT_DROPPED, ON9_LOG_LEVEL_NONE, 0, 0, sizeof(uint32_t));
     on9log_emit_u32(&stream, dropped_count, 1, 0);
+    on9log_stream_end(&stream);
+}
+
+static void on9log_emit_buffer_packet(on9log_level_t level,
+                                      const char *tag,
+                                      const uint8_t *bytes,
+                                      uint32_t total_len,
+                                      uint32_t offset,
+                                      uint32_t chunk_len)
+{
+    on9log_stream_t stream = {0};
+
+    on9log_emit_header(&stream,
+                       ON9LOG_PKT_BUFFER,
+                       level,
+                       (uint32_t)(uintptr_t)tag,
+                       0,
+                       ON9LOG_PAYLOAD_LEN_STREAMING);
+    on9log_emit_u32(&stream, total_len, 1, ON9LOG_PAYLOAD_META_ARG_INDEX);
+    on9log_emit_u32(&stream, offset, 1, ON9LOG_PAYLOAD_META_ARG_INDEX);
+    on9log_emit_u32(&stream, chunk_len, 1, ON9LOG_PAYLOAD_META_ARG_INDEX);
+    if (chunk_len != 0) {
+        on9log_stream_payload(&stream, &bytes[offset], chunk_len, 1, 0);
+    }
     on9log_stream_end(&stream);
 }
 
@@ -426,13 +450,16 @@ void on9log_write_buffer(on9log_level_t level,
                          size_t buffer_len)
 {
     uint32_t dropped_count = 0;
-    on9log_stream_t stream = {0};
     const uint8_t *bytes = (const uint8_t *)buffer;
 
     if (!on9log_level_enabled(level, tag)) {
         return;
     }
-    if (buffer_len > UINT32_MAX || (bytes == NULL && buffer_len != 0)) {
+    if ((bytes == NULL && buffer_len != 0)
+#if SIZE_MAX > UINT32_MAX
+        || buffer_len > UINT32_MAX
+#endif
+    ) {
         atomic_fetch_add_explicit(&s_dropped_count, 1, memory_order_relaxed);
         return;
     }
@@ -444,17 +471,17 @@ void on9log_write_buffer(on9log_level_t level,
 
     uint32_t total_len = (uint32_t)buffer_len;
 
-    on9log_emit_header(&stream,
-                       ON9LOG_PKT_BUFFER,
-                       level,
-                       (uint32_t)(uintptr_t)tag,
-                       0,
-                       ON9LOG_PAYLOAD_LEN_STREAMING);
-    on9log_emit_u32(&stream, total_len, 1, ON9LOG_PAYLOAD_META_ARG_INDEX);
-    on9log_emit_u32(&stream, 0, 1, ON9LOG_PAYLOAD_META_ARG_INDEX);
-    on9log_emit_u32(&stream, total_len, 1, ON9LOG_PAYLOAD_META_ARG_INDEX);
-    if (total_len != 0) {
-        on9log_stream_payload(&stream, bytes, total_len, 1, 0);
+    if (total_len == 0) {
+        on9log_emit_buffer_packet(level, tag, bytes, total_len, 0, 0);
+        return;
     }
-    on9log_stream_end(&stream);
+
+    for (uint32_t offset = 0; offset < total_len;) {
+        uint32_t chunk_len = total_len - offset;
+        if (chunk_len > ON9LOG_BUFFER_CHUNK_SIZE) {
+            chunk_len = ON9LOG_BUFFER_CHUNK_SIZE;
+        }
+        on9log_emit_buffer_packet(level, tag, bytes, total_len, offset, chunk_len);
+        offset += chunk_len;
+    }
 }

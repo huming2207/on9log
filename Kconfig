@@ -44,4 +44,24 @@ menu "on9log"
             Maximum number of callback sinks that the core on9log packet
             producer can register.
 
+    config ON9LOG_BUFFER_CHUNK_SIZE
+        int "Maximum buffer dump chunk size"
+        range 1 65535
+        default 3042
+        help
+            Maximum number of user buffer bytes emitted in one ON9LOG_PKT_BUFFER
+            packet. The default fits the largest buffer chunk that the default
+            ESP stdio VFS transport can forward in one frame.
+
+    config ON9LOG_MAX_DYNAMIC_STRING_LEN
+        int "Maximum dynamic string argument length"
+        range 0 3048
+        default 1024
+        help
+            Maximum number of bytes copied from a dynamic string argument. Longer
+            strings are truncated to this length before being encoded into the
+            log packet. The upper bound fits one dynamic string argument in the
+            default 3072-byte ESP stdio VFS transport frame; logs with multiple
+            large dynamic strings can still exceed the transport frame cap.
+
 endmenu

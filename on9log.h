@@ -47,12 +47,14 @@ on9log_err_t on9log_remove_sink(const on9log_sink_t *sink, void *ctx);
 void on9log_set_uart_enabled(bool enabled);
 uint32_t on9log_get_dropped_count(void);
 
+/* on9log_write() and ON9_LOGx() must not be called from ISR context. */
 void on9log_write(on9log_level_t level,
                   const char *tag,
                   const char *format,
                   const char *arg_types,
                   ...) __attribute__((format(printf, 3, 5)));
 
+/* on9log_write_buffer() and ON9_LOG_BUF*() must not be called from ISR context. */
 void on9log_write_buffer(on9log_level_t level,
                          const char *tag,
                          const void *buffer,
