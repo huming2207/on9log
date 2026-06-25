@@ -3,7 +3,12 @@
 use crate::elf_resolv::ElfStrings;
 
 /// Streaming helper for ESP-IDF panic text carried in plain-text frames.
+///
+/// Accumulates raw text bytes line-by-line, recognises crash indicators
+/// (abort, assert, Guru Meditation, debug exception, stack canary), and
+/// resolves backtrace addresses via optional [`ElfStrings`].
 pub struct CrashDecoder {
+    /// Incomplete current line buffer. Flushed on each `\n`.
     line: Vec<u8>,
 }
 
@@ -14,11 +19,17 @@ impl Default for CrashDecoder {
 }
 
 impl CrashDecoder {
+    /// Create a new `CrashDecoder` with an empty line buffer.
     pub fn new() -> Self {
         Self { line: Vec::new() }
     }
 
     /// Feed raw text bytes and return annotation lines for complete input lines.
+    ///
+    /// Annotations are produced each time a complete line (ending with `\n`)
+    /// is assembled. The line is scanned for known crash indicators and
+    /// backtrace address patterns; matching addresses are resolved through
+    /// the optional [`ElfStrings`] table.
     pub fn feed(&mut self, bytes: &[u8], elf: Option<&ElfStrings>) -> Vec<String> {
         let mut annotations = Vec::new();
         for &b in bytes {
@@ -31,6 +42,8 @@ impl CrashDecoder {
         annotations
     }
 
+    /// Scan the current complete line for crash indicators and backtrace
+    /// addresses, appending annotation strings to `out`.
     fn process_current_line(&self, elf: Option<&ElfStrings>, out: &mut Vec<String>) {
         let line = String::from_utf8_lossy(&self.line);
         let line = line.trim_matches(['\r', '\n']);
@@ -54,6 +67,9 @@ impl CrashDecoder {
     }
 }
 
+/// Check if `line` contains a known ESP-IDF crash indicator and return the
+/// full line text if recognised. Supports abort(), assert, Guru Meditation,
+/// Unhandled debug exception, and Stack canary watchpoint messages.
 fn crash_reason(line: &str) -> Option<String> {
     if line.contains("abort() was called") {
         return Some(line.to_string());
@@ -72,14 +88,19 @@ fn crash_reason(line: &str) -> Option<String> {
     None
 }
 
+/// Check if the line is an "abort() was called" line that also contains
+/// a " PC " token, indicating the abort program counter is present.
 fn is_abort_pc_line(line: &str) -> bool {
     line.contains("abort() was called") && line.contains(" PC ")
 }
 
+/// Extract the first hex address from a line, if any.
 fn first_hex_addr(line: &str) -> Option<u32> {
     hex_addrs(line).next()
 }
 
+/// Extract all backtrace PC addresses from a space-separated list of
+/// `pc:sp` pairs (e.g. `0x4037a3ad:0x3fc97b70`).
 fn backtrace_pcs(line: &str) -> Vec<u32> {
     line.split_whitespace()
         .filter_map(|token| token.split_once(':').map(|(pc, _)| pc).or(Some(token)))
@@ -87,11 +108,15 @@ fn backtrace_pcs(line: &str) -> Vec<u32> {
         .collect()
 }
 
+/// Iterate over all hex addresses found in a line, scanning for `0x`-prefixed
+/// tokens of length 8-16 hex digits.
 fn hex_addrs(line: &str) -> impl Iterator<Item = u32> + '_ {
     line.split(|c: char| !(c.is_ascii_hexdigit() || c == 'x' || c == 'X'))
         .filter_map(parse_hex_addr)
 }
 
+/// Try to parse a hex address string (with `0x` prefix) into a `u32`.
+/// Returns `None` for strings that are not valid 8-16 digit hex values.
 fn parse_hex_addr(s: &str) -> Option<u32> {
     let s = s.trim();
     let hex = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X"))?;
@@ -101,6 +126,10 @@ fn parse_hex_addr(s: &str) -> Option<u32> {
     u32::from_str_radix(hex, 16).ok()
 }
 
+/// Format an address with optional ELF symbolication and source location.
+///
+/// Produces output like `0x42008e7d: app_main+0x14` or
+/// `0x42008e7d: app_main+0x14 at main.c:42`.
 fn format_addr(addr: u32, elf: Option<&ElfStrings>) -> String {
     let Some(elf) = elf else {
         return format!("0x{addr:08x}: <unresolved>");

@@ -1,3 +1,22 @@
+/**
+ * @file esp_stdio_log_vfs.c
+ * @brief ESP STDIO VFS transport for on9log (and general text) log frames.
+ *
+ * Implements a SLIP-encoded framed transport layer over POSIX file descriptors
+ * (e.g. UART devices, USB CDC, USB serial/JTAG), registers it as an ESP VFS
+ * device at @c /dev/logger, and redirects @c stdout/@c stderr through it.
+ *
+ * Frame wire format:
+ *   - SLIP_START (0xa5)
+ *   - type byte (SLIP-escaped)
+ *   - payload bytes (SLIP-escaped)
+ *   - CRC-16/CCITT over (type + payload), little-endian (SLIP-escaped)
+ *   - SLIP_END (0xc0)
+ *
+ * The write batch size (128 B) matches the ESP32 UART TX FIFO depth to
+ * minimise blocking on TX drain.
+ */
+
 #include "esp_stdio_log_vfs.h"
 
 #include "sdkconfig.h"
@@ -18,48 +37,79 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
+/** @brief VFS device path for the log transport. */
 #define ESP_STDIO_LOG_VFS_PATH "/dev/logger"
+/** @brief Internal macro to stringify a preprocessor token. */
 #define STRINGIFY2(s) #s
+/** @brief Stringify a preprocessor token (indirection for macro expansion). */
 #define STRINGIFY(s) STRINGIFY2(s)
 
+/** @brief Maximum number of concurrent output file descriptors. */
 #define ESP_STDIO_LOG_VFS_MAX_OUTPUTS 3
 
+/** @brief ESP-IDF log tag for this module. */
 #define LOG_TAG "esp_stdio_log_vfs"
 
-#define ESP_STDIO_LOG_VFS_SLIP_START 0xa5u
-#define ESP_STDIO_LOG_VFS_SLIP_END 0xc0u
-#define ESP_STDIO_LOG_VFS_SLIP_ESC 0xdbu
-#define ESP_STDIO_LOG_VFS_SLIP_ESC_END 0xdcu
-#define ESP_STDIO_LOG_VFS_SLIP_ESC_ESC 0xddu
-#define ESP_STDIO_LOG_VFS_SLIP_ESC_START 0xdeu
-#define ESP_STDIO_LOG_VFS_SLIP_ESC_CR 0xd0u
-#define ESP_STDIO_LOG_VFS_SLIP_ESC_LF 0xd1u
+/* ---- SLIP protocol constants ---- */
+#define ESP_STDIO_LOG_VFS_SLIP_START    0xa5u /**< SLIP frame-start marker. */
+#define ESP_STDIO_LOG_VFS_SLIP_END      0xc0u /**< SLIP frame-end marker. */
+#define ESP_STDIO_LOG_VFS_SLIP_ESC      0xdbu /**< SLIP escape byte. */
+#define ESP_STDIO_LOG_VFS_SLIP_ESC_END  0xdcu /**< Escaped 0xc0 when preceded by ESC. */
+#define ESP_STDIO_LOG_VFS_SLIP_ESC_ESC  0xddu /**< Escaped 0xdb when preceded by ESC. */
+#define ESP_STDIO_LOG_VFS_SLIP_ESC_START 0xdeu /**< Escaped 0xa5 when preceded by ESC. */
+#define ESP_STDIO_LOG_VFS_SLIP_ESC_CR   0xd0u /**< Escaped CR when preceded by ESC. */
+#define ESP_STDIO_LOG_VFS_SLIP_ESC_LF   0xd1u /**< Escaped LF when preceded by ESC. */
 
+/** @brief CRC-16/CCITT initial value. */
 #define ESP_STDIO_LOG_VFS_CRC16_CCITT_INIT 0xffffu
 
-// Transport frame bytes are batched into this many bytes before calling
-// write(). Sized to the ESP32 UART TX FIFO depth (128 bytes): a batch that fits
-// in an empty FIFO returns without blocking on TX drain, and most on9log frames
-// fit in a single batch, so a typical packet costs one write() instead of one
-// per payload byte. Larger frames flush in 128-byte chunks; the SLIP start/end
-// markers delimit frames on the wire, not write() call boundaries.
+/**
+ * @brief Transport frame bytes are batched into this many bytes before
+ *        calling write().
+ *
+ * Sized to the ESP32 UART TX FIFO depth (128 bytes): a batch that fits
+ * in an empty FIFO returns without blocking on TX drain, and most on9log
+ * frames fit in a single batch, so a typical packet costs one write()
+ * instead of one per payload byte.  Larger frames flush in 128-byte chunks;
+ * the SLIP start/end markers delimit frames on the wire, not write() call
+ * boundaries.
+ */
 #define ESP_STDIO_LOG_VFS_WRITE_BATCH 128u
 
+/**
+ * @brief Top-level state for the STDIO VFS transport.
+ *
+ * Holds the set of output file descriptors, the output count, and an
+ * installed flag.
+ */
 typedef struct {
-    int outputs[ESP_STDIO_LOG_VFS_MAX_OUTPUTS];
-    size_t output_count;
-    bool installed;
+    int outputs[ESP_STDIO_LOG_VFS_MAX_OUTPUTS]; /**< Output file descriptors (-1 = unused). */
+    size_t output_count;                         /**< Number of active output descriptors. */
+    bool installed;                              /**< @c true once @ref esp_stdio_log_vfs_init completes. */
 } esp_stdio_log_vfs_t;
 
+/** @brief Singleton VFS transport state. */
 static esp_stdio_log_vfs_t s_esp_stdio_log_vfs = {
     .outputs = {-1, -1, -1},
     .output_count = 0,
     .installed = false,
 };
+
+/** @brief Mutex for serialising transport writes across tasks. */
 static SemaphoreHandle_t s_transport_mutex = NULL;
+/** @brief Static storage for the transport mutex (avoids dynamic allocation). */
 static StaticSemaphore_t s_transport_mutex_storage;
+/** @brief Spin-lock for one-time initialisation of the transport mutex. */
 static portMUX_TYPE s_transport_mutex_init_lock = portMUX_INITIALIZER_UNLOCKED;
 
+/**
+ * @brief Obtain (or lazily create) the transport mutex.
+ *
+ * Double-checked locking pattern: first a relaxed read, then an acquisition
+ * inside a critical section guarded by @ref s_transport_mutex_init_lock.
+ *
+ * @return Pointer to the mutex, or @c NULL if creation failed (unlikely).
+ */
 static SemaphoreHandle_t esp_stdio_log_vfs_get_transport_mutex(void)
 {
     SemaphoreHandle_t mutex = s_transport_mutex;
@@ -77,6 +127,12 @@ static SemaphoreHandle_t esp_stdio_log_vfs_get_transport_mutex(void)
     return mutex;
 }
 
+/**
+ * @brief Lock the transport mutex (blocking).
+ *
+ * No-op when the scheduler has not yet started or when the mutex cannot be
+ * obtained.
+ */
 static void esp_stdio_log_vfs_transport_lock(void)
 {
     SemaphoreHandle_t mutex = esp_stdio_log_vfs_get_transport_mutex();
@@ -89,6 +145,11 @@ static void esp_stdio_log_vfs_transport_lock(void)
     xSemaphoreTake(mutex, portMAX_DELAY);
 }
 
+/**
+ * @brief Unlock the transport mutex.
+ *
+ * No-op when the scheduler has not yet started or when the mutex is NULL.
+ */
 static void esp_stdio_log_vfs_transport_unlock(void)
 {
     if (xTaskGetSchedulerState() == taskSCHEDULER_NOT_STARTED) {
@@ -100,6 +161,12 @@ static void esp_stdio_log_vfs_transport_unlock(void)
     }
 }
 
+/**
+ * @brief CRC-16/CCITT lookup table (256 entries, polynomial 0x1021).
+ *
+ * Pre-computed table for bytewise CRC computation using the CCITT polynomial
+ * \f$x^{16} + x^{12} + x^{5} + 1\f$.
+ */
 static const uint16_t s_crc16_ccitt_table[256] = {
     0x0000, 0x1021, 0x2042, 0x3063, 0x4084, 0x50a5, 0x60c6, 0x70e7,
     0x8108, 0x9129, 0xa14a, 0xb16b, 0xc18c, 0xd1ad, 0xe1ce, 0xf1ef,
@@ -135,6 +202,15 @@ static const uint16_t s_crc16_ccitt_table[256] = {
     0x6e17, 0x7e36, 0x4e55, 0x5e74, 0x2e93, 0x3eb2, 0x0ed1, 0x1ef0,
 };
 
+/**
+ * @brief Update a CRC-16/CCITT checksum byte-by-byte using the lookup table.
+ *
+ * @param[in] crc   Current CRC value (initialise with @ref ESP_STDIO_LOG_VFS_CRC16_CCITT_INIT).
+ * @param[in] data  Pointer to the data buffer.
+ * @param[in] len   Number of bytes to process.
+ *
+ * @return Updated CRC-16/CCITT value.
+ */
 static uint16_t esp_stdio_log_vfs_crc16_ccitt_update(uint16_t crc, const uint8_t *data, size_t len)
 {
     for (size_t i = 0; i < len; ++i) {
@@ -144,6 +220,15 @@ static uint16_t esp_stdio_log_vfs_crc16_ccitt_update(uint16_t crc, const uint8_t
     return crc;
 }
 
+/**
+ * @brief Write all bytes to a file descriptor, retrying on short writes.
+ *
+ * @param[in] fd    File descriptor to write to.
+ * @param[in] data  Pointer to the data buffer.
+ * @param[in] len   Number of bytes to write.
+ *
+ * @return @c true if all bytes were written, @c false on error.
+ */
 static bool esp_stdio_log_vfs_write_all(int fd, const uint8_t *data, size_t len)
 {
     while (len != 0) {
@@ -158,12 +243,24 @@ static bool esp_stdio_log_vfs_write_all(int fd, const uint8_t *data, size_t len)
     return true;
 }
 
+/**
+ * @brief Batched frame writer state.
+ *
+ * Bytes are accumulated in a small buffer and flushed once it reaches
+ * @ref ESP_STDIO_LOG_VFS_WRITE_BATCH bytes, reducing the number of write()
+ * syscalls.
+ */
 typedef struct {
-    uint8_t bytes[ESP_STDIO_LOG_VFS_WRITE_BATCH];
-    size_t len;
-    bool ok;
+    uint8_t bytes[ESP_STDIO_LOG_VFS_WRITE_BATCH]; /**< Accumulation buffer. */
+    size_t len;                                    /**< Number of bytes currently buffered. */
+    bool ok;                                       /**< Tracks whether any write has failed. */
 } esp_stdio_log_vfs_frame_writer_t;
 
+/**
+ * @brief Flush the frame writer's buffer to all registered outputs.
+ *
+ * @param[in,out] writer  Frame writer state.  On return @c len is 0.
+ */
 static void esp_stdio_log_vfs_frame_writer_flush(esp_stdio_log_vfs_frame_writer_t *writer)
 {
     if (writer->len == 0) {
@@ -180,9 +277,18 @@ static void esp_stdio_log_vfs_frame_writer_flush(esp_stdio_log_vfs_frame_writer_
     writer->len = 0;
 }
 
+/**
+ * @brief Write raw (un-escaped) bytes into the frame writer buffer.
+ *
+ * Automatically flushes the buffer to outputs when it is full.
+ *
+ * @param[in,out] writer  Frame writer state.
+ * @param[in]     data    Pointer to the raw bytes.
+ * @param[in]     len     Number of bytes to write.
+ */
 static void esp_stdio_log_vfs_frame_writer_put_raw(esp_stdio_log_vfs_frame_writer_t *writer,
-                                                   const uint8_t *data,
-                                                   size_t len)
+                                                    const uint8_t *data,
+                                                    size_t len)
 {
     while (len != 0) {
         if (writer->len == sizeof(writer->bytes)) {
@@ -198,12 +304,27 @@ static void esp_stdio_log_vfs_frame_writer_put_raw(esp_stdio_log_vfs_frame_write
     }
 }
 
+/**
+ * @brief Write a single raw byte into the frame writer buffer.
+ *
+ * @param[in,out] writer  Frame writer state.
+ * @param[in]     byte    Byte to write.
+ */
 static void esp_stdio_log_vfs_frame_writer_put_raw_byte(esp_stdio_log_vfs_frame_writer_t *writer,
                                                         uint8_t byte)
 {
     esp_stdio_log_vfs_frame_writer_put_raw(writer, &byte, sizeof(byte));
 }
 
+/**
+ * @brief Write a single byte with SLIP escaping into the frame writer.
+ *
+ * Reserved bytes (SLIP_START, SLIP_END, SLIP_ESC, CR, LF) are replaced by
+ * a two-byte escape sequence.
+ *
+ * @param[in,out] writer  Frame writer state.
+ * @param[in]     byte    Byte to escape and write.
+ */
 static void esp_stdio_log_vfs_frame_writer_put_slip_byte(esp_stdio_log_vfs_frame_writer_t *writer,
                                                          uint8_t byte)
 {
@@ -236,6 +357,13 @@ static void esp_stdio_log_vfs_frame_writer_put_slip_byte(esp_stdio_log_vfs_frame
     esp_stdio_log_vfs_frame_writer_put_raw_byte(writer, byte);
 }
 
+/**
+ * @brief Write a buffer of bytes with SLIP escaping into the frame writer.
+ *
+ * @param[in,out] writer  Frame writer state.
+ * @param[in]     data    Pointer to data to escape and write.
+ * @param[in]     len     Number of bytes to write.
+ */
 static void esp_stdio_log_vfs_frame_writer_put_slip(esp_stdio_log_vfs_frame_writer_t *writer,
                                                     const uint8_t *data,
                                                     size_t len)
@@ -245,6 +373,24 @@ static void esp_stdio_log_vfs_frame_writer_put_slip(esp_stdio_log_vfs_frame_writ
     }
 }
 
+/**
+ * @brief Write a SLIP-encoded frame (type + payload + CRC-16) to all registered
+ *        transport outputs.
+ *
+ * The frame is protected by the transport mutex for thread safety.  Output
+ * bytes are accumulated in the batched frame writer and flushed once the
+ * batch is full or the frame is complete.
+ *
+ * @param[in] type         Frame type byte (e.g. @c ESP_STDIO_LOG_VFS_FRAME_TYPE_ON9LOG).
+ * @param[in] payload      Pointer to the payload data (may be NULL when @c payload_len is 0).
+ * @param[in] payload_len  Length of the payload in bytes.
+ *
+ * @return
+ * - @c ESP_OK on success.
+ * - @c ESP_ERR_INVALID_ARG if payload is NULL and payload_len is non-zero.
+ * - @c ESP_ERR_INVALID_SIZE if payload_len exceeds the maximum frame payload size.
+ * - @c ESP_FAIL if a write() call failed.
+ */
 esp_err_t esp_stdio_log_vfs_write_frame(uint8_t type, const uint8_t *payload, size_t payload_len)
 {
     if (payload == NULL && payload_len != 0) {
@@ -277,6 +423,19 @@ esp_err_t esp_stdio_log_vfs_write_frame(uint8_t type, const uint8_t *payload, si
     return writer.ok ? ESP_OK : ESP_FAIL;
 }
 
+/**
+ * @brief Add a file-system path as a transport output for log frames.
+ *
+ * The path is opened in write-only mode and appended to the internal output
+ * list.  Thread safety is guaranteed by the transport mutex.
+ *
+ * @param[in] path  File-system path (e.g. @c "/dev/uart/1" or @c "/dev/usbserjtag").
+ *
+ * @return
+ * - @c ESP_OK on success.
+ * - @c ESP_ERR_INVALID_ARG if path is NULL.
+ * - @c ESP_ERR_NO_MEM if the maximum number of outputs has been reached.
+ */
 esp_err_t esp_stdio_log_vfs_add_output(const char *path)
 {
     if (path == NULL) {
@@ -300,6 +459,19 @@ esp_err_t esp_stdio_log_vfs_add_output(const char *path)
     return ESP_OK;
 }
 
+/**
+ * @brief VFS write callback: split byte stream into text frames and write via
+ *        the transport layer.
+ *
+ * Text data larger than the maximum frame payload is chunked automatically.
+ *
+ * @param[in] ctx   VFS context pointer (unused).
+ * @param[in] fd    File descriptor (unused; all writes go to the transport outputs).
+ * @param[in] data  Pointer to the data to write.
+ * @param[in] size  Number of bytes to write.
+ *
+ * @return The number of bytes written on success, or -1 on error.
+ */
 static ssize_t esp_stdio_log_vfs_write(void *ctx, int fd, const void *data, size_t size)
 {
     const uint8_t *bytes = (const uint8_t *)data;
@@ -332,6 +504,13 @@ static ssize_t esp_stdio_log_vfs_write(void *ctx, int fd, const void *data, size
     return (ssize_t)size;
 }
 
+/**
+ * @brief VFS open callback (no-op).
+ *
+ * The log device does not support file open; this stub always succeeds.
+ *
+ * @return 0.
+ */
 static int esp_stdio_log_vfs_open(void *ctx, const char *path, int flags, int mode)
 {
     (void)ctx;
@@ -342,6 +521,13 @@ static int esp_stdio_log_vfs_open(void *ctx, const char *path, int flags, int mo
     return 0;
 }
 
+/**
+ * @brief VFS close callback (no-op).
+ *
+ * The log device does not support file close; this stub always succeeds.
+ *
+ * @return 0.
+ */
 static int esp_stdio_log_vfs_close(void *ctx, int fd)
 {
     (void)ctx;
@@ -350,6 +536,13 @@ static int esp_stdio_log_vfs_close(void *ctx, int fd)
     return 0;
 }
 
+/**
+ * @brief VFS fstat callback: report character-device mode.
+ *
+ * @param[in,out] st  Stat structure to populate with @c S_IFCHR.
+ *
+ * @return 0.
+ */
 static int esp_stdio_log_vfs_fstat(void *ctx, int fd, struct stat *st)
 {
     (void)ctx;
@@ -359,6 +552,14 @@ static int esp_stdio_log_vfs_fstat(void *ctx, int fd, struct stat *st)
     return 0;
 }
 
+/**
+ * @brief VFS fsync callback: synchronise all transport output file descriptors.
+ *
+ * @param[in] ctx  VFS context pointer (the @ref esp_stdio_log_vfs_t instance).
+ * @param[in] fd   File descriptor (unused; all transport outputs are fsynced).
+ *
+ * @return 0 on success, -1 if any fsync failed.
+ */
 static int esp_stdio_log_vfs_fsync(void *ctx, int fd)
 {
     (void)fd;
@@ -377,11 +578,36 @@ static int esp_stdio_log_vfs_fsync(void *ctx, int fd)
     return result;
 }
 
+/**
+ * @brief VFS vprintf callback: forward formatted output to stdout.
+ *
+ * Used internally by esp-log after @ref esp_log_set_vprintf is called during
+ * initialisation.
+ *
+ * @param[in] fmt   printf-style format string.
+ * @param[in] args  Variable argument list.
+ *
+ * @return Number of characters printed, or a negative value on error.
+ */
 static int esp_stdio_log_vfs_vprintf(const char *fmt, va_list args)
 {
     return vfprintf(stdout, fmt, args);
 }
 
+/**
+ * @brief Initialise the ESP STDIO VFS transport layer.
+ *
+ * Opens the configured console output devices (UART, USB serial/JTAG, USB CDC)
+ * as transport outputs, registers the VFS device at @c /dev/logger, redirects
+ * @c stdout and @c stderr to it, sets unbuffered mode, and installs the custom
+ * vprintf handler.  Safe to call multiple times; subsequent calls return
+ * @c ESP_OK without re-initialising.
+ *
+ * @return
+ * - @c ESP_OK on success or if already initialised.
+ * - @c ESP_FAIL if freopen() for stdout or stderr fails.
+ * - Other @c esp_err_t propagated from @c esp_vfs_register.
+ */
 esp_err_t esp_stdio_log_vfs_init(void)
 {
     if (s_esp_stdio_log_vfs.installed) {

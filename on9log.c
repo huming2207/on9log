@@ -1,3 +1,22 @@
+/**
+ * @file on9log.c
+ * @brief Core implementation of the on9log logging library.
+ *
+ * Provides the encoding, filtering, sink-dispatch, and ISR-safe logging
+ * primitives.  The public API is declared in @ref on9log.h.
+ *
+ * Architecture overview:
+ *   - Log calls (on9log_write etc.) build a "stream" of payload chunks that
+ *     are forwarded to every registered sink via callbacks (start / payload /
+ *     end).
+ *   - A header is emitted once per log packet; payloads carry the argument
+ *     data.
+ *   - ISR-safe logging serialises the full packet into a caller-provided
+ *     buffer which is then enqueued into a platform-provided ringbuffer.
+ *   - Tag-level filtering sits in front of the dispatch path to skip
+ *     disabled log levels early.
+ */
+
 #include "on9log.h"
 
 #include <stdarg.h>
@@ -13,50 +32,121 @@
 #include "on9log_fmt.h"
 #include "on9log_port.h"
 
+/** @brief Sentinel value encoding a NULL dynamic string (length field). */
 #define ON9LOG_NULL_STRING_LEN UINT32_MAX
+/**
+ * @brief Argument index sentinel used for payload meta-data that is not a
+ *        regular log argument.
+ */
 #define ON9LOG_PAYLOAD_META_ARG_INDEX SIZE_MAX
 
+/**
+ * @brief An atomic slot in the global sink table.
+ *
+ * Each slot holds a pointer to a @ref on9log_sink_t and its opaque context,
+ * both stored as @c atomic_uintptr_t so that ISR-context writers can read
+ * them without locking.
+ */
 typedef struct {
-    atomic_uintptr_t sink;
-    atomic_uintptr_t ctx;
+    atomic_uintptr_t sink; /**< Pointer to the sink descriptor (@ref on9log_sink_t). */
+    atomic_uintptr_t ctx;  /**< Opaque user context passed to every sink callback. */
 } on9log_sink_entry_t;
 
+/**
+ * @brief Lightweight byte-array encoder used to serialise header/payload data.
+ *
+ * Writing past the buffer capacity sets @ref overflow to @c true and all
+ * subsequent writes are silently discarded — the caller checks the flag after
+ * encoding.
+ */
 typedef struct {
-    bool overflow;
-    size_t len;
-    size_t cap;
-    uint8_t *data;
+    bool overflow;   /**< @c true if a write past @ref cap was attempted. */
+    size_t len;      /**< Number of valid bytes in @ref data. */
+    size_t cap;      /**< Capacity of @ref data in bytes. */
+    uint8_t *data;   /**< Backing byte buffer (not owned by this struct). */
 } on9log_encoder_t;
 
+/**
+ * @brief A single sink reference captured during a stream snapshot.
+ *
+ * This pairs a sink descriptor with its context so the stream iteration is
+ * fast and does not touch the atomic slot table on every payload call.
+ */
 typedef struct {
-    const on9log_sink_t *sink;
-    void *ctx;
+    const on9log_sink_t *sink; /**< The sink descriptor. */
+    void *ctx;                 /**< Opaque user context for the sink. */
 } on9log_stream_sink_t;
 
+/**
+ * @brief Per-log-call stream state.
+ *
+ * A snapshot of the sink table is taken once at stream-start; this avoids
+ * holding a lock during the entire multi-payload output sequence.
+ */
 typedef struct {
-    bool uart_enabled;
-    size_t sink_count;
-    on9log_stream_sink_t sinks[ON9LOG_MAX_SINKS];
+    bool uart_enabled;                    /**< Snapshot of the UART enabled flag. */
+    size_t sink_count;                    /**< Number of sinks captured in @ref sinks. */
+    on9log_stream_sink_t sinks[ON9LOG_MAX_SINKS]; /**< Captured sink table. */
 } on9log_stream_t;
 
+/**
+ * @brief A node in the per-tag filter linked list.
+ *
+ * Each node stores a tag pointer, a minimum log level, and an active flag.
+ * The list is walked atomically (via @ref s_tag_filter_head) by the
+ * fast-path filter check.
+ */
 typedef struct on9log_tag_filter_node {
-    SLIST_ENTRY(on9log_tag_filter_node) entries;
-    const char *tag;
-    atomic_int level;
-    atomic_bool active;
+    SLIST_ENTRY(on9log_tag_filter_node) entries; /**< BSD sys/queue list entry. */
+    const char *tag;                              /**< Tag string (pointer-identity or strcmp match). */
+    atomic_int level;                             /**< Minimum enabled level for this tag. */
+    atomic_bool active;                           /**< @c true while this node is in the live filter list. */
 } on9log_tag_filter_node_t;
 
+/** @brief Type alias for the BSD sys/queue singly-linked list header. */
 SLIST_HEAD(on9log_tag_filter_list, on9log_tag_filter_node);
 
+/**
+ * @brief Global sink table.
+ *
+ * Each slot can hold one sink.  Slots are read with acquire ordering and
+ * written with release ordering for lock-free ISR safety.
+ */
 static on9log_sink_entry_t s_sinks[ON9LOG_MAX_SINKS];
+
+/** @brief Head of the per-tag filter linked list (protected by on9log_port_lock). */
 static struct on9log_tag_filter_list s_tag_filters = SLIST_HEAD_INITIALIZER(s_tag_filters);
+
+/**
+ * @brief Atomic snapshot of the filter list head for lock-free reader access.
+ *
+ * Updated every time the filter list is modified.
+ */
 static atomic_uintptr_t s_tag_filter_head = ATOMIC_VAR_INIT((uintptr_t)NULL);
+
+/** @brief Number of active (non-deactivated) tag filter nodes (atomic counter). */
 static atomic_uint_fast32_t s_active_tag_filter_count = ATOMIC_VAR_INIT(0);
+
+/** @brief Default minimum log level (applied when no per-tag filter matches). */
 static atomic_int s_default_level = ATOMIC_VAR_INIT(ON9_LOG_LEVEL_VERBOSE);
+
+/** @brief Whether the platform UART output is enabled. */
 static atomic_bool s_uart_enabled = ATOMIC_VAR_INIT(true);
+
+/** @brief Monotonically increasing packet sequence number. */
 static atomic_uint_fast16_t s_seq = ATOMIC_VAR_INIT(0);
+
+/** @brief Count of log packets dropped since last query (ISR-safe). */
 static atomic_uint_fast32_t s_dropped_count = ATOMIC_VAR_INIT(0);
 
+/**
+ * @brief Write a single uint8_t to the encoder buffer.
+ *
+ * Sets the overflow flag if the buffer is already full.
+ *
+ * @param[in,out] enc  Encoder state.
+ * @param[in]     val  Value to write.
+ */
 static void on9log_put_u8(on9log_encoder_t *enc, uint8_t val)
 {
     if (enc->len >= enc->cap) {
@@ -67,12 +157,24 @@ static void on9log_put_u8(on9log_encoder_t *enc, uint8_t val)
     enc->data[enc->len++] = val;
 }
 
+/**
+ * @brief Write a uint16_t in little-endian byte order to the encoder.
+ *
+ * @param[in,out] enc  Encoder state.
+ * @param[in]     val  Value to write.
+ */
 static void on9log_put_u16(on9log_encoder_t *enc, uint16_t val)
 {
     on9log_put_u8(enc, (uint8_t)(val & 0xffu));
     on9log_put_u8(enc, (uint8_t)(val >> 8u));
 }
 
+/**
+ * @brief Write a uint32_t in little-endian byte order to the encoder.
+ *
+ * @param[in,out] enc  Encoder state.
+ * @param[in]     val  Value to write.
+ */
 static void on9log_put_u32(on9log_encoder_t *enc, uint32_t val)
 {
     on9log_put_u8(enc, (uint8_t)(val & 0xffu));
@@ -81,12 +183,27 @@ static void on9log_put_u32(on9log_encoder_t *enc, uint32_t val)
     on9log_put_u8(enc, (uint8_t)(val >> 24u));
 }
 
+/**
+ * @brief Write a uint64_t in little-endian byte order to the encoder.
+ *
+ * @param[in,out] enc  Encoder state.
+ * @param[in]     val  Value to write.
+ */
 static void on9log_put_u64(on9log_encoder_t *enc, uint64_t val)
 {
     on9log_put_u32(enc, (uint32_t)(val & 0xffffffffu));
     on9log_put_u32(enc, (uint32_t)(val >> 32u));
 }
 
+/**
+ * @brief Look up the argument type at a given index.
+ *
+ * @param[in] arg_types  Packed argument-type string, or NULL.
+ * @param[in] idx        Zero-based argument index.
+ *
+ * @return The type byte at @c arg_types[idx], or @c ON9_LOG_ARGS_TYPE_NONE
+ *         if @c arg_types is NULL.
+ */
 static uint8_t on9log_arg_type_at(const char *arg_types, unsigned idx)
 {
     if (arg_types == NULL) {
@@ -95,6 +212,16 @@ static uint8_t on9log_arg_type_at(const char *arg_types, unsigned idx)
     return (uint8_t)arg_types[idx];
 }
 
+/**
+ * @brief Count the number of arguments described by a type string.
+ *
+ * Iterates until the first @c ON9_LOG_ARGS_TYPE_NONE sentinel, up to
+ * @c UINT8_MAX.
+ *
+ * @param[in] arg_types  Packed argument-type string (NULL yields 0).
+ *
+ * @return Number of non-sentinel argument type bytes.
+ */
 static uint8_t on9log_arg_count(const char *arg_types)
 {
     uint8_t count = 0;
@@ -109,6 +236,17 @@ static uint8_t on9log_arg_count(const char *arg_types)
     return count;
 }
 
+/**
+ * @brief Safe bounded string length computation.
+ *
+ * Scans @c str for a NUL terminator, stopping at @c max_len bytes to avoid
+ * unbounded access on non-NULL-terminated inputs.
+ *
+ * @param[in] str     String to measure (may be NULL — returns 0).
+ * @param[in] max_len Maximum number of bytes to check.
+ *
+ * @return The string length, capped at @c max_len.
+ */
 static size_t on9log_bounded_strlen(const char *str, size_t max_len)
 {
     size_t len = 0;
@@ -120,6 +258,13 @@ static size_t on9log_bounded_strlen(const char *str, size_t max_len)
     return len;
 }
 
+/**
+ * @brief Write raw bytes to the platform UART, if UART output is enabled.
+ *
+ * @param[in] stream  Stream snapshot (used to check the uart_enabled flag).
+ * @param[in] data    Pointer to the bytes to write.
+ * @param[in] len     Number of bytes to write.
+ */
 static void on9log_uart_write(const on9log_stream_t *stream, const uint8_t *data, size_t len)
 {
     if (!stream->uart_enabled) {
@@ -129,6 +274,18 @@ static void on9log_uart_write(const on9log_stream_t *stream, const uint8_t *data
     on9log_port_write(data, len);
 }
 
+/**
+ * @brief Begin a new log stream: snapshot sink table and emit the header.
+ *
+ * Reads the atomic sink table (with acquire ordering) and captures every
+ * non-NULL slot into the stream structure.  The UART enabled flag is
+ * snapshotted as well.  After the snapshot, the header bytes are sent to
+ * UART first, then forwarded to every captured sink's @c start_cb.
+ *
+ * @param[out] stream      Stream state to initialise.
+ * @param[in]  header      Packet header bytes.
+ * @param[in]  header_len  Length of the header (must equal @c sizeof(on9log_packet_header_t)).
+ */
 static void on9log_stream_start(on9log_stream_t *stream, const uint8_t *header, size_t header_len)
 {
     stream->uart_enabled = atomic_load_explicit(&s_uart_enabled, memory_order_relaxed);
@@ -151,6 +308,18 @@ static void on9log_stream_start(on9log_stream_t *stream, const uint8_t *header, 
     }
 }
 
+/**
+ * @brief Emit a payload chunk through the current stream.
+ *
+ * The payload bytes are written to UART (if enabled) and then forwarded to
+ * every captured sink's @c payload_cb.
+ *
+ * @param[in] stream          Stream snapshot.
+ * @param[in] payload         Pointer to the payload bytes.
+ * @param[in] payload_len     Number of payload bytes.
+ * @param[in] total_arg_cnt   Total number of arguments expected in this frame.
+ * @param[in] curr_arg_index  Index of the current argument (or @ref ON9LOG_PAYLOAD_META_ARG_INDEX for meta-data).
+ */
 static void on9log_stream_payload(on9log_stream_t *stream,
                                   const uint8_t *payload,
                                   size_t payload_len,
@@ -168,6 +337,11 @@ static void on9log_stream_payload(on9log_stream_t *stream,
     }
 }
 
+/**
+ * @brief End a log stream: call every captured sink's @c end_cb.
+ *
+ * @param[in] stream  Stream snapshot.
+ */
 static void on9log_stream_end(on9log_stream_t *stream)
 {
     for (size_t i = 0; i < stream->sink_count; ++i) {
@@ -175,6 +349,14 @@ static void on9log_stream_end(on9log_stream_t *stream)
     }
 }
 
+/**
+ * @brief Emit the contents of an encoder as a payload chunk (if no overflow).
+ *
+ * @param[in] stream          Stream snapshot.
+ * @param[in] enc             Encoder state (overflow flag is checked).
+ * @param[in] total_arg_cnt   Total argument count.
+ * @param[in] curr_arg_index  Current argument index.
+ */
 static void on9log_emit_encoder(on9log_stream_t *stream,
                                 const on9log_encoder_t *enc,
                                 size_t total_arg_cnt,
@@ -185,11 +367,27 @@ static void on9log_emit_encoder(on9log_stream_t *stream,
     }
 }
 
+/**
+ * @brief Emit a single uint8_t as a payload chunk.
+ *
+ * @param[in] stream          Stream snapshot.
+ * @param[in] val             Value to emit.
+ * @param[in] total_arg_cnt   Total argument count.
+ * @param[in] curr_arg_index  Current argument index.
+ */
 static void on9log_emit_u8(on9log_stream_t *stream, uint8_t val, size_t total_arg_cnt, size_t curr_arg_index)
 {
     on9log_stream_payload(stream, &val, sizeof(val), total_arg_cnt, curr_arg_index);
 }
 
+/**
+ * @brief Emit a uint32_t (little-endian) as a payload chunk.
+ *
+ * @param[in] stream          Stream snapshot.
+ * @param[in] val             Value to emit.
+ * @param[in] total_arg_cnt   Total argument count.
+ * @param[in] curr_arg_index  Current argument index.
+ */
 static void on9log_emit_u32(on9log_stream_t *stream, uint32_t val, size_t total_arg_cnt, size_t curr_arg_index)
 {
     uint8_t data[sizeof(uint32_t)];
@@ -202,6 +400,14 @@ static void on9log_emit_u32(on9log_stream_t *stream, uint32_t val, size_t total_
     on9log_emit_encoder(stream, &enc, total_arg_cnt, curr_arg_index);
 }
 
+/**
+ * @brief Emit a uint64_t (little-endian) as a payload chunk.
+ *
+ * @param[in] stream          Stream snapshot.
+ * @param[in] val             Value to emit.
+ * @param[in] total_arg_cnt   Total argument count.
+ * @param[in] curr_arg_index  Current argument index.
+ */
 static void on9log_emit_u64(on9log_stream_t *stream, uint64_t val, size_t total_arg_cnt, size_t curr_arg_index)
 {
     uint8_t data[sizeof(uint64_t)];
@@ -214,6 +420,21 @@ static void on9log_emit_u64(on9log_stream_t *stream, uint64_t val, size_t total_
     on9log_emit_encoder(stream, &enc, total_arg_cnt, curr_arg_index);
 }
 
+/**
+ * @brief Emit a single typed argument to the stream.
+ *
+ * Handles all four argument types:
+ *   - @c ON9_LOG_ARGS_TYPE_32BITS: emit a uint32_t.
+ *   - @c ON9_LOG_ARGS_TYPE_64BITS: emit a uint64_t.
+ *   - @c ON9_LOG_ARGS_TYPE_POINTER: emit the pointer as uint32_t (truncated on 64-bit platforms).
+ *   - @c ON9_LOG_ARGS_TYPE_DYNAMIC_STRING: emit the string length followed by the string bytes.
+ *
+ * @param[in] stream          Stream snapshot.
+ * @param[in] arg_type        Argument type code.
+ * @param[in] args            Variable argument list pointer (consumed from).
+ * @param[in] total_arg_cnt   Total number of arguments expected in this frame.
+ * @param[in] curr_arg_index  Index of the current argument.
+ */
 static void on9log_emit_arg(on9log_stream_t *stream,
                             uint8_t arg_type,
                             va_list *args,
@@ -256,6 +477,17 @@ static void on9log_emit_arg(on9log_stream_t *stream,
     }
 }
 
+/**
+ * @brief Emit all arguments described by the type string to the stream.
+ *
+ * Iterates through the argument types and delegates each to
+ * @ref on9log_emit_arg.
+ *
+ * @param[in] stream        Stream snapshot.
+ * @param[in] arg_types     Packed argument-type string.
+ * @param[in] args          Variable argument list pointer.
+ * @param[in] total_arg_cnt Total number of arguments (passed to each emit).
+ */
 static void on9log_emit_payload_args(on9log_stream_t *stream, const char *arg_types, va_list *args, size_t total_arg_cnt)
 {
     for (unsigned idx = 0; on9log_arg_type_at(arg_types, idx) != ON9_LOG_ARGS_TYPE_NONE; ++idx) {
@@ -263,6 +495,27 @@ static void on9log_emit_payload_args(on9log_stream_t *stream, const char *arg_ty
     }
 }
 
+/**
+ * @brief Encode a packet header into the encoder.
+ *
+ * Wire format:
+ *   - Magic byte        (1B)
+ *   - Type|Level nibble (1B)
+ *   - Sequence number   (2B, LE)
+ *   - Timestamp         (4B, LE)
+ *   - Tag ID            (4B, LE)
+ *   - Format ID         (4B, LE)
+ *   - Payload length    (2B, LE)
+ *
+ * @param[in,out] enc         Encoder to write into.
+ * @param[in]     type        Packet type (on9log_packet_type_t).
+ * @param[in]     level       Log level.
+ * @param[in]     seq         Sequence number.
+ * @param[in]     time_ms     Timestamp in milliseconds.
+ * @param[in]     tag_id      Tag identifier (typically a pointer cast to uint32_t).
+ * @param[in]     fmt_id      Format string identifier (typically a pointer cast to uint32_t).
+ * @param[in]     payload_len Payload length (may be @c ON9LOG_PAYLOAD_LEN_STREAMING).
+ */
 static void on9log_put_header(on9log_encoder_t *enc,
                               on9log_packet_type_t type,
                               on9log_level_t level,
@@ -281,6 +534,20 @@ static void on9log_put_header(on9log_encoder_t *enc,
     on9log_put_u16(enc, payload_len);
 }
 
+/**
+ * @brief Encode a packet header into a caller-provided header buffer.
+ *
+ * @param[out] header      Buffer of at least @c sizeof(on9log_packet_header_t) bytes.
+ * @param[in]  type        Packet type.
+ * @param[in]  level       Log level.
+ * @param[in]  seq         Sequence number.
+ * @param[in]  time_ms     Timestamp in milliseconds.
+ * @param[in]  tag_id      Tag identifier.
+ * @param[in]  fmt_id      Format identifier.
+ * @param[in]  payload_len Payload length.
+ *
+ * @return @c true if the header was fully written without overflow.
+ */
 static bool on9log_encode_header(uint8_t *header,
                                  on9log_packet_type_t type,
                                  on9log_level_t level,
@@ -299,6 +566,20 @@ static bool on9log_encode_header(uint8_t *header,
     return !enc.overflow && enc.len == sizeof(on9log_packet_header_t);
 }
 
+/**
+ * @brief Emit a complete packet header and begin the stream.
+ *
+ * Allocates a temporary header buffer, fills it with the encoded header
+ * (including an auto-incremented sequence number and the current timestamp),
+ * and calls @ref on9log_stream_start.
+ *
+ * @param[in,out] stream      Stream state to initialise.
+ * @param[in]     type        Packet type.
+ * @param[in]     level       Log level.
+ * @param[in]     tag_id      Tag identifier.
+ * @param[in]     fmt_id      Format identifier.
+ * @param[in]     payload_len Payload length (may be @c ON9LOG_PAYLOAD_LEN_STREAMING).
+ */
 static void on9log_emit_header(on9log_stream_t *stream,
                                on9log_packet_type_t type,
                                on9log_level_t level,
@@ -320,6 +601,17 @@ static void on9log_emit_header(on9log_stream_t *stream,
     }
 }
 
+/**
+ * @brief Check whether all argument types are safe to encode in an ISR context.
+ *
+ * Dynamic strings are not ISR-safe because reading user memory from an ISR
+ * can trigger a page fault or take too long.
+ *
+ * @param[in] arg_types  Packed argument-type string.
+ *
+ * @return @c true if all types are @c _32BITS, @c _64BITS, or @c _POINTER.
+ *         @c false if any type is @c _DYNAMIC_STRING or unknown.
+ */
 static bool on9log_arg_types_are_isr_safe(const char *arg_types)
 {
     for (unsigned idx = 0;; ++idx) {
@@ -341,6 +633,26 @@ static bool on9log_arg_types_are_isr_safe(const char *arg_types)
     }
 }
 
+/**
+ * @brief Serialise a complete log packet into a pre-allocated buffer for ISR
+ *        use.
+ *
+ * Encodes the header (with ISR-safe timestamp), argument count and type bytes,
+ * and all argument values.  Dynamic-string arguments cause encoding to fail
+ * (overflow set) because they are not ISR-safe.
+ *
+ * @param[out] packet      Buffer to write the serialised packet into.
+ * @param[in]  packet_cap  Capacity of @c packet in bytes.
+ * @param[out] packet_len  Receives the actual packet length on success.
+ * @param[in]  level       Log level.
+ * @param[in]  tag         Tag string (stored as pointer).
+ * @param[in]  format      Format string (stored as pointer).
+ * @param[in]  arg_types   Packed argument-type string.
+ * @param[in]  args        Variable argument list to consume.
+ *
+ * @return @c true on success, @c false if encoding overflowed (e.g. dynamic
+ *         string encountered or buffer too small).
+ */
 static bool on9log_encode_isr_log_packet(uint8_t *packet,
                                          size_t packet_cap,
                                          size_t *packet_len,
@@ -398,6 +710,14 @@ static bool on9log_encode_isr_log_packet(uint8_t *packet,
     return true;
 }
 
+/**
+ * @brief Emit a "dropped packets" notification packet (type @c ON9LOG_PKT_DROPPED).
+ *
+ * Sent to all sinks when at least one packet has been dropped since the last
+ * successful dispatch.
+ *
+ * @param[in] dropped_count  Number of packets dropped.
+ */
 static void on9log_emit_dropped_packet(uint32_t dropped_count)
 {
     on9log_stream_t stream = {0};
@@ -407,12 +727,25 @@ static void on9log_emit_dropped_packet(uint32_t dropped_count)
     on9log_stream_end(&stream);
 }
 
+/**
+ * @brief Emit a buffer-data packet (type @c ON9LOG_PKT_BUFFER).
+ *
+ * Used by @ref on9log_write_buffer to transmit raw binary data.  Large
+ * buffers are split into multiple packets; this function emits one chunk.
+ *
+ * @param[in] level      Log level.
+ * @param[in] tag        Tag string (stored as pointer).
+ * @param[in] bytes      Pointer to the buffer bytes.
+ * @param[in] total_len  Total buffer length across all chunks.
+ * @param[in] offset     Byte offset of this chunk in the original buffer.
+ * @param[in] chunk_len  Length of this chunk in bytes.
+ */
 static void on9log_emit_buffer_packet(on9log_level_t level,
-                                      const char *tag,
-                                      const uint8_t *bytes,
-                                      uint32_t total_len,
-                                      uint32_t offset,
-                                      uint32_t chunk_len)
+                                       const char *tag,
+                                       const uint8_t *bytes,
+                                       uint32_t total_len,
+                                       uint32_t offset,
+                                       uint32_t chunk_len)
 {
     on9log_stream_t stream = {0};
 
@@ -431,11 +764,29 @@ static void on9log_emit_buffer_packet(on9log_level_t level,
     on9log_stream_end(&stream);
 }
 
+/**
+ * @brief Validate a log level value.
+ *
+ * @param[in] level  Level to validate.
+ *
+ * @return @c true if level is in the range @c ON9_LOG_LEVEL_NONE ..
+ *         @c ON9_LOG_LEVEL_VERBOSE.
+ */
 static bool on9log_valid_level(on9log_level_t level)
 {
     return level >= ON9_LOG_LEVEL_NONE && level <= ON9_LOG_LEVEL_VERBOSE;
 }
 
+/**
+ * @brief Check whether a configured tag string matches a given tag.
+ *
+ * Performs pointer-identity comparison first, then falls back to @c strcmp.
+ *
+ * @param[in] configured  Tag from the filter list (may be NULL).
+ * @param[in] tag         Tag to match against (may be NULL).
+ *
+ * @return @c true if the tags match.
+ */
 static bool on9log_tag_matches(const char *configured, const char *tag)
 {
     if (configured == tag) {
@@ -447,6 +798,17 @@ static bool on9log_tag_matches(const char *configured, const char *tag)
     return strcmp(configured, tag) == 0;
 }
 
+/**
+ * @brief Determine the effective minimum log level for a given tag.
+ *
+ * If no per-tag filters are active, returns the default level.  Otherwise
+ * walks the atomic filter list snapshot and returns the level of the first
+ * matching active node, falling back to the default level.
+ *
+ * @param[in] tag  Tag string to look up.
+ *
+ * @return The minimum enabled log level for this tag.
+ */
 static on9log_level_t on9log_filter_level_for_tag(const char *tag)
 {
     if (atomic_load_explicit(&s_active_tag_filter_count, memory_order_acquire) == 0) {
@@ -467,6 +829,19 @@ static on9log_level_t on9log_filter_level_for_tag(const char *tag)
     return (on9log_level_t)atomic_load_explicit(&s_default_level, memory_order_relaxed);
 }
 
+/**
+ * @brief Check whether a given log level is enabled for a given tag.
+ *
+ * The check combines:
+ * - Compile-time filtering via @c ON9_LOG_LOCAL_LEVEL.
+ * - Runtime per-tag filtering via configured tag levels.
+ * - Runtime default level.
+ *
+ * @param[in] level  Requested log level.
+ * @param[in] tag    Tag string.
+ *
+ * @return @c true if the level is enabled.
+ */
 static bool on9log_level_enabled(on9log_level_t level, const char *tag)
 {
     on9log_level_t runtime_level;
@@ -484,6 +859,21 @@ static bool on9log_level_enabled(on9log_level_t level, const char *tag)
     return level <= runtime_level;
 }
 
+/**
+ * @brief Register a log sink.
+ *
+ * Adds the sink to the global atomic sink table.  Duplicate (sink, ctx)
+ * pairs are silently accepted (returns @c ON9LOG_OK).  Thread-safe.
+ *
+ * @param[in] sink  Pointer to the sink descriptor.  Must have all three
+ *                  callbacks (@c start_cb, @c payload_cb, @c end_cb) set.
+ * @param[in] ctx   Opaque user context passed to every sink callback.
+ *
+ * @return
+ * - @c ON9LOG_OK on success.
+ * - @c ON9LOG_ERR_INVALID_ARG if sink or any callback pointer is NULL.
+ * - @c ON9LOG_ERR_NO_MEM if the sink table is full.
+ */
 on9log_err_t on9log_add_sink(const on9log_sink_t *sink, void *ctx)
 {
     if (sink == NULL || sink->start_cb == NULL || sink->payload_cb == NULL || sink->end_cb == NULL) {
@@ -512,6 +902,19 @@ on9log_err_t on9log_add_sink(const on9log_sink_t *sink, void *ctx)
     return ON9LOG_ERR_NO_MEM;
 }
 
+/**
+ * @brief Remove a previously registered log sink.
+ *
+ * Finds the matching (sink, ctx) entry in the sink table and clears the slot
+ * with release ordering so that concurrent readers see the update.
+ *
+ * @param[in] sink  Pointer to the sink descriptor.
+ * @param[in] ctx   Opaque user context that was passed to @ref on9log_add_sink.
+ *
+ * @return
+ * - @c ON9LOG_OK on success.
+ * - @c ON9LOG_ERR_NOT_FOUND if the (sink, ctx) pair is not in the table.
+ */
 on9log_err_t on9log_remove_sink(const on9log_sink_t *sink, void *ctx)
 {
     on9log_port_lock();
@@ -530,16 +933,37 @@ on9log_err_t on9log_remove_sink(const on9log_sink_t *sink, void *ctx)
     return ON9LOG_ERR_NOT_FOUND;
 }
 
+/**
+ * @brief Enable or disable the platform UART output.
+ *
+ * When disabled, the stream still forwards data to registered sinks; only
+ * the direct UART write (via @ref on9log_port_write) is skipped.
+ *
+ * @param[in] enabled  @c true to enable UART output, @c false to disable.
+ */
 void on9log_set_uart_enabled(bool enabled)
 {
     atomic_store_explicit(&s_uart_enabled, enabled, memory_order_relaxed);
 }
 
+/**
+ * @brief Read and reset the dropped-packet counter.
+ *
+ * @return The number of packets dropped since the last call to this function
+ *         (or since system initialisation).
+ */
 uint32_t on9log_get_dropped_count(void)
 {
     return (uint32_t)atomic_load_explicit(&s_dropped_count, memory_order_relaxed);
 }
 
+/**
+ * @brief Set the default minimum log level.
+ *
+ * Affects all tags that do not have an explicit tag-level filter.
+ *
+ * @param[in] level  New default log level.  Invalid levels are silently ignored.
+ */
 void on9log_set_level(on9log_level_t level)
 {
     if (!on9log_valid_level(level)) {
@@ -548,11 +972,30 @@ void on9log_set_level(on9log_level_t level)
     atomic_store_explicit(&s_default_level, (int)level, memory_order_relaxed);
 }
 
+/**
+ * @brief Get the current default minimum log level.
+ *
+ * @return The current default log level.
+ */
 on9log_level_t on9log_get_level(void)
 {
     return (on9log_level_t)atomic_load_explicit(&s_default_level, memory_order_relaxed);
 }
 
+/**
+ * @brief Set the minimum log level for a specific tag.
+ *
+ * If a filter node already exists for the tag its level is updated; otherwise
+ * a new node is allocated and inserted at the head of the filter list.
+ *
+ * @param[in] tag    Tag string (pointer is stored, not copied).
+ * @param[in] level  Minimum log level for this tag.
+ *
+ * @return
+ * - @c ON9LOG_OK on success.
+ * - @c ON9LOG_ERR_INVALID_ARG if tag is NULL or level is invalid.
+ * - @c ON9LOG_ERR_NO_MEM if a new node could not be allocated.
+ */
 on9log_err_t on9log_set_tag_level(const char *tag, on9log_level_t level)
 {
     if (tag == NULL || !on9log_valid_level(level)) {
@@ -591,6 +1034,20 @@ on9log_err_t on9log_set_tag_level(const char *tag, on9log_level_t level)
     return ON9LOG_OK;
 }
 
+/**
+ * @brief Remove the minimum log level override for a specific tag.
+ *
+ * Marks the filter node inactive (without freeing it) so that the tag falls
+ * back to the default level.  The node remains in the linked list but is
+ * skipped during filter lookups.
+ *
+ * @param[in] tag  Tag string to clear.
+ *
+ * @return
+ * - @c ON9LOG_OK on success.
+ * - @c ON9LOG_ERR_INVALID_ARG if tag is NULL.
+ * - @c ON9LOG_ERR_NOT_FOUND if no filter exists for the given tag.
+ */
 on9log_err_t on9log_clear_tag_level(const char *tag)
 {
     if (tag == NULL) {
@@ -614,6 +1071,21 @@ on9log_err_t on9log_clear_tag_level(const char *tag)
     return ON9LOG_ERR_NOT_FOUND;
 }
 
+/**
+ * @brief Dispatch a pre-serialised log packet to all registered sinks.
+ *
+ * Used by the ISR drain path (and any other code that has already serialised
+ * a packet).  The packet must start with a valid magic byte and have at least
+ * @c sizeof(on9log_packet_header_t) bytes.  Any accumulated dropped-count is
+ * emitted before the packet.
+ *
+ * @param[in] packet      Pointer to the serialised packet (header + payload).
+ * @param[in] packet_len  Total packet length in bytes.
+ *
+ * @return
+ * - @c ON9LOG_OK on success.
+ * - @c ON9LOG_ERR_INVALID_ARG if packet is NULL, too short, or has an invalid magic.
+ */
 on9log_err_t on9log_dispatch_packet(const uint8_t *packet, size_t packet_len)
 {
     uint32_t dropped_count = 0;
@@ -642,6 +1114,20 @@ on9log_err_t on9log_dispatch_packet(const uint8_t *packet, size_t packet_len)
     return ON9LOG_OK;
 }
 
+/**
+ * @brief Write a formatted log message (task-context, variadic).
+ *
+ * This is the primary logging entry point.  It checks the runtime level
+ * filter, emits any accumulated dropped-packet notification, creates a
+ * @c ON9LOG_PKT_LOG frame with header, argument count, argument type bytes,
+ * and the serialised argument values via the stream.
+ *
+ * @param[in] level     Log level.
+ * @param[in] tag       Tag string.
+ * @param[in] format    Format string (stored as pointer; not interpreted here).
+ * @param[in] arg_types Packed argument-type string.
+ * @param[in] ...       Variable arguments matching @c arg_types.
+ */
 void on9log_write(on9log_level_t level,
                   const char *tag,
                   const char *format,
@@ -681,6 +1167,24 @@ void on9log_write(on9log_level_t level,
     va_end(args);
 }
 
+/**
+ * @brief Write a formatted log message from an ISR context.
+ *
+ * The message is serialised into a stack-allocated packet buffer, then
+ * enqueued into the platform ringbuffer for deferred dispatch.  Only
+ * ISR-safe argument types (32/64-bit integers and pointers) are accepted;
+ * dynamic strings cause the message to be dropped and the dropped counter
+ * incremented.
+ *
+ * @param[in] level     Log level.
+ * @param[in] tag       Tag string.
+ * @param[in] format    Format string (stored as pointer).
+ * @param[in] arg_types Packed argument-type string (must be ISR-safe).
+ * @param[in] ...       Variable arguments matching @c arg_types.
+ *
+ * @return @c true if the packet was successfully enqueued, @c false if it
+ *         was dropped (ringbuffer full, non-ISR-safe args, or encoding failure).
+ */
 bool on9log_write_isr(on9log_level_t level,
                       const char *tag,
                       const char *format,
@@ -715,6 +1219,18 @@ bool on9log_write_isr(on9log_level_t level,
     return true;
 }
 
+/**
+ * @brief Write a raw binary buffer through the logging system.
+ *
+ * The buffer is split into chunks of up to @c ON9LOG_BUFFER_CHUNK_SIZE bytes
+ * and each chunk is emitted as a @c ON9LOG_PKT_BUFFER frame.  Buffers larger
+ * than @c UINT32_MAX are rejected on 64-bit platforms.
+ *
+ * @param[in] level      Log level.
+ * @param[in] tag        Tag string.
+ * @param[in] buffer     Pointer to the raw data buffer (may be NULL if @c buffer_len is 0).
+ * @param[in] buffer_len Length of the buffer in bytes.
+ */
 void on9log_write_buffer(on9log_level_t level,
                          const char *tag,
                          const void *buffer,

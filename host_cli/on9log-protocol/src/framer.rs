@@ -14,8 +14,11 @@ use crate::wire::{
 /// A fully decoded on9log packet carried inside a CRC-verified transport frame.
 #[derive(Debug, Clone)]
 pub struct RawFrame {
+    /// Parsed 18-byte packet header (magic, type, level, sequence, timestamps, IDs).
     pub header: Header,
+    /// Raw header bytes as received over the wire (for CRC re-computation etc.).
     pub header_bytes: Vec<u8>,
+    /// Payload bytes following the header (arg-type table + argument values).
     pub payload: Vec<u8>,
 }
 
@@ -23,22 +26,41 @@ pub struct RawFrame {
 /// (bad magic, CRC mismatch, truncated). Errors do not halt decoding.
 #[derive(Debug)]
 pub enum Outcome {
+    /// A successfully decoded and CRC-verified on9log packet.
     Frame(RawFrame),
+    /// A plain-text chunk (stdout/stderr) carried in a text transport frame or
+    /// raw bytes outside any SLIP frame.
     PlainText(Vec<u8>),
+    /// The on9log packet magic byte was missing or wrong.
     BadMagic,
+    /// The transport frame CRC-16 did not match the computed checksum.
     CrcMismatch,
+    /// The transport frame was too short to contain even a type byte and CRC.
     Truncated,
+    /// The on9log payload length field does not match the actual payload size
+    /// (only checked for non-streaming frames).
     LengthMismatch,
+    /// The accumulated transport frame exceeded [`TRANSPORT_MAX_PAYLOAD`].
     FrameTooLong,
+    /// The transport frame type byte is neither on9log nor text.
     UnknownFrameType(u8),
+    /// An invalid SLIP escape sequence was encountered.
     InvalidEscape,
 }
 
 /// Streaming transport deframer. Feed it arbitrary byte slices from the UART.
+///
+/// The deframer maintains state across calls to [`Deframer::feed`], handling
+/// SLIP frame boundaries, escape sequences, CRC verification, and raw-text
+/// accumulation. Each call returns a batch of [`Outcome`] values.
 pub struct Deframer {
+    /// Accumulated bytes for the current SLIP frame (after un-escaping).
     buf: Vec<u8>,
+    /// Accumulated raw text bytes outside any SLIP frame.
     raw_text: Vec<u8>,
+    /// `true` while inside a SLIP frame (between `SLIP_START` and `SLIP_END`).
     in_frame: bool,
+    /// `true` when the previous byte was a SLIP escape (`SLIP_ESC`).
     escape: bool,
 }
 
@@ -49,6 +71,7 @@ impl Default for Deframer {
 }
 
 impl Deframer {
+    /// Create a new `Deframer` with empty internal state.
     pub fn new() -> Self {
         Self {
             buf: Vec::with_capacity(256),
@@ -122,6 +145,9 @@ impl Deframer {
         out
     }
 
+    /// Push a single unescaped byte into the frame buffer, checking the maximum
+    /// transport frame size. On overflow the accumulated buffer is discarded and
+    /// [`Outcome::FrameTooLong`] is emitted.
     fn push_byte(&mut self, byte: u8, out: &mut Vec<Outcome>) {
         let max_frame_bytes = 1 + TRANSPORT_MAX_PAYLOAD + 2;
         if self.buf.len() >= max_frame_bytes {
@@ -134,6 +160,7 @@ impl Deframer {
         self.buf.push(byte);
     }
 
+    /// Flush any accumulated raw text bytes as an [`Outcome::PlainText`].
     fn flush_raw_text(&mut self, out: &mut Vec<Outcome>) {
         if !self.raw_text.is_empty() {
             out.push(Outcome::PlainText(std::mem::take(&mut self.raw_text)));
@@ -141,6 +168,10 @@ impl Deframer {
     }
 
     /// Decode one unescaped transport frame buffer into an `Outcome`.
+    ///
+    /// The buffer layout is: `type(1) | payload(N) | crc_le(2)`.
+    /// This method validates the CRC, checks the payload length, and
+    /// dispatches by frame type to the on9log or plain-text decoder.
     fn decode_frame(buf: &[u8]) -> Option<Outcome> {
         // type(1) + crc(2) is the minimum transport frame.
         if buf.len() < 3 {
@@ -164,6 +195,10 @@ impl Deframer {
         }
     }
 
+    /// Decode the inner on9log payload (after the transport frame type byte)
+    /// into an [`Outcome::Frame`]. Validates the magic byte, parses the header,
+    /// and checks the payload length against [`PAYLOAD_LEN_STREAMING`] or the
+    /// declared length.
     fn decode_on9log_payload(payload: &[u8]) -> Option<Outcome> {
         // header(18) is the minimum inner on9log packet.
         if payload.len() < HEADER_LEN {
@@ -195,8 +230,7 @@ mod tests {
         ArgType, HEADER_LEN, Level, PACKET_MAGIC, PAYLOAD_LEN_STREAMING, PacketType,
     };
 
-    /// Build a full typed transport frame exactly as `esp_stdio_log_vfs.c` emits
-    /// it: `0xa5 SLIP(type) SLIP(payload) SLIP(crc_le) 0xc0`.
+    /// Build a full typed transport frame: `SLIP_START | esc(type) | esc(payload) | esc(crc_le) | SLIP_END`.
     fn build_transport_frame(frame_type: u8, payload: &[u8]) -> Vec<u8> {
         let crc = crate::crc::compute(&[frame_type], payload);
         let mut inner = Vec::new();
@@ -212,6 +246,7 @@ mod tests {
         out
     }
 
+    /// Build an on9log transport frame from raw header bytes and payload.
     fn build_on9log_frame(header: &[u8], payload: &[u8]) -> Vec<u8> {
         let mut inner_payload = Vec::new();
         inner_payload.extend_from_slice(header);
@@ -219,6 +254,8 @@ mod tests {
         build_transport_frame(TRANSPORT_FRAME_ON9LOG, &inner_payload)
     }
 
+    /// Apply SLIP escaping to a single byte and append it to `out`.
+    /// Escapes `SLIP_START`, `SLIP_END`, `SLIP_ESC`, `\r`, and `\n`.
     fn push_slip(byte: u8, out: &mut Vec<u8>) {
         match byte {
             SLIP_START => {
@@ -245,6 +282,7 @@ mod tests {
         }
     }
 
+    /// Build a minimal 18-byte on9log header with the given sequence number.
     fn make_header(seq: u16) -> Vec<u8> {
         let mut h = Vec::with_capacity(HEADER_LEN);
         h.push(PACKET_MAGIC);

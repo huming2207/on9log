@@ -13,6 +13,10 @@ use goblin::{
 };
 
 /// Address-indexed ELF string table.
+///
+/// Loads an ELF binary and provides address-to-string resolution for format
+/// strings, tags, and function symbols, plus optional DWARF source-location
+/// lookups when loaded from a file path.
 pub struct ElfStrings {
     /// Sections sorted by start address, each carrying its file bytes.
     sections: Vec<Section>,
@@ -22,34 +26,56 @@ pub struct ElfStrings {
     lines: Option<addr2line::Loader>,
 }
 
+/// An ELF section with its virtual-address range and file-backed data.
 struct Section {
+    /// Section name (e.g. `.rodata`, `.noload`).
     name: String,
+    /// Virtual start address of the section.
     addr: u32,
+    /// Exclusive end address (`addr + section_size`).
     end: u32,
+    /// Raw file bytes for this section (for string lookups).
     data: Vec<u8>,
 }
 
+/// A resolved symbol result: the containing function name, its base address,
+/// and the byte offset from that base to the queried address.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedSymbol<'a> {
+    /// Function symbol name.
     pub name: &'a str,
+    /// Base address of the function.
     pub address: u32,
+    /// Byte offset from `address` to the queried instruction address.
     pub offset: u32,
 }
 
+/// A source file and optional line number resolved from an instruction address
+/// via DWARF debug information.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceLocation {
+    /// Source file path (as recorded in DWARF).
     pub file: String,
+    /// 1-based line number, or `None` if the debug info lacks line data.
     pub line: Option<u32>,
 }
 
+/// A function symbol parsed from the ELF symbol table.
 struct Symbol {
+    /// Mangled or unmangled function name.
     name: String,
+    /// Virtual address of the function entry point.
     addr: u32,
+    /// Size of the function in bytes (0 if unknown).
     size: u32,
 }
 
 impl ElfStrings {
     /// Parse an ELF file from raw bytes (e.g. the Xtensa `.elf` build artifact).
+    ///
+    /// Scans all section headers and symbol tables, sorting sections and symbols
+    /// by address for binary search at lookup time. Does not load DWARF debug
+    /// info; use [`ElfStrings::from_path`] for source-location resolution.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
         let elf = Elf::parse(bytes).map_err(|e| format!("elf parse: {e}"))?;
 
@@ -73,6 +99,9 @@ impl ElfStrings {
     }
 
     /// Parse an ELF file from disk and enable DWARF source location lookups.
+    ///
+    /// Reads the file, calls [`ElfStrings::from_bytes`], and then loads the
+    /// DWARF debug info from the same path for [`resolve_location`](Self::resolve_location).
     pub fn from_path(path: impl AsRef<Path>) -> Result<Self, String> {
         let path = path.as_ref();
         let bytes = std::fs::read(path).map_err(|e| format!("read: {e}"))?;
@@ -83,6 +112,10 @@ impl ElfStrings {
 
     /// Read a NUL-terminated string starting at `addr`, if it falls inside a
     /// known section. Returns `None` for unmapped addresses or empty strings.
+    ///
+    /// Searches all loaded sections regardless of section type or name.
+    /// If the same address maps to different strings in different sections,
+    /// returns `None` (ambiguous).
     pub fn read_cstr(&self, addr: u32) -> Option<&str> {
         self.read_cstr_from(addr, |_| true)
     }
@@ -91,6 +124,9 @@ impl ElfStrings {
     /// no-load section family. The C++ header wrapper accepts normal function
     /// string arguments, so those literals remain in ordinary string-bearing
     /// sections and are used as a fallback.
+    ///
+    /// First searches sections whose names contain `.noload`; if no match is
+    /// found, falls back to any loaded section.
     pub fn read_format(&self, addr: u32) -> Option<&str> {
         self.read_cstr_from(addr, is_noload_section)
             .or_else(|| self.read_cstr_from(addr, |_| true))
@@ -98,12 +134,17 @@ impl ElfStrings {
 
     /// Read a normal tag string. Tags are expected in ordinary string-bearing
     /// sections, not the no-load format-string section.
+    ///
+    /// Searches all sections whose names do NOT contain `.noload`.
     pub fn read_tag(&self, addr: u32) -> Option<&str> {
         self.read_cstr_from(addr, |name| !is_noload_section(name))
     }
 
     /// Resolve an instruction address to the nearest containing function
     /// symbol. If the symbol has no size, the next symbol address bounds it.
+    ///
+    /// Uses binary search over the sorted symbol list. Returns the containing
+    /// function name, its base address, and the offset from that base to `addr`.
     pub fn resolve_symbol(&self, addr: u32) -> Option<ResolvedSymbol<'_>> {
         let idx = self.symbols.partition_point(|s| s.addr <= addr);
         for i in (0..idx).rev() {
@@ -130,6 +171,10 @@ impl ElfStrings {
     }
 
     /// Resolve an instruction address to a DWARF source file and line.
+    ///
+    /// Requires the ELF to have been loaded via [`ElfStrings::from_path`] (which
+    /// enables DWARF lookups). Returns `None` when no DWARF info is available
+    /// or the address is not mapped to a known source location.
     pub fn resolve_location(&self, addr: u32) -> Option<SourceLocation> {
         let loc = self.lines.as_ref()?.find_location(u64::from(addr)).ok()??;
         let file = loc.file?;
@@ -139,6 +184,11 @@ impl ElfStrings {
         })
     }
 
+    /// Internal helper: find a NUL-terminated string at `addr`, restricting
+    /// the search to sections that pass the `section_matches` predicate.
+    ///
+    /// If multiple sections contain `addr` but disagree on the string value,
+    /// returns `None` (ambiguous).
     fn read_cstr_from<P>(&self, addr: u32, section_matches: P) -> Option<&str>
     where
         P: Fn(&str) -> bool,
@@ -161,10 +211,13 @@ impl ElfStrings {
 }
 
 impl Section {
+    /// Check if `addr` falls within this section's virtual address range.
     fn contains(&self, addr: u32) -> bool {
         self.addr <= addr && addr < self.end
     }
 
+    /// Read the NUL-terminated string starting at `addr` within this section's
+    /// data. Returns `None` if `addr` is out of range or the string is empty.
     fn read_cstr(&self, addr: u32) -> Option<&str> {
         let off = usize::try_from(addr - self.addr).ok()?;
         let bytes = self.data.get(off..)?;
@@ -176,10 +229,15 @@ impl Section {
     }
 }
 
+/// Check whether a section name identifies it as an ESP-IDF no-load section
+/// (`.noload*`), which carry format strings at VMA 0.
 fn is_noload_section(name: &str) -> bool {
     name.contains(".noload")
 }
 
+/// Collect a single ELF section's data into `out` if it has non-zero size
+/// and is addressable. NOBITS sections (`SHT_NOBITS`) are skipped. VMA-0
+/// sections are only kept when their name indicates a no-load section.
 fn collect_section(file: &[u8], sh: &SectionHeader, name: &str, out: &mut Vec<Section>) {
     // NOBITS sections occupy no file space and hold no strings. ESP-IDF's
     // no-load strings are PROGBITS at VMA 0, so keep VMA-0 sections only when
@@ -207,11 +265,15 @@ fn collect_section(file: &[u8], sh: &SectionHeader, name: &str, out: &mut Vec<Se
     });
 }
 
+/// Collect all `STT_FUNC` symbols from both the normal and dynamic symbol
+/// tables, deduplicating by (address, name).
 fn collect_symbols(elf: &Elf<'_>, out: &mut Vec<Symbol>) {
     collect_symbol_table(elf.syms.iter(), &elf.strtab, out);
     collect_symbol_table(elf.dynsyms.iter(), &elf.dynstrtab, out);
 }
 
+/// Collect function symbols from one symbol table iterator, filtering to
+/// `STT_FUNC` entries with a non-zero value and a non-empty name.
 fn collect_symbol_table(
     symbols: impl Iterator<Item = goblin::elf::Sym>,
     names: &Strtab<'_>,

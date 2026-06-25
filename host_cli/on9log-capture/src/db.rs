@@ -20,8 +20,11 @@ use std::path::Path;
 use on9log_protocol::{Header, Outcome, RawFrame};
 use rusqlite::{Connection, OpenFlags, Statement};
 
+/// Convenience alias for fallible operations that can return any boxed error.
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
+/// DDL statements that create the `meta` and `events` tables (plus indexes)
+/// if they do not already exist. Executed at database open time.
 const SCHEMA: &str = "\
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
@@ -46,12 +49,14 @@ CREATE INDEX IF NOT EXISTS idx_events_captured ON events(captured_at_ms);
 CREATE INDEX IF NOT EXISTS idx_events_seq ON events(seq);
 ";
 
+/// Prepared INSERT statement for storing one event row.
 const INSERT: &str = "\
 INSERT INTO events (
     captured_at_ms, kind, seq, device_time_ms, level, ptype,
     tag_id, fmt_id, payload_len, header, payload, detail
 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)";
 
+/// Prepared SELECT statement that reads all event columns in capture order.
 const SELECT_ALL: &str = "\
 SELECT id, captured_at_ms, kind, seq, device_time_ms, level, ptype, tag_id,
        fmt_id, payload_len, header, payload, detail
@@ -59,6 +64,7 @@ FROM events ORDER BY id";
 
 /// A SQLite database holding captured on9log transport outcomes.
 pub struct CaptureDb {
+    /// Underlying SQLite connection handle.
     conn: Connection,
 }
 
@@ -167,6 +173,9 @@ impl CaptureDb {
     }
 }
 
+/// Insert a single [`Outcome`] into the `events` table using the prepared
+/// statement. Dispatches on the outcome variant to set the correct `kind`
+/// column and relevant field values.
 fn store_one(stmt: &mut Statement<'_>, outcome: &Outcome, ts: u64) -> Result<()> {
     match outcome {
         Outcome::Frame(f) => {
@@ -214,6 +223,9 @@ fn store_one(stmt: &mut Statement<'_>, outcome: &Outcome, ts: u64) -> Result<()>
     Ok(())
 }
 
+/// Insert a diagnostic/error outcome (bad magic, CRC mismatch, truncated,
+/// etc.) into the `events` table. Only the `kind` and optional `detail`
+/// columns are populated; frame-specific fields are all `NULL`.
 fn store_error(
     stmt: &mut Statement<'_>,
     ts: u64,
@@ -237,7 +249,12 @@ fn store_error(
     Ok(())
 }
 
-/// Reconstruct an [`Outcome`] from stored columns.
+/// Reconstruct an [`Outcome`] from stored database columns.
+///
+/// The `kind` column determines which variant to use. For `"on9log"` frames
+/// the header BLOB is re-parsed; for diagnostic kinds the string detail is
+/// used when applicable. Returns `None` if the stored data cannot be parsed
+/// (indicating a corrupted or hand-edited database).
 fn reconstruct(
     kind: &str,
     header: &Option<Vec<u8>>,
@@ -271,6 +288,8 @@ fn reconstruct(
     }
 }
 
+/// Check whether the database contains an `events` table. Used by
+/// `open_readonly()` to reject files that are not on9log capture databases.
 fn has_events_table(conn: &Connection) -> Result<bool> {
     let n: i64 = conn.query_row(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='events'",

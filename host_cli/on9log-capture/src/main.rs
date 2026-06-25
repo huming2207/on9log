@@ -41,6 +41,7 @@ use term::{host_now_ms, local_ts_string, print_log_line, stdout_is_tty};
 #[derive(Parser, Debug)]
 #[command(name = "on9log-capture", version, about)]
 struct Cli {
+    /// Subcommand: `capture` (customer workflow) or `decode` (developer workflow).
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -115,6 +116,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Load an ELF file for string-address resolution. Returns `None` (with an
+/// info message) when no path is provided, or an error if the path exists but
+/// cannot be parsed.
 fn load_elf(
     path: Option<&std::path::Path>,
 ) -> Result<Option<ElfStrings>, Box<dyn std::error::Error>> {
@@ -133,6 +137,13 @@ fn load_elf(
     }
 }
 
+/// Capture loop: opens a UART serial port, deframes all incoming outcomes,
+/// stamps each with the host receive time, and stores them in a SQLite
+/// database. Runs until EOF on the serial port or the user presses Ctrl+C.
+///
+/// # Errors
+/// Returns an error if the serial port cannot be opened, the ESP reset fails,
+/// or an I/O error occurs during the read loop.
 async fn capture_run(args: CaptureArgs) -> Result<(), Box<dyn std::error::Error>> {
     let out_path = args.out.clone().unwrap_or_else(default_capture_path);
     let mut db = CaptureDb::open(&out_path)?;
@@ -202,6 +213,14 @@ async fn capture_run(args: CaptureArgs) -> Result<(), Box<dyn std::error::Error>
     Ok(())
 }
 
+/// Decode loop: opens a previously captured SQLite database, replays every
+/// stored event through the on9log decode pipeline, and renders human-readable
+/// output to stdout (or a save file). Optionally loads an ELF for string
+/// resolution.
+///
+/// # Errors
+/// Returns an error if the database cannot be opened, no `events` table is
+/// found, or the ELF file cannot be parsed.
 fn decode_run(args: DecodeArgs) -> Result<(), Box<dyn std::error::Error>> {
     let elf = load_elf(args.elf.as_deref())?;
     let db = CaptureDb::open_readonly(&args.db)?;
@@ -237,6 +256,8 @@ fn decode_run(args: DecodeArgs) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Generate a default capture database path:
+/// `on9log-capture-{unix_epoch_seconds}.sqlite`.
 fn default_capture_path() -> PathBuf {
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -249,27 +270,41 @@ fn default_capture_path() -> PathBuf {
 // Rendering for decode replay
 // ---------------------------------------------------------------------------
 
+/// Rendering options for the decode-replay loop.
 #[derive(Clone, Copy)]
 struct RenderOptions {
+    /// Whether to emit ANSI color codes.
     use_color: bool,
+    /// Line-wrap width (0 = no wrapping, grep-friendly).
     width: usize,
+    /// Whether to prefix each line with the captured-at local timestamp.
     timestamp: bool,
+    /// When true, output goes to stdout; when false, only the save-file path.
     to_stdout: bool,
+    /// Whether to strip ANSI escape sequences from device plain text before
+    /// outputting (used when `--no-color` is active or when saving to file).
     strip_ansi: bool,
 }
 
 /// Stateful renderer wrapping the on9log decode pipeline. The timestamp source
 /// is always the per-event `captured_at_ms` stored during capture.
 struct Renderer {
+    /// Rendering configuration (color, width, timestamp, etc.).
     opts: RenderOptions,
+    /// Protocol decoder for on9log binary frames.
     decoder: Decoder,
+    /// Crash decoder for extracting backtrace annotations from plain text.
     crash: CrashDecoder,
+    /// Plain-text state for stdout output (tracks timestamps at line starts).
     plain: PlainTextState,
+    /// Separate plain-text state for the save-file path.
     save_plain: PlainTextState,
+    /// Optional save-file writer.
     save: Option<SaveLog>,
 }
 
 impl Renderer {
+    /// Create a new renderer with the given options and optional save file.
     fn new(opts: RenderOptions, save: Option<SaveLog>) -> Self {
         Self {
             opts,
@@ -281,6 +316,9 @@ impl Renderer {
         }
     }
 
+    /// Process a single [`Outcome`] through the decode pipeline and render it
+    /// to stdout and/or the save file. `captured_at_ms` is the wall-clock
+    /// receive timestamp from the capture database.
     fn handle(&mut self, outcome: &Outcome, elf: Option<&ElfStrings>, captured_at_ms: u64) {
         let RenderOptions {
             use_color,
@@ -440,6 +478,9 @@ impl Renderer {
         }
     }
 
+    /// Print a dim, yellow warning/progress line, optionally prefixed with
+    /// the captured-at timestamp. The message is ANSI-stripped if the renderer
+    /// is configured for stripping.
     fn warn_line(&mut self, msg: &str, captured_at_ms: u64) {
         let RenderOptions {
             use_color,
@@ -470,6 +511,7 @@ impl Renderer {
     }
 }
 
+/// Map an on9log [`Level`] to the corresponding ANSI color constant.
 fn level_color(level: Level) -> &'static str {
     match level {
         Level::Error => color::RED,
@@ -483,12 +525,18 @@ fn level_color(level: Level) -> &'static str {
 // Plain text + save file helpers
 // ---------------------------------------------------------------------------
 
+/// A file that mirrors decoded text output, with synchronous writes and
+/// data-sync after each operation for crash safety.
 struct SaveLog {
+    /// Path to the log file on disk.
     path: PathBuf,
+    /// Open writable file handle.
     file: std::fs::File,
 }
 
 impl SaveLog {
+    /// Create a new save file at the given `path`. The file is created
+    /// (truncating any existing content).
     fn create(path: &std::path::Path) -> std::io::Result<Self> {
         let file = std::fs::File::create(path)?;
         Ok(Self {
@@ -497,12 +545,14 @@ impl SaveLog {
         })
     }
 
+    /// Write all `bytes` to the file, flush, and `sync_data()` for durability.
     fn write_all_immediate(&mut self, bytes: &[u8]) -> std::io::Result<()> {
         self.file.write_all(bytes)?;
         self.file.flush()?;
         self.file.sync_data()
     }
 
+    /// Write a single `line` (with trailing newline), flush, and `sync_data()`.
     fn write_line(&mut self, line: &str) -> std::io::Result<()> {
         self.file.write_all(line.as_bytes())?;
         self.file.write_all(b"\n")?;
@@ -511,18 +561,25 @@ impl SaveLog {
     }
 }
 
+/// Display the save-file path for user-facing output.
 impl std::fmt::Display for SaveLog {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.path.display())
     }
 }
 
+/// Tracks plain-text output position for inserting timestamps at line starts
+/// and for stripping ANSI escape sequences in the save-file path.
 struct PlainTextState {
+    /// Whether the next byte to be written is at the start of a fresh line.
     line_start: bool,
+    /// Current state of the streaming ANSI escape sequence parser.
     ansi: AnsiStripState,
 }
 
 impl PlainTextState {
+    /// Create a new state positioned at the start of a line with the ANSI
+    /// parser in the ground state.
     fn new() -> Self {
         Self {
             line_start: true,
@@ -530,19 +587,29 @@ impl PlainTextState {
         }
     }
 
+    /// Reset to line-start with ground ANSI state.
     fn reset_line(&mut self) {
         self.line_start = true;
         self.ansi = AnsiStripState::Ground;
     }
 }
 
+/// State machine for the streaming ANSI escape sequence parser.
+///
+/// Transitions: `Ground` -> (`0x1b`) -> `Escape` -> (`[`) -> `Csi` -> (final
+/// byte 0x40-0x7e) -> `Ground`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AnsiStripState {
+    /// Normal character output; no escape sequence in progress.
     Ground,
+    /// Saw `0x1b` (ESC); waiting for the next byte to determine the sequence.
     Escape,
+    /// Saw `[` after ESC; accumulating CSI parameters until the final byte.
     Csi,
 }
 
+/// Return the timestamp prefix string `[YYYYMMDD-HH:MM:SS.mmm] ` if `enabled`
+/// is true, otherwise an empty string.
 fn ts_prefix(enabled: bool, captured_at_ms: u64) -> String {
     if !enabled {
         return String::new();
@@ -550,6 +617,8 @@ fn ts_prefix(enabled: bool, captured_at_ms: u64) -> String {
     format!("[{}] ", local_ts_string(captured_at_ms))
 }
 
+/// Print a hex + ASCII dump of `bytes` to stdout, 16 bytes per line, with
+/// optional ANSI color and timestamp prefix.
 fn print_hexdump(
     bytes: &[u8],
     color_code: &str,
@@ -590,6 +659,8 @@ fn print_hexdump(
     }
 }
 
+/// Write a hex + ASCII dump of `bytes` to the save file, 16 bytes per line,
+/// with optional timestamp prefix.
 fn write_hexdump_to_file(
     save: &mut SaveLog,
     bytes: &[u8],
@@ -621,6 +692,9 @@ fn write_hexdump_to_file(
     Ok(())
 }
 
+/// Write raw plain-text bytes to the output, optionally inserting a timestamp
+/// at each line start and optionally stripping ANSI escape sequences. Tracks
+/// the line-start state across calls so chunked input is handled correctly.
 fn write_plain_text<W: Write>(
     out: &mut W,
     bytes: &[u8],
@@ -649,6 +723,9 @@ fn write_plain_text<W: Write>(
     Ok(())
 }
 
+/// Write a single annotation line (e.g. a crash backtrace marker) to the
+/// output, prefixed with an optional timestamp and always terminated by a
+/// newline.
 fn write_plain_annotation<W: Write>(
     out: &mut W,
     line: &str,
@@ -660,6 +737,8 @@ fn write_plain_annotation<W: Write>(
     out.write_all(b"\n")
 }
 
+/// Write plain-text bytes to the save file, optionally stripping ANSI escape
+/// sequences and inserting timestamps at each line start.
 fn write_plain_text_saved(
     save: &mut SaveLog,
     bytes: &[u8],
@@ -690,11 +769,14 @@ fn write_plain_text_saved(
     Ok(())
 }
 
+/// Remove ANSI escape sequences from `bytes` in a single pass.
 fn strip_ansi_bytes(bytes: &[u8]) -> Vec<u8> {
     let mut state = AnsiStripState::Ground;
     strip_ansi_stream(bytes, &mut state)
 }
 
+/// Conditionally strip ANSI escape sequences from a string. Returns the
+/// original string (cloned) when `strip_ansi` is false.
 fn clean_string(s: &str, strip_ansi: bool) -> String {
     if !strip_ansi {
         return s.to_string();
@@ -702,6 +784,9 @@ fn clean_string(s: &str, strip_ansi: bool) -> String {
     String::from_utf8_lossy(&strip_ansi_bytes(s.as_bytes())).into_owned()
 }
 
+/// Streaming ANSI escape sequence remover. `state` tracks whether we are
+/// inside an escape sequence across calls so that split sequences (spanning
+/// multiple chunks) are handled correctly.
 fn strip_ansi_stream(bytes: &[u8], state: &mut AnsiStripState) -> Vec<u8> {
     let mut out = Vec::with_capacity(bytes.len());
     for &b in bytes {
@@ -734,6 +819,9 @@ fn strip_ansi_stream(bytes: &[u8], state: &mut AnsiStripState) -> Vec<u8> {
 // ESP reset
 // ---------------------------------------------------------------------------
 
+/// Perform a hard reset of an ESP target by toggling the serial port's RTS
+/// line (connected to EN on ESP dev boards via an active-low transistor
+/// circuit). DTR is held high (GPIO0 released, normal boot).
 fn esp_hard_reset<P: SerialPort>(port: &mut P) -> tokio_serial::Result<()> {
     // ESP dev boards wire DTR to GPIO0 and RTS to EN through active-low
     // transistor circuits. Release GPIO0, pulse EN low, then release EN.

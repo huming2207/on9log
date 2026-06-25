@@ -60,6 +60,7 @@ struct Cli {
     log_path: Option<PathBuf>,
 }
 
+/// Map an on9log [`Level`] to the corresponding ANSI color constant.
 fn level_color(level: Level) -> &'static str {
     match level {
         Level::Error => color::RED,
@@ -117,17 +118,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Runtime configuration assembled from [`Cli`] arguments before entering the
+/// async event loop.
 struct RunConfig {
+    /// UART port device path, e.g. `/dev/ttyUSB0`.
     port: String,
+    /// Baud rate for the serial connection.
     baud: u32,
+    /// Optional ELF strings table for resolving format/tag addresses.
     elf: Option<Rc<ElfStrings>>,
+    /// Whether to emit ANSI color codes.
     use_color: bool,
+    /// Terminal width for line wrapping (columns).
     width: usize,
+    /// Whether to prefix each output line with a local timestamp.
     timestamp: bool,
+    /// Whether to toggle DTR/RTS to reset the ESP target on open.
     esp_reset: bool,
+    /// Optional text-file logger for saving decoded output.
     save: Option<SaveLog>,
 }
 
+/// Main async event loop: opens the serial port, optionally resets the ESP
+/// target, then reads serial bytes through the deframer/decode pipeline
+/// until EOF or the user presses the quit key sequence (`Ctrl+] Ctrl+T`).
+///
+/// # Errors
+/// Returns an error if the serial port cannot be opened, the ESP reset fails,
+/// or an unrecoverable I/O error occurs during the read loop.
 async fn run(mut cfg: RunConfig) -> Result<(), Box<dyn std::error::Error>> {
     let port = cfg.port;
     let baud = cfg.baud;
@@ -199,24 +217,32 @@ async fn run(mut cfg: RunConfig) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// A text log file that mirrors decoded output, with synchronous writes and
+/// data-sync after each operation so the file is never truncated on crash.
 struct SaveLog {
+    /// Path to the log file on disk.
     path: PathBuf,
+    /// Open writable file handle.
     file: std::fs::File,
 }
 
 impl SaveLog {
+    /// Create a new save file. If `path` is `None`, a default
+    /// `on9log-UNIX_TIMESTAMP.log` path is generated.
     fn create(path: Option<PathBuf>) -> std::io::Result<Self> {
         let path = path.unwrap_or_else(default_save_path);
         let file = std::fs::File::create(&path)?;
         Ok(Self { path, file })
     }
 
+    /// Write all `bytes` to the file, flush, and `sync_data()` for durability.
     fn write_all_immediate(&mut self, bytes: &[u8]) -> std::io::Result<()> {
         self.file.write_all(bytes)?;
         self.file.flush()?;
         self.file.sync_data()
     }
 
+    /// Write a single `line` (with trailing newline), flush, and `sync_data()`.
     fn write_line(&mut self, line: &str) -> std::io::Result<()> {
         self.file.write_all(line.as_bytes())?;
         self.file.write_all(b"\n")?;
@@ -225,6 +251,7 @@ impl SaveLog {
     }
 }
 
+/// Generate a default save path: `on9log-{unix_epoch_seconds}.log`.
 fn default_save_path() -> PathBuf {
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -233,15 +260,23 @@ fn default_save_path() -> PathBuf {
     PathBuf::from(format!("on9log-{ts}.log"))
 }
 
+/// RAII guard that places the terminal in raw (non-canonical) input mode so
+/// that quit-key sequences (`Ctrl+] Ctrl+T`) are received immediately. The
+/// original termios settings are restored on drop.
 struct RawInputGuard {
+    /// Whether raw mode is currently active.
     active: bool,
+    /// File descriptor of stdin (used for `tcsetattr` on drop).
     #[cfg(unix)]
     fd: std::os::fd::RawFd,
+    /// Original termios settings to restore on drop.
     #[cfg(unix)]
     original: libc::termios,
 }
 
 impl RawInputGuard {
+    /// Enter raw input mode if stdin is a TTY. Returns an inactive guard
+    /// (no-op on drop) if stdin is not interactive or if mode switching fails.
     fn enter_if_interactive() -> Self {
         if !term::stdin_is_tty() {
             return Self::inactive();
@@ -255,6 +290,7 @@ impl RawInputGuard {
         }
     }
 
+    /// Create an inactive guard that performs no terminal manipulation on drop.
     fn inactive() -> Self {
         Self {
             active: false,
@@ -265,6 +301,7 @@ impl RawInputGuard {
         }
     }
 
+    /// Returns `true` if raw input mode was successfully enabled.
     fn is_active(&self) -> bool {
         self.active
     }
@@ -285,6 +322,9 @@ impl Drop for RawInputGuard {
     }
 }
 
+/// Enable Unix raw (non-canonical) terminal mode on stdin so that control
+/// characters such as `Ctrl+]` (0x1d) arrive immediately without line
+/// buffering. Returns an RAII guard that restores the original settings.
 #[cfg(unix)]
 fn enable_raw_input_mode() -> std::io::Result<RawInputGuard> {
     use std::os::fd::AsRawFd;
@@ -320,17 +360,24 @@ fn enable_raw_input_mode() -> std::io::Result<RawInputGuard> {
     Ok(RawInputGuard { active: true })
 }
 
+/// Tracks whether the user has typed the quit sequence `Ctrl+] Ctrl+T`.
+/// The sequence can span multiple `feed()` calls (partial chunks).
 struct MonitorKeyState {
+    /// Whether `Ctrl+]` (0x1d) was seen as the most recent key.
     saw_ctrl_rbracket: bool,
 }
 
 impl MonitorKeyState {
+    /// Create a new idle key state.
     fn new() -> Self {
         Self {
             saw_ctrl_rbracket: false,
         }
     }
 
+    /// Feed a chunk of stdin bytes and return `true` if the complete quit
+    /// sequence (`Ctrl+] Ctrl+T`) has been detected. The sequence can span
+    /// multiple calls; any byte that does not continue the sequence resets.
     fn feed(&mut self, bytes: &[u8]) -> bool {
         for &b in bytes {
             match (self.saw_ctrl_rbracket, b) {
@@ -343,9 +390,16 @@ impl MonitorKeyState {
     }
 }
 
+/// `Ctrl+]` byte (ASCII group separator, 0x1d). Used as the first key in the
+/// quit sequence.
 const CTRL_RBRACKET: u8 = 0x1d;
+/// `Ctrl+T` byte (ASCII end of transmission, 0x14). Used as the second key in
+/// the quit sequence.
 const CTRL_T: u8 = 0x14;
 
+/// Perform a hard reset of an ESP target by toggling the serial port's RTS
+/// line (connected to EN on ESP dev boards via an active-low transistor
+/// circuit). DTR is held high (GPIO0 released, normal boot).
 fn esp_hard_reset<P: SerialPort>(port: &mut P) -> tokio_serial::Result<()> {
     // ESP dev boards wire DTR to GPIO0 and RTS to EN through active-low
     // transistor circuits. Release GPIO0, pulse EN low, then release EN.
@@ -357,21 +411,34 @@ fn esp_hard_reset<P: SerialPort>(port: &mut P) -> tokio_serial::Result<()> {
     Ok(())
 }
 
+/// Rendering configuration passed to `handle_outcome()`.
 #[derive(Clone, Copy)]
 struct RenderOptions {
+    /// Whether to emit ANSI color codes.
     use_color: bool,
+    /// Terminal width for line wrapping (columns). 0 disables wrapping.
     width: usize,
+    /// Whether to prefix each line with a local timestamp.
     timestamp: bool,
 }
 
+/// Persistent state for the on9log decode pipeline, wrapping the protocol
+/// [`Decoder`], [`CrashDecoder`], and plain-text tracking state.
 struct DecodeState {
+    /// Decoder for on9log binary frames.
     decoder: Decoder,
+    /// State for tracking plain-text line starts (used for timestamp insertion
+    /// on stdout).
     plain_text: PlainTextState,
+    /// Crash-decoder for extracting backtrace annotations from plain text.
     crash_decoder: CrashDecoder,
+    /// Separate plain-text state for the save-file path (tracks ANSI stripping
+    /// independently).
     save_plain_text: PlainTextState,
 }
 
 impl DecodeState {
+    /// Create a new decode state with fresh decoders and reset plain-text tracking.
     fn new() -> Self {
         Self {
             decoder: Decoder::new(),
@@ -382,6 +449,9 @@ impl DecodeState {
     }
 }
 
+/// Decode a single transport [`Outcome`] and render it to stdout (and
+/// optionally to the save file). Handles both on9log frames (via the
+/// [`Decoder`]) and plain-text / diagnostic outcomes.
 fn handle_outcome(
     outcome: Outcome,
     state: &mut DecodeState,
@@ -512,12 +582,18 @@ fn handle_outcome(
     }
 }
 
+/// Tracks plain-text output position for inserting timestamps at line starts
+/// and for stripping ANSI escape sequences in the save-file path.
 struct PlainTextState {
+    /// Whether the next byte to be written is at the start of a fresh line.
     line_start: bool,
+    /// Current state of the streaming ANSI escape sequence parser.
     ansi: AnsiStripState,
 }
 
 impl PlainTextState {
+    /// Create a new state positioned at the start of a line with the ANSI
+    /// parser in the ground state.
     fn new() -> Self {
         Self {
             line_start: true,
@@ -525,19 +601,30 @@ impl PlainTextState {
         }
     }
 
+    /// Reset to line-start with ground ANSI state (called after a formatted
+    /// on9log packet is rendered).
     fn reset_line(&mut self) {
         self.line_start = true;
         self.ansi = AnsiStripState::Ground;
     }
 }
 
+/// State machine for the streaming ANSI escape sequence parser.
+///
+/// Transitions: `Ground` -> (`0x1b`) -> `Escape` -> (`[`) -> `Csi` -> (final
+/// byte 0x40-0x7e) -> `Ground`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AnsiStripState {
+    /// Normal character output; no escape sequence in progress.
     Ground,
+    /// Saw `0x1b` (ESC); waiting for the next byte to determine the sequence.
     Escape,
+    /// Saw `[` after ESC; accumulating CSI parameters until the final byte.
     Csi,
 }
 
+/// Print a dim, yellow warning/progress line to stdout (with optional
+/// timestamp and ANSI coloring).
 fn warn_line(msg: &str, use_color: bool, timestamp: bool) {
     let msg = format!("{}{}", timestamp_prefix(timestamp), msg);
     if use_color {
@@ -552,6 +639,8 @@ fn warn_line(msg: &str, use_color: bool, timestamp: bool) {
     }
 }
 
+/// Print a hex + ASCII dump of `bytes` to stdout, 16 bytes per line, with
+/// optional ANSI color and timestamp prefix.
 fn print_hexdump(bytes: &[u8], color_code: &str, use_color: bool, timestamp: bool) {
     const BYTES_PER_LINE: usize = 16;
     for (i, chunk) in bytes.chunks(BYTES_PER_LINE).enumerate() {
@@ -586,6 +675,8 @@ fn print_hexdump(bytes: &[u8], color_code: &str, use_color: bool, timestamp: boo
     }
 }
 
+/// Write a hex + ASCII dump of `bytes` to the save file, 16 bytes per line,
+/// with optional timestamp prefix.
 fn write_hexdump_to_file(save: &mut SaveLog, bytes: &[u8], timestamp: bool) -> std::io::Result<()> {
     const BYTES_PER_LINE: usize = 16;
     for (i, chunk) in bytes.chunks(BYTES_PER_LINE).enumerate() {
@@ -612,6 +703,9 @@ fn write_hexdump_to_file(save: &mut SaveLog, bytes: &[u8], timestamp: bool) -> s
     Ok(())
 }
 
+/// Write raw plain-text bytes to the output, optionally inserting a timestamp
+/// at each line start. Tracks the line-start state across calls so that
+/// chunked input (e.g. from fragmented SLIP frames) is timestamped correctly.
 fn write_plain_text<W: Write>(
     out: &mut W,
     bytes: &[u8],
@@ -631,6 +725,9 @@ fn write_plain_text<W: Write>(
     Ok(())
 }
 
+/// Write a single annotation line (e.g. a crash backtrace marker) to the
+/// output, prefixed with an optional timestamp and always terminated by a
+/// newline.
 fn write_plain_annotation<W: Write>(
     out: &mut W,
     line: &str,
@@ -641,6 +738,8 @@ fn write_plain_annotation<W: Write>(
     out.write_all(b"\n")
 }
 
+/// Write plain-text bytes to the save file, stripping ANSI escape sequences
+/// and optionally inserting timestamps at each line start.
 fn write_plain_text_saved(
     save: &mut SaveLog,
     bytes: &[u8],
@@ -663,12 +762,16 @@ fn write_plain_text_saved(
     Ok(())
 }
 
+/// Remove ANSI escape sequences from `bytes` in a single pass (test helper).
 #[cfg(test)]
 fn strip_ansi(bytes: &[u8]) -> Vec<u8> {
     let mut state = AnsiStripState::Ground;
     strip_ansi_stream(bytes, &mut state)
 }
 
+/// Streaming ANSI escape sequence remover. `state` tracks whether we are
+/// inside an escape sequence across calls so that split sequences (spanning
+/// multiple chunks) are handled correctly.
 fn strip_ansi_stream(bytes: &[u8], state: &mut AnsiStripState) -> Vec<u8> {
     let mut out = Vec::with_capacity(bytes.len());
     for &b in bytes {
@@ -697,6 +800,8 @@ fn strip_ansi_stream(bytes: &[u8], state: &mut AnsiStripState) -> Vec<u8> {
     out
 }
 
+/// Return the timestamp prefix string `[YYYYMMDD-HH:MM:SS.mmm] ` if `enabled`
+/// is true, otherwise an empty string.
 fn timestamp_prefix(enabled: bool) -> String {
     if !enabled {
         return String::new();
@@ -704,6 +809,8 @@ fn timestamp_prefix(enabled: bool) -> String {
     format!("[{}] ", local_timestamp())
 }
 
+/// Format the current local wall-clock time as `YYYYMMDD-HH:MM:SS.mmm` using
+/// `localtime_r` (Unix variant).
 #[cfg(unix)]
 fn local_timestamp() -> String {
     let mut tv = libc::timeval {
@@ -736,6 +843,8 @@ fn local_timestamp() -> String {
     )
 }
 
+/// Fallback timestamp formatter for non-Unix platforms. Returns a fixed
+/// placeholder because `gettimeofday` and `localtime_r` are not available.
 #[cfg(not(unix))]
 fn local_timestamp() -> String {
     "19700101-00:00:00.000".to_string()

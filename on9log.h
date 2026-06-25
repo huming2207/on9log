@@ -10,41 +10,132 @@
 extern "C" {
 #endif
 
+/**
+ * @brief Error codes returned by on9log API functions.
+ */
 typedef enum {
+    /** @brief Operation completed successfully. */
     ON9LOG_OK = 0,
+    /** @brief Generic or unspecified failure. */
     ON9LOG_ERR_FAIL = -1,
+    /** @brief Invalid argument provided to a function. */
     ON9LOG_ERR_INVALID_ARG = -2,
+    /** @brief Memory allocation failed. */
     ON9LOG_ERR_NO_MEM = -3,
+    /** @brief Requested resource or entry not found. */
     ON9LOG_ERR_NOT_FOUND = -4,
+    /** @brief Supplied size is outside the valid range. */
     ON9LOG_ERR_INVALID_SIZE = -5,
 } on9log_err_t;
 
+/**
+ * @brief Log severity levels.
+ *
+ * Levels are ordered from most severe (NONE) to least severe (VERBOSE).
+ * A filter at a given level passes all messages at that level and above
+ * (i.e. lower numeric values).
+ */
 typedef enum {
+    /** @brief No logging; all messages suppressed. */
     ON9_LOG_LEVEL_NONE = 0,
+    /** @brief Critical errors that require immediate attention. */
     ON9_LOG_LEVEL_ERROR = 1,
+    /** @brief Warning conditions that are not fatal. */
     ON9_LOG_LEVEL_WARN = 2,
+    /** @brief Informational messages about normal operation. */
     ON9_LOG_LEVEL_INFO = 3,
+    /** @brief Debug messages useful during development. */
     ON9_LOG_LEVEL_DEBUG = 4,
+    /** @brief Verbose diagnostic output (lowest severity). */
     ON9_LOG_LEVEL_VERBOSE = 5,
 } on9log_level_t;
 
+/**
+ * @brief Callback invoked at the start of processing one log packet.
+ *
+ * @param[in] header     Pointer to the raw on9log packet header.
+ * @param[in] header_len Byte length of the header (typically sizeof(on9log_packet_header_t)).
+ * @param[in] ctx        User-supplied context pointer from on9log_sink_t registration.
+ */
 typedef void (*on9log_sink_start_cb_t)(const uint8_t *header, size_t header_len, void *ctx);
+
+/**
+ * @brief Callback invoked for each decoded argument payload in a log packet.
+ *
+ * @param[in] payload         Pointer to the serialised argument data.
+ * @param[in] payload_len     Byte length of the argument data.
+ * @param[in] total_arg_cnt   Total number of arguments in this log packet.
+ * @param[in] curr_arg_index  Zero-based index of the current argument.
+ * @param[in] ctx             User-supplied context pointer from on9log_sink_t registration.
+ */
 typedef void (*on9log_sink_payload_cb_t)(const uint8_t *payload,
                                          size_t payload_len,
                                          size_t total_arg_cnt,
                                          size_t curr_arg_index,
                                          void *ctx);
+
+/**
+ * @brief Callback invoked after all arguments in a log packet have been dispatched.
+ *
+ * @param[in] ctx User-supplied context pointer from on9log_sink_t registration.
+ */
 typedef void (*on9log_sink_end_cb_t)(void *ctx);
 
+/**
+ * @brief Descriptor for a single log sink.
+ *
+ * A sink is a set of three callbacks that together consume one decoded on9log
+ * packet. Sinks are registered with on9log_add_sink() and removed with
+ * on9log_remove_sink().
+ */
 typedef struct {
-    on9log_sink_start_cb_t start_cb;
-    on9log_sink_payload_cb_t payload_cb;
-    on9log_sink_end_cb_t end_cb;
+    on9log_sink_start_cb_t start_cb;   /**< @brief Called once at the beginning of a packet. */
+    on9log_sink_payload_cb_t payload_cb; /**< @brief Called for each argument in the packet. */
+    on9log_sink_end_cb_t end_cb;         /**< @brief Called once after all arguments have been dispatched. */
 } on9log_sink_t;
 
+/**
+ * @brief Register a log sink to receive decoded log packets.
+ *
+ * @param[in] sink Pointer to the sink descriptor. The pointed-to data must remain
+ *                 valid for the lifetime of the sink.
+ * @param[in] ctx  Opaque user context passed to every sink callback invocation.
+ *
+ * @return ON9LOG_OK on success, or an error code if the sink registry is full.
+ */
 on9log_err_t on9log_add_sink(const on9log_sink_t *sink, void *ctx);
+
+/**
+ * @brief Remove a previously registered log sink.
+ *
+ * Both the sink descriptor pointer and the context pointer must match the
+ * values used during registration.
+ *
+ * @param[in] sink Pointer to the sink descriptor to remove.
+ * @param[in] ctx  User context that was passed at registration time.
+ *
+ * @return ON9LOG_OK on success, or ON9LOG_ERR_NOT_FOUND if the sink was not registered.
+ */
 on9log_err_t on9log_remove_sink(const on9log_sink_t *sink, void *ctx);
+
+/**
+ * @brief Enable or disable direct UART output of raw on9log packets.
+ *
+ * When enabled, every packet is also written to the platform UART transport
+ * in addition to being dispatched through registered sinks.
+ *
+ * @param[in] enabled true to enable UART output, false to disable.
+ */
 void on9log_set_uart_enabled(bool enabled);
+
+/**
+ * @brief Return the total number of packets dropped since boot.
+ *
+ * A packet is counted as dropped when the ISR ringbuffer or the output
+ * transport cannot accept it.
+ *
+ * @return Cumulative dropped-packet count.
+ */
 uint32_t on9log_get_dropped_count(void);
 
 /*
@@ -52,12 +143,65 @@ uint32_t on9log_get_dropped_count(void);
  * ceiling; runtime levels can only suppress logs that survived that ceiling.
  * Tag filters are matched by pointer first, then by string contents.
  */
+
+/**
+ * @brief Set the global runtime log level.
+ *
+ * Messages with a severity above (numeric value greater than) this level are
+ * suppressed. The compile-time ON9_LOG_LOCAL_LEVEL is the hard upper bound.
+ *
+ * @param[in] level Maximum log level to allow.
+ */
 void on9log_set_level(on9log_level_t level);
+
+/**
+ * @brief Get the current global runtime log level.
+ *
+ * @return The currently active on9log_level_t value.
+ */
 on9log_level_t on9log_get_level(void);
+
+/**
+ * @brief Override the runtime log level for a specific tag.
+ *
+ * When a tag-level override is set, messages with that tag use the override
+ * level instead of the global level, provided the override is more restrictive.
+ *
+ * @param[in] tag   The tag string to filter.
+ * @param[in] level Maximum log level allowed for this tag.
+ *
+ * @return ON9LOG_OK on success, or an error code on failure.
+ */
 on9log_err_t on9log_set_tag_level(const char *tag, on9log_level_t level);
+
+/**
+ * @brief Remove a tag-level filter previously set with on9log_set_tag_level().
+ *
+ * After removal, messages with that tag fall back to the global runtime level.
+ *
+ * @param[in] tag The tag string whose override should be cleared.
+ *
+ * @return ON9LOG_OK on success, or ON9LOG_ERR_NOT_FOUND if no override exists.
+ */
 on9log_err_t on9log_clear_tag_level(const char *tag);
 
 /* on9log_write() and ON9_LOGx() must not be called from ISR context. */
+
+/**
+ * @brief Write a formatted log message (task context only).
+ *
+ * Encodes the level, tag, format string address, argument types and variadic
+ * arguments into an on9log packet and dispatches it through registered sinks
+ * and the platform output transport.
+ *
+ * @warning Must not be called from ISR context. Use on9log_write_isr() instead.
+ *
+ * @param[in] level     Severity level for this message.
+ * @param[in] tag       Tag string (stored in .noload section when a compile-time constant).
+ * @param[in] format    printf-style format string.
+ * @param[in] arg_types Compact type-descriptor string built by ON9_LOG_ARGS_TYPE().
+ * @param[in] ...       Variadic arguments matching the format string.
+ */
 void on9log_write(on9log_level_t level,
                   const char *tag,
                   const char *format,
@@ -68,6 +212,25 @@ void on9log_write(on9log_level_t level,
  * Encodes a bounded packet and enqueues it through the platform ISR backend.
  * Dynamic string arguments are not supported on the ISR path.
  */
+
+/**
+ * @brief Write a formatted log message from ISR context.
+ *
+ * Encodes a bounded on9log packet and enqueues it through the platform ISR
+ * ringbuffer for later processing by a drain task.
+ *
+ * @note Dynamic string (char*/const char*) arguments are NOT supported on the
+ *       ISR path; only 32-bit and 64-bit scalar types are safe.
+ *
+ * @param[in] level     Severity level for this message.
+ * @param[in] tag       Tag string.
+ * @param[in] format    printf-style format string.
+ * @param[in] arg_types Compact type-descriptor string built by ON9_LOG_ARGS_TYPE().
+ * @param[in] ...       Variadic arguments matching the format string.
+ *
+ * @return true  if the packet was successfully enqueued,
+ * @return false if the ISR ringbuffer was full (packet dropped).
+ */
 bool on9log_write_isr(on9log_level_t level,
                       const char *tag,
                       const char *format,
@@ -75,27 +238,80 @@ bool on9log_write_isr(on9log_level_t level,
                       ...) __attribute__((format(printf, 3, 5)));
 
 /* on9log_write_buffer() and ON9_LOG_BUF*() must not be called from ISR context. */
+
+/**
+ * @brief Write a raw binary buffer as a log message (task context only).
+ *
+ * The buffer contents are packed into one or more ON9LOG_PKT_BUFFER packets
+ * and dispatched through registered sinks and the platform output transport.
+ *
+ * @warning Must not be called from ISR context.
+ *
+ * @param[in] level      Severity level for this message.
+ * @param[in] tag        Tag string.
+ * @param[in] buffer     Pointer to the binary data to log.
+ * @param[in] buffer_len Byte length of the buffer.
+ */
 void on9log_write_buffer(on9log_level_t level,
                          const char *tag,
                          const void *buffer,
                          size_t buffer_len);
 
-/* Dispatches one complete raw on9log packet through the normal sink path. */
+/**
+ * @brief Dispatch a complete raw on9log packet through the normal sink path.
+ *
+ * Parses the packet header and dispatches each argument payload through
+ * registered sink callbacks. Useful for forwarding or replaying packets from
+ * an external source.
+ *
+ * @param[in] packet     Pointer to the complete on9log packet (header + payload).
+ * @param[in] packet_len Total byte length of the packet.
+ *
+ * @return ON9LOG_OK on success, or an error code if the packet is malformed.
+ */
 on9log_err_t on9log_dispatch_packet(const uint8_t *packet, size_t packet_len);
 
 #ifdef __cplusplus
 }
 #endif
 
+/**
+ * @brief Stringification helper (indirection layer).
+ *
+ * @param[in] x Macro argument to stringify.
+ * @return String literal of the expanded argument.
+ */
 #define ON9_LOG_STRINGIFY2(x) #x
+
+/**
+ * @brief Stringify a macro argument after expansion.
+ *
+ * @param[in] x Macro argument to expand and stringify.
+ * @return String literal of the fully expanded argument.
+ */
 #define ON9_LOG_STRINGIFY(x) ON9_LOG_STRINGIFY2(x)
 
+/**
+ * @brief Count the number of variadic macro arguments (up to 16).
+ *
+ * @return Integer literal representing the argument count (0–16).
+ */
 #define ON9_LOG_VA_NARG(...) ON9_LOG_VA_NARG_IMPL(_, ##__VA_ARGS__, \
     16, 15, 14, 13, 12, 11, 10, 9, \
     8, 7, 6, 5, 4, 3, 2, 1, 0)
+
+/** @cond INTERNAL */
 #define ON9_LOG_VA_NARG_IMPL(_0, _1, _2, _3, _4, _5, _6, _7, _8, _9, \
                              _10, _11, _12, _13, _14, _15, _16, N, ...) N
+/** @endcond */
 
+/**
+ * @brief Macro attribute for placing a string literal in the .noload ELF section.
+ *
+ * On non-Apple platforms, strings marked with this attribute are kept in the
+ * ELF binary but never loaded into RAM. Apple platforms define this as empty
+ * because the mach-o format does not support .noload sections natively.
+ */
 #ifndef ON9_LOG_NOLOAD_ATTR
 #if defined(__APPLE__)
 #define ON9_LOG_NOLOAD_ATTR
@@ -105,19 +321,50 @@ on9log_err_t on9log_dispatch_packet(const uint8_t *packet, size_t packet_len);
 #endif
 #endif
 
+/**
+ * @brief Store a string literal in the .noload ELF section so it is
+ *        available for offline symbolisation but never loaded into RAM.
+ *
+ * The string is declared as a static const variable with a unique section
+ * name generated via __COUNTER__.
+ *
+ * @param[in] str String literal to store.
+ *
+ * @return Pointer to the .noload-resident string.
+ */
 #define ON9_LOG_NOLOAD_STR(str) \
     (__extension__({ \
         static const ON9_LOG_NOLOAD_ATTR char __on9log_str[] = (str); \
         (const char *)__on9log_str; \
     }))
 
+/**
+ * @brief Return a .noload-resident pointer for compile-time constant strings,
+ *        or pass through runtime strings unchanged.
+ *
+ * @param[in] str String that may or may not be a compile-time constant.
+ *
+ * @return Pointer to the string (possibly in the .noload section).
+ */
 #define ON9_LOG_ATTR_STR(str) (__builtin_constant_p(str) ? ON9_LOG_NOLOAD_STR(str) : (str))
 
+/**
+ * @defgroup diag_macros Compiler diagnostic pragma helpers
+ * @{
+ */
+
+/** @brief Push the current compiler diagnostic state. */
 #if defined(__GNUC__)
 #define ON9_LOG_DIAG_PUSH _Pragma("GCC diagnostic push")
+
+/** @brief Pop to the previous compiler diagnostic state. */
 #define ON9_LOG_DIAG_POP _Pragma("GCC diagnostic pop")
 
-// Avoid some weird issues on false-positive string formatting warning/errors from Clangd
+/*
+ * Avoid some weird issues on false-positive string formatting warning/errors from Clangd
+ */
+
+/** @brief Suppress GCC format-overflow, format-nonliteral, and format-security warnings. */
 #define ON9_LOG_DIAG_IGNORE_FORMAT_OVERFLOW \
     _Pragma("GCC diagnostic ignored \"-Wformat-overflow\"") \
     _Pragma("GCC diagnostic ignored \"-Wformat-nonliteral\"") \
@@ -127,19 +374,37 @@ on9log_err_t on9log_dispatch_packet(const uint8_t *packet, size_t packet_len);
 #define ON9_LOG_DIAG_POP
 #define ON9_LOG_DIAG_IGNORE_FORMAT_OVERFLOW
 #endif
+/** @} */
 
+/**
+ * @brief Enumeration of argument type tags used in the compact type-descriptor string.
+ *
+ * Each variadic argument to a log call is classified into one of these types
+ * so the decoder can correctly deserialise the packet payload.
+ */
 typedef enum {
+    /** @brief No argument (sentinel). */
     ON9_LOG_ARGS_TYPE_NONE = 0,
+    /** @brief 32-bit integer or other 4-byte scalar. */
     ON9_LOG_ARGS_TYPE_32BITS = 1,
+    /** @brief 64-bit integer, double-precision float, or other 8-byte scalar. */
     ON9_LOG_ARGS_TYPE_64BITS = 2,
+    /** @brief Pointer type (uint8_t* or const uint8_t*). */
     ON9_LOG_ARGS_TYPE_POINTER = 3,
+    /** @brief Dynamic string (char* or const char*) with inline length prefix. */
     ON9_LOG_ARGS_TYPE_DYNAMIC_STRING = 4,
 } on9log_args_type_t;
 
+/**
+ * @brief Sentinel type used to terminate a variadic argument list in
+ *        compile-time type-detection logic.
+ */
 typedef struct {
-    unsigned tmp;
+    unsigned tmp; /**< @brief Unused placeholder field. */
 } on9log_args_end_t;
 
+/** @cond INTERNAL */
+/* Argument type initialisation macros (one per supported argument count). */
 #define ON9_LOG_INIT_ARG_TYPE_N(n) ON9_LOG_INIT_ARG_TYPE_##n
 #define ON9_LOG_INIT_ARG_TYPE(n, ...) ON9_LOG_INIT_ARG_TYPE_N(n)(__VA_ARGS__)
 #define ON9_LOG_INIT_ARG_TYPE_1(a) (char)ON9_LOG_DETECT_TYPE(a)
@@ -158,8 +423,18 @@ typedef struct {
 #define ON9_LOG_INIT_ARG_TYPE_14(a, b, c, d, e, f, g, h, i, j, k, l, m, n) ON9_LOG_INIT_ARG_TYPE_13(a, b, c, d, e, f, g, h, i, j, k, l, m), ON9_LOG_INIT_ARG_TYPE_1(n)
 #define ON9_LOG_INIT_ARG_TYPE_15(a, b, c, d, e, f, g, h, i, j, k, l, m, n, o) ON9_LOG_INIT_ARG_TYPE_14(a, b, c, d, e, f, g, h, i, j, k, l, m, n), ON9_LOG_INIT_ARG_TYPE_1(o)
 #define ON9_LOG_INIT_ARG_TYPE_16(a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p) ON9_LOG_INIT_ARG_TYPE_15(a, b, c, d, e, f, g, h, i, j, k, l, m, n, o), ON9_LOG_INIT_ARG_TYPE_1(p)
+/** @endcond */
 
 #ifndef __cplusplus
+/**
+ * @brief Detect the on9log argument type of an expression at compile time (C11 _Generic).
+ *
+ * Maps common C types to their on9log_args_type_t classification.
+ *
+ * @param[in] arg Expression whose type is to be detected.
+ *
+ * @return An on9log_args_type_t value as a char.
+ */
 #define ON9_LOG_DETECT_TYPE(arg) ( \
     _Generic((arg), \
         on9log_args_end_t: ON9_LOG_ARGS_TYPE_NONE, \
@@ -174,92 +449,168 @@ typedef struct {
         default: ON9_LOG_ARGS_TYPE_32BITS))
 #else
 extern "C++" {
+/**
+ * @brief Compile-time argument type trait (C++ template, primary template).
+ *
+ * The primary template maps any unknown type to ON9_LOG_ARGS_TYPE_32BITS.
+ * Explicit specialisations below handle specific types.
+ */
 template <typename T>
 struct On9LogArgType {
     constexpr static unsigned long long log_type = ON9_LOG_ARGS_TYPE_32BITS;
     constexpr static unsigned long long constant_log_type = log_type;
 };
+
+/** @brief Specialisation for on9log_args_end_t (sentinel). */
 template <>
 struct On9LogArgType<on9log_args_end_t> {
     constexpr static unsigned long long log_type = ON9_LOG_ARGS_TYPE_NONE;
     constexpr static unsigned long long constant_log_type = log_type;
 };
+
+/** @brief Specialisation for char* (dynamic string). */
 template <>
 struct On9LogArgType<char *> {
     constexpr static unsigned long long log_type = ON9_LOG_ARGS_TYPE_DYNAMIC_STRING;
     constexpr static unsigned long long constant_log_type = log_type;
 };
+
+/** @brief Specialisation for const char* (dynamic string). */
 template <>
 struct On9LogArgType<const char *> {
     constexpr static unsigned long long log_type = ON9_LOG_ARGS_TYPE_DYNAMIC_STRING;
     constexpr static unsigned long long constant_log_type = log_type;
 };
+
+/** @brief Specialisation for uint8_t* (pointer). */
 template <>
 struct On9LogArgType<uint8_t *> {
     constexpr static unsigned long long log_type = ON9_LOG_ARGS_TYPE_POINTER;
     constexpr static unsigned long long constant_log_type = log_type;
 };
+
+/** @brief Specialisation for const uint8_t* (pointer). */
 template <>
 struct On9LogArgType<const uint8_t *> {
     constexpr static unsigned long long log_type = ON9_LOG_ARGS_TYPE_POINTER;
     constexpr static unsigned long long constant_log_type = log_type;
 };
+
+/** @brief Specialisation for char[N] arrays (dynamic string). */
 template <size_t N>
 struct On9LogArgType<char[N]> {
     constexpr static unsigned long long log_type = ON9_LOG_ARGS_TYPE_DYNAMIC_STRING;
     constexpr static unsigned long long constant_log_type = log_type;
 };
+
+/** @brief Specialisation for const char[N] arrays (dynamic string). */
 template <size_t N>
 struct On9LogArgType<const char[N]> {
     constexpr static unsigned long long log_type = ON9_LOG_ARGS_TYPE_DYNAMIC_STRING;
     constexpr static unsigned long long constant_log_type = log_type;
 };
+
+/** @brief Specialisation for uint8_t[N] arrays (pointer). */
 template <size_t N>
 struct On9LogArgType<uint8_t[N]> {
     constexpr static unsigned long long log_type = ON9_LOG_ARGS_TYPE_POINTER;
     constexpr static unsigned long long constant_log_type = log_type;
 };
+
+/** @brief Specialisation for const uint8_t[N] arrays (pointer). */
 template <size_t N>
 struct On9LogArgType<const uint8_t[N]> {
     constexpr static unsigned long long log_type = ON9_LOG_ARGS_TYPE_POINTER;
     constexpr static unsigned long long constant_log_type = log_type;
 };
+
+/** @brief Specialisation for long long int (64-bit). */
 template <>
 struct On9LogArgType<long long int> {
     constexpr static unsigned long long log_type = ON9_LOG_ARGS_TYPE_64BITS;
     constexpr static unsigned long long constant_log_type = log_type;
 };
+
+/** @brief Specialisation for long long unsigned int (64-bit). */
 template <>
 struct On9LogArgType<long long unsigned int> {
     constexpr static unsigned long long log_type = ON9_LOG_ARGS_TYPE_64BITS;
     constexpr static unsigned long long constant_log_type = log_type;
 };
+
+/** @brief Specialisation for double (64-bit floating point). */
 template <>
 struct On9LogArgType<double> {
     constexpr static unsigned long long log_type = ON9_LOG_ARGS_TYPE_64BITS;
     constexpr static unsigned long long constant_log_type = log_type;
 };
+
+/** @brief Specialisation for float (64-bit — promoted to double in variadic args). */
 template <>
 struct On9LogArgType<float> {
     constexpr static unsigned long long log_type = ON9_LOG_ARGS_TYPE_64BITS;
     constexpr static unsigned long long constant_log_type = log_type;
 };
+
+/**
+ * @brief C++ implementation of compile-time argument type detection.
+ *
+ * @tparam T         The deduced argument type.
+ * @param[in] is_constant Whether the argument is a compile-time constant.
+ *
+ * @return The on9log_args_type_t classification as unsigned long long.
+ */
 template <typename T>
 constexpr unsigned long long ON9_LOG_DETECT_TYPE_IMPL(const T &, bool is_constant)
 {
     return is_constant ? On9LogArgType<T>::constant_log_type : On9LogArgType<T>::log_type;
 }
 }
+
+/**
+ * @brief Detect the on9log argument type of an expression at compile time (C++).
+ *
+ * Delegates to the ON9_LOG_DETECT_TYPE_IMPL template function.
+ */
 #define ON9_LOG_DETECT_TYPE(arg) ON9_LOG_DETECT_TYPE_IMPL((arg), __builtin_constant_p(arg))
 #endif
 
+/**
+ * @brief Build a compact NUL-terminated type-descriptor string for the given variadic arguments.
+ *
+ * Each argument is classified via ON9_LOG_DETECT_TYPE and the resulting byte
+ * values are stored in a static char array.
+ *
+ * @param[in] ... Variadic arguments whose types should be recorded.
+ *
+ * @return Pointer to the NUL-terminated type-descriptor string.
+ */
 #define ON9_LOG_ARGS_TYPE(...) (__extension__({ \
     static const char __on9log_arg_types[] = { __VA_OPT__(ON9_LOG_INIT_ARG_TYPE(ON9_LOG_VA_NARG(__VA_ARGS__), __VA_ARGS__), ) 0 }; \
     (const char *)&__on9log_arg_types; \
 }))
 
+/**
+ * @brief Check whether the given log level is enabled at compile time.
+ *
+ * @param[in] level Log level to test.
+ *
+ * @return true if the level is non-NONE and <= ON9_LOG_LOCAL_LEVEL,
+ * @return false otherwise.
+ */
 #define ON9_LOG_ENABLED(level) ((level) != ON9_LOG_LEVEL_NONE && (level) <= ON9_LOG_LOCAL_LEVEL)
 
+/**
+ * @brief Core logging macro.
+ *
+ * Checks ON9_LOG_ENABLED(), suppresses compiler format warnings, and calls
+ * on9log_write() with the format string stored in the .noload section.
+ *
+ * @param[in] level   Severity level.
+ * @param[in] tag     Tag string.
+ * @param[in] format  printf-style format string.
+ * @param[in] ...     Variadic arguments.
+ */
 #define ON9_LOG_LEVEL(level, tag, format, ...) do { \
         if (ON9_LOG_ENABLED(level)) { \
             ON9_LOG_DIAG_PUSH; \
@@ -269,12 +620,63 @@ constexpr unsigned long long ON9_LOG_DETECT_TYPE_IMPL(const T &, bool is_constan
         } \
     } while (0)
 
+/**
+ * @brief Log an ERROR-level message (task context).
+ *
+ * @param[in] tag     Tag string.
+ * @param[in] format  printf-style format string.
+ * @param[in] ...     Variadic arguments.
+ */
 #define ON9_LOGE(tag, format, ...) ON9_LOG_LEVEL(ON9_LOG_LEVEL_ERROR, tag, format, ##__VA_ARGS__)
+
+/**
+ * @brief Log a WARN-level message (task context).
+ *
+ * @param[in] tag     Tag string.
+ * @param[in] format  printf-style format string.
+ * @param[in] ...     Variadic arguments.
+ */
 #define ON9_LOGW(tag, format, ...) ON9_LOG_LEVEL(ON9_LOG_LEVEL_WARN, tag, format, ##__VA_ARGS__)
+
+/**
+ * @brief Log an INFO-level message (task context).
+ *
+ * @param[in] tag     Tag string.
+ * @param[in] format  printf-style format string.
+ * @param[in] ...     Variadic arguments.
+ */
 #define ON9_LOGI(tag, format, ...) ON9_LOG_LEVEL(ON9_LOG_LEVEL_INFO, tag, format, ##__VA_ARGS__)
+
+/**
+ * @brief Log a DEBUG-level message (task context).
+ *
+ * @param[in] tag     Tag string.
+ * @param[in] format  printf-style format string.
+ * @param[in] ...     Variadic arguments.
+ */
 #define ON9_LOGD(tag, format, ...) ON9_LOG_LEVEL(ON9_LOG_LEVEL_DEBUG, tag, format, ##__VA_ARGS__)
+
+/**
+ * @brief Log a VERBOSE-level message (task context).
+ *
+ * @param[in] tag     Tag string.
+ * @param[in] format  printf-style format string.
+ * @param[in] ...     Variadic arguments.
+ */
 #define ON9_LOGV(tag, format, ...) ON9_LOG_LEVEL(ON9_LOG_LEVEL_VERBOSE, tag, format, ##__VA_ARGS__)
 
+/**
+ * @brief ISR-safe core logging macro.
+ *
+ * Builds the argument-types array on the stack (not in .noload) and calls
+ * on9log_write_isr(). Dynamic string arguments are not supported on the
+ * ISR path.
+ *
+ * @param[in] level   Severity level.
+ * @param[in] tag     Tag string.
+ * @param[in] format  printf-style format string.
+ * @param[in] ...     Variadic arguments.
+ */
 #define ON9_ISR_LOG_LEVEL(level, tag, format, ...) do { \
         if (ON9_LOG_ENABLED(level)) { \
             ON9_LOG_DIAG_PUSH; \
@@ -285,20 +687,108 @@ constexpr unsigned long long ON9_LOG_DETECT_TYPE_IMPL(const T &, bool is_constan
         } \
     } while (0)
 
+/**
+ * @brief Log an ERROR-level message from ISR context.
+ *
+ * @param[in] tag     Tag string.
+ * @param[in] format  printf-style format string.
+ * @param[in] ...     Variadic arguments.
+ */
 #define ON9_ISR_LOGE(tag, format, ...) ON9_ISR_LOG_LEVEL(ON9_LOG_LEVEL_ERROR, tag, format, ##__VA_ARGS__)
+
+/**
+ * @brief Log a WARN-level message from ISR context.
+ *
+ * @param[in] tag     Tag string.
+ * @param[in] format  printf-style format string.
+ * @param[in] ...     Variadic arguments.
+ */
 #define ON9_ISR_LOGW(tag, format, ...) ON9_ISR_LOG_LEVEL(ON9_LOG_LEVEL_WARN, tag, format, ##__VA_ARGS__)
+
+/**
+ * @brief Log an INFO-level message from ISR context.
+ *
+ * @param[in] tag     Tag string.
+ * @param[in] format  printf-style format string.
+ * @param[in] ...     Variadic arguments.
+ */
 #define ON9_ISR_LOGI(tag, format, ...) ON9_ISR_LOG_LEVEL(ON9_LOG_LEVEL_INFO, tag, format, ##__VA_ARGS__)
+
+/**
+ * @brief Log a DEBUG-level message from ISR context.
+ *
+ * @param[in] tag     Tag string.
+ * @param[in] format  printf-style format string.
+ * @param[in] ...     Variadic arguments.
+ */
 #define ON9_ISR_LOGD(tag, format, ...) ON9_ISR_LOG_LEVEL(ON9_LOG_LEVEL_DEBUG, tag, format, ##__VA_ARGS__)
+
+/**
+ * @brief Log a VERBOSE-level message from ISR context.
+ *
+ * @param[in] tag     Tag string.
+ * @param[in] format  printf-style format string.
+ * @param[in] ...     Variadic arguments.
+ */
 #define ON9_ISR_LOGV(tag, format, ...) ON9_ISR_LOG_LEVEL(ON9_LOG_LEVEL_VERBOSE, tag, format, ##__VA_ARGS__)
 
+/**
+ * @brief Core buffer-logging macro (task context).
+ *
+ * Calls on9log_write_buffer() to log a raw binary buffer.
+ *
+ * @param[in] level      Severity level.
+ * @param[in] tag        Tag string.
+ * @param[in] buffer     Pointer to the binary data.
+ * @param[in] buffer_len Byte length of the buffer.
+ */
 #define ON9_LOG_BUF_LEVEL(level, tag, buffer, buffer_len) do { \
         if (ON9_LOG_ENABLED(level)) { \
             on9log_write_buffer((level), (tag), (buffer), (buffer_len)); \
         } \
     } while (0)
 
+/**
+ * @brief Log a raw ERROR-level binary buffer (task context).
+ *
+ * @param[in] tag        Tag string.
+ * @param[in] buffer     Pointer to the binary data.
+ * @param[in] buffer_len Byte length of the buffer.
+ */
 #define ON9_LOG_BUFE(tag, buffer, buffer_len) ON9_LOG_BUF_LEVEL(ON9_LOG_LEVEL_ERROR, tag, buffer, buffer_len)
+
+/**
+ * @brief Log a raw WARN-level binary buffer (task context).
+ *
+ * @param[in] tag        Tag string.
+ * @param[in] buffer     Pointer to the binary data.
+ * @param[in] buffer_len Byte length of the buffer.
+ */
 #define ON9_LOG_BUFW(tag, buffer, buffer_len) ON9_LOG_BUF_LEVEL(ON9_LOG_LEVEL_WARN, tag, buffer, buffer_len)
+
+/**
+ * @brief Log a raw INFO-level binary buffer (task context).
+ *
+ * @param[in] tag        Tag string.
+ * @param[in] buffer     Pointer to the binary data.
+ * @param[in] buffer_len Byte length of the buffer.
+ */
 #define ON9_LOG_BUFI(tag, buffer, buffer_len) ON9_LOG_BUF_LEVEL(ON9_LOG_LEVEL_INFO, tag, buffer, buffer_len)
+
+/**
+ * @brief Log a raw DEBUG-level binary buffer (task context).
+ *
+ * @param[in] tag        Tag string.
+ * @param[in] buffer     Pointer to the binary data.
+ * @param[in] buffer_len Byte length of the buffer.
+ */
 #define ON9_LOG_BUFD(tag, buffer, buffer_len) ON9_LOG_BUF_LEVEL(ON9_LOG_LEVEL_DEBUG, tag, buffer, buffer_len)
+
+/**
+ * @brief Log a raw VERBOSE-level binary buffer (task context).
+ *
+ * @param[in] tag        Tag string.
+ * @param[in] buffer     Pointer to the binary data.
+ * @param[in] buffer_len Byte length of the buffer.
+ */
 #define ON9_LOG_BUFV(tag, buffer, buffer_len) ON9_LOG_BUF_LEVEL(ON9_LOG_LEVEL_VERBOSE, tag, buffer, buffer_len)

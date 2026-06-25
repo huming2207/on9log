@@ -15,12 +15,19 @@ pub fn stdout_is_tty() -> bool {
 
 /// ANSI SGR color codes used for log levels.
 pub mod color {
+    /// Reset all ANSI attributes to default.
     pub const RESET: &str = "\x1b[0m";
+    /// Red foreground (typically used for `Level::Error`).
     pub const RED: &str = "\x1b[31m";
+    /// Yellow foreground (typically used for `Level::Warn`).
     pub const YELLOW: &str = "\x1b[33m";
+    /// Green foreground (typically used for `Level::Info`).
     pub const GREEN: &str = "\x1b[32m";
+    /// White / default foreground (used for `Level::Debug`/`Level::Verbose`).
     pub const WHITE: &str = "\x1b[37m";
+    /// Bold / increased intensity.
     pub const BOLD: &str = "\x1b[1m";
+    /// Dim / reduced intensity (used for warning prose).
     pub const DIM: &str = "\x1b[2m";
 }
 
@@ -65,6 +72,9 @@ pub fn wrap(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
+/// Hard-break a word that is wider than `width` by pushing one character at a
+/// time onto the current line, wrapping to a new line whenever the width is
+/// exhausted.
 fn push_hard(
     lines: &mut Vec<String>,
     line: &mut String,
@@ -185,6 +195,9 @@ pub fn local_ts_string(unix_ms: u64) -> String {
     format_ts(secs, millis)
 }
 
+/// Format a Unix timestamp (seconds + milliseconds) as
+/// `YYYYMMDD-HH:MM:SS.mmm` using `localtime_r` (Unix variant). Falls back to
+/// `@<secs>s` if `localtime_r` fails.
 #[cfg(unix)]
 fn format_ts(secs: i64, millis: i64) -> String {
     let mut tm = std::mem::MaybeUninit::<libc::tm>::uninit();
@@ -207,6 +220,8 @@ fn format_ts(secs: i64, millis: i64) -> String {
     )
 }
 
+/// Format a Unix timestamp as `YYYYMMDD-HH:MM:SS.mmmZ` (UTC-only fallback
+/// for non-Unix platforms where `localtime_r` is unavailable).
 #[cfg(not(unix))]
 fn format_ts(secs: i64, millis: i64) -> String {
     let days = secs.div_euclid(86_400);
@@ -221,7 +236,9 @@ fn format_ts(secs: i64, millis: i64) -> String {
     )
 }
 
-/// Howard Hinnant's days-from-epoch -> civil date algorithm (UTC fallback).
+/// Convert a days-from-Unix-epoch value into a `(year, month, day)` civil date
+/// using Howard Hinnant's algorithm (UTC-only fallback, no `localtime_r`
+/// required). Returns a proleptic Gregorian date.
 #[cfg(not(unix))]
 fn civil_from_days(z: i64) -> (i64, i64, i64) {
     let z = z + 719468;

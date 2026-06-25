@@ -3,6 +3,7 @@
 //! Initial value `0xffff`, polynomial `0x1021`, no reflection, no final xor.
 //! The firmware appends the little-endian result before SLIP-escaping it.
 
+/// Pre-computed CRC-16-CCITT (CCITT-FALSE) table using the IBM-3740 polynomial.
 const CRC16_CCITT_FALSE: crc::Crc<u16> = crc::Crc::<u16>::new(&crc::CRC_16_IBM_3740);
 
 /// Compute CRC-16-CCITT over `header` followed by `payload`.

@@ -61,28 +61,37 @@
 
 use crate::printf::Arg;
 
-/// A parsed piece of a format string.
+/// A parsed piece of a format string: either literal text or a replacement field.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Piece {
+    /// A literal text segment (no special handling).
     Literal(String),
+    /// A parsed `{...}` replacement field.
     Field(Field),
 }
 
+/// A parsed C++23 replacement field with optional arg-id and spec.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Field {
     /// `None` means automatic arg-id (`{}`).
     arg_id: Option<usize>,
+    /// The parsed format specification (the part after `:`).
     spec: Spec,
 }
 
+/// Fill-and-align direction for a C++23 format spec.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Align {
+    /// Left-align (`<`).
     Left,
+    /// Right-align (`>`).
     Right,
+    /// Center-align (`^`).
     Center,
 }
 
 impl Align {
+    /// Convert a character to an [`Align`]. Returns an error for non-align chars.
     fn from_char(c: char) -> Result<Self, String> {
         match c {
             '<' => Ok(Self::Left),
@@ -97,23 +106,35 @@ impl Align {
 /// explicit ref. `None` means the component was absent.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 enum Count {
+    /// The width/precision was not specified.
     #[default]
     None,
+    /// A literal decimal value (e.g. `{:.5}`).
     Literal(usize),
+    /// A nested auto-indexed replacement field (e.g. `{:{}}`).
     Auto,
+    /// A nested explicit-indexed replacement field (e.g. `{0:{1}}`).
     Explicit(usize),
 }
 
 /// Parsed C++23 format spec (the text between `:` and `}`).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct Spec {
+    /// Optional fill character (default is space).
     fill: Option<char>,
+    /// Alignment direction (`<`, `>`, or `^`).
     align: Option<Align>,
+    /// Sign mode (`+`, `-`, or ` `).
     sign: Option<char>,
+    /// Whether the `#` (alternate form) flag is present.
     alt: bool,
+    /// Whether the `0` (zero-pad) flag is present.
     zero: bool,
+    /// Width specification (literal, auto, or explicit index).
     width: Count,
+    /// Precision specification (literal, auto, or explicit index).
     precision: Count,
+    /// The type character (`d`, `x`, `f`, `s`, etc.), or `None` for default.
     type_char: Option<char>,
 }
 
@@ -277,6 +298,10 @@ fn fetch_count(args: &[Arg], idx: usize) -> Result<usize, String> {
     Ok(signed as usize)
 }
 
+/// Parse a C++23-style format string into a sequence of [`Piece`] values.
+///
+/// Handles `{{` / `}}` escapes, `{arg_id:spec}` replacement fields, and
+/// nested brace-depth tracking for dynamic width/precision refs.
 fn parse(fmt: &str) -> Result<Vec<Piece>, String> {
     let mut pieces = Vec::new();
     let mut lit = String::new();
@@ -311,6 +336,10 @@ fn parse(fmt: &str) -> Result<Vec<Piece>, String> {
     Ok(pieces)
 }
 
+/// Parse one replacement field body (between `{` and `}`).
+///
+/// Reads an optional arg-id (decimal digits), then either a `:` followed by a
+/// spec string (with brace-depth tracking for nested refs) or a closing `}`.
 fn parse_field<I: Iterator<Item = char>>(
     chars: &mut std::iter::Peekable<I>,
 ) -> Result<Field, String> {
@@ -365,6 +394,11 @@ fn parse_field<I: Iterator<Item = char>>(
     Ok(Field { arg_id, spec })
 }
 
+/// Parse a C++23 format specification string (the part between `:` and `}`)
+/// into a [`Spec`] struct.
+///
+/// Handles fill-and-align, sign, `#` flag, `0` flag, width, precision, and
+/// the type character. Returns an error for unsupported or malformed specs.
 fn parse_spec(s: &str) -> Result<Spec, String> {
     let chars: Vec<char> = s.chars().collect();
     let mut i = 0usize;
@@ -426,7 +460,7 @@ fn parse_spec(s: &str) -> Result<Spec, String> {
 }
 
 /// Parse a width/precision component: either `{` [digits] `}` (dynamic ref) or
-/// a run of decimal digits (literal). Returns `Count::None` if neither is
+/// a run of decimal digits (literal). Returns [`Count::None`] if neither is
 /// present at the current position.
 fn parse_count(chars: &[char], i: &mut usize) -> Result<Count, String> {
     if *i < chars.len() && chars[*i] == '{' {
@@ -466,6 +500,7 @@ fn parse_count(chars: &[char], i: &mut usize) -> Result<Count, String> {
     }
 }
 
+/// Check if a character is a C++23 alignment direction (`<`, `>`, or `^`).
 fn is_align(c: char) -> bool {
     matches!(c, '<' | '>' | '^')
 }
@@ -481,6 +516,7 @@ fn is_supported_type(c: char) -> bool {
 
 /// The rendered core of one argument, before width/fill/align padding.
 struct Core {
+    /// Whether the value is numeric (enables right-alignment by default and `0` padding).
     is_numeric: bool,
     /// True for integer/pointer renders (enables integer precision semantics
     /// and suppresses the `0` flag when precision is set).
@@ -494,11 +530,14 @@ struct Core {
 }
 
 impl Core {
+    /// Concatenate `sign`, `prefix`, and `main` into the final rendered string.
     fn assemble(&self) -> String {
         format!("{}{}{}", self.sign, self.prefix, self.main)
     }
 }
 
+/// Render one wire argument according to its parsed format [`Spec`], applying
+/// width, precision, zero-padding (`0` flag), fill, and alignment.
 fn render_field(
     arg: &Arg,
     spec: &Spec,
@@ -515,6 +554,8 @@ fn render_field(
     Ok(apply_padding(core, spec, width, zero_pad))
 }
 
+/// Render the core value (before padding) by dispatching to the appropriate
+/// type-specific renderer based on the spec type character and wire argument.
 fn render_core(arg: &Arg, spec: &Spec, precision: Option<usize>) -> Result<Core, String> {
     let tc = spec.type_char;
     match arg {
@@ -535,6 +576,8 @@ fn render_core(arg: &Arg, spec: &Spec, precision: Option<usize>) -> Result<Core,
     }
 }
 
+/// Render a string argument, applying optional truncation precision.
+/// Accepts `s` or no type character; returns an error for numeric/float types.
 fn render_str(
     opt: &Option<Vec<u8>>,
     tc: Option<char>,
@@ -560,6 +603,11 @@ fn render_str(
     })
 }
 
+/// Render an integer argument according to the type character and format spec.
+///
+/// Handles decimal (`d` or default), hex (`x`/`X`), octal (`o`), binary (`b`/`B`),
+/// pointer (`p`), char (`c`), and sign/alternate-form/prefix rendering.
+/// Returns an error for string or float type characters on integer arguments.
 fn render_int(
     v: u64,
     tc: Option<char>,
@@ -618,6 +666,8 @@ fn render_int(
     })
 }
 
+/// Apply integer precision (minimum number of digits, zero-padded on the left).
+/// C++23: precision 0 with value 0 yields an empty string.
 fn apply_int_precision(digits: &str, v: u64, precision: Option<usize>) -> String {
     match precision {
         Some(p) => {
@@ -636,6 +686,11 @@ fn apply_int_precision(digits: &str, v: u64, precision: Option<usize>) -> String
     }
 }
 
+/// Render an `f64` argument using C++23 float type characters (`f`/`F`/`e`/`E`/`g`/`G`).
+///
+/// `std::fmt` does the digit conversion; `inf`/`nan` casing is normalised
+/// to match C++ conventions (lowercase for lower-case types, uppercase for
+/// upper-case types).
 fn render_float(
     x: f64,
     tc: Option<char>,
@@ -682,6 +737,11 @@ fn render_float(
 }
 
 /// Apply width / fill / align / `0` zero-pad around a rendered core value.
+///
+/// When `zero_pad` is true, zeros are inserted between the sign/prefix and the
+/// main digits. Otherwise, fill characters (defaulting to space) pad according
+/// to the alignment direction (left, right, or center). Default alignment for
+/// numeric types is right, for non-numeric types is left.
 fn apply_padding(core: Core, spec: &Spec, width: Option<usize>, zero_pad: bool) -> String {
     let content = core.assemble();
     let width = width.unwrap_or(0);
@@ -747,6 +807,9 @@ fn apply_padding(core: Core, spec: &Spec, width: Option<usize>, zero_pad: bool) 
 }
 
 /// Truncate `s` to at most `max` Unicode scalar values (not bytes).
+///
+/// Used to implement string precision: `{:.5s}` limits the output to 5
+/// Unicode code points.
 fn truncate_chars(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();

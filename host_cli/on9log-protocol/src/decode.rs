@@ -43,10 +43,14 @@ pub struct DroppedRecord {
     pub count: u32,
 }
 
+/// A fully decoded packet, dispatched by type from a raw frame.
 #[derive(Debug, Clone)]
 pub enum DecodedPacket {
+    /// A decoded log message with tag and rendered message.
     Log(LogRecord),
+    /// A decoded buffer-dump chunk.
     Buffer(BufferRecord),
+    /// A device-side dropped-packet notification.
     Dropped(DroppedRecord),
     /// Time-sync / boot packets are not currently emitted by the firmware; their
     /// raw payload is surfaced for forward compatibility.
@@ -63,7 +67,12 @@ pub enum DecodedPacket {
 }
 
 /// Stateful decoder tracking the sequence counter for gap detection.
+///
+/// The [`Decoder`] wraps a sequence tracker used to compute the number of
+/// packets missed between consecutive frames. It also contains the packet-type
+/// dispatch logic that decodes log, buffer, and dropped frames.
 pub struct Decoder {
+    /// The sequence number of the last decoded frame, used for gap detection.
     last_seq: Option<u16>,
 }
 
@@ -74,6 +83,7 @@ impl Default for Decoder {
 }
 
 impl Decoder {
+    /// Create a new `Decoder` with no prior sequence state.
     pub fn new() -> Self {
         Self { last_seq: None }
     }
@@ -83,6 +93,9 @@ impl Decoder {
         self.last_seq = None;
     }
 
+    /// Record a sequence number and return the gap from the last recorded
+    /// sequence (wrapping arithmetic). Returns `None` for the first packet
+    /// or when no gap is detected.
     fn record_seq(&mut self, seq: u16) -> Option<u32> {
         let gap = match self.last_seq {
             None => None,
@@ -127,6 +140,8 @@ impl Decoder {
         }
     }
 
+    /// Decode a log-type packet: extract arg-type table, decode each argument,
+    /// resolve the tag and format string from ELF, and render the message.
     fn decode_log(
         &self,
         frame: &RawFrame,
@@ -194,6 +209,7 @@ impl Decoder {
         })
     }
 
+    /// Decode a buffer-dump packet: extract total_len, offset, chunk_len, and bytes.
     fn decode_buffer(
         &self,
         frame: &RawFrame,
@@ -227,6 +243,7 @@ impl Decoder {
         })
     }
 
+    /// Decode a dropped-packet notification: extract the dropped count (u32 LE).
     fn decode_dropped(&self, frame: &RawFrame, meta: PacketMeta) -> DecodedPacket {
         let p = &frame.payload;
         if p.len() < 4 {
@@ -246,6 +263,10 @@ impl Decoder {
     }
 }
 
+/// Decode a single argument from the wire payload according to its [`ArgType`].
+///
+/// Advances the `body` slice past the consumed bytes. Returns an error if
+/// the payload is truncated for the expected argument size.
 fn decode_arg(t: ArgType, body: &mut &[u8]) -> Result<Arg, String> {
     match t {
         ArgType::Bits32 => {
@@ -277,6 +298,7 @@ fn decode_arg(t: ArgType, body: &mut &[u8]) -> Result<Arg, String> {
     }
 }
 
+/// Read a little-endian `u32` from the front of the byte slice, advancing it.
 fn take_u32(b: &mut &[u8]) -> Result<u32, String> {
     if b.len() < 4 {
         return Err("truncated u32".into());
@@ -286,6 +308,7 @@ fn take_u32(b: &mut &[u8]) -> Result<u32, String> {
     Ok(v)
 }
 
+/// Read a little-endian `u64` from the front of the byte slice, advancing it.
 fn take_u64(b: &mut &[u8]) -> Result<u64, String> {
     if b.len() < 8 {
         return Err("truncated u64".into());
@@ -295,6 +318,8 @@ fn take_u64(b: &mut &[u8]) -> Result<u64, String> {
     Ok(v)
 }
 
+/// Resolve a tag address to a human-readable string via ELF, falling back
+/// to a hex address when the ELF is unavailable or the address is unknown.
 fn resolve_tag(elf: Option<&ElfStrings>, addr: u32) -> String {
     match elf {
         Some(e) => match e.read_tag(addr) {
@@ -305,6 +330,8 @@ fn resolve_tag(elf: Option<&ElfStrings>, addr: u32) -> String {
     }
 }
 
+/// Build a compact, human-readable summary of decoded arguments (used when
+/// the format string itself is unavailable).
 fn summarize_args(args: &[Arg]) -> String {
     let parts: Vec<String> = args
         .iter()

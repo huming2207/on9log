@@ -3,39 +3,60 @@
 //! Mirrors `on9log_fmt.h` and the `ON9_LOG_ARGS_TYPE_*` values from `on9log.h`.
 //! All multi-byte fields are little-endian.
 
+/// Magic byte that begins every on9log packet header.
 pub const PACKET_MAGIC: u8 = 0x9a;
+/// Special payload-length value indicating a streaming (indeterminate-length) packet.
 pub const PAYLOAD_LEN_STREAMING: u16 = 0xffff;
+/// Size of a parsed on9log packet header in bytes.
 pub const HEADER_LEN: usize = 18;
+/// Sentinel length value representing a null dynamic string.
 pub const NULL_STRING_LEN: u32 = 0xffff_ffff;
+/// Maximum payload size allowed in a single transport frame (3 KiB).
 pub const TRANSPORT_MAX_PAYLOAD: usize = 3 * 1024;
+/// Transport frame type byte for on9log binary packets.
 pub const TRANSPORT_FRAME_ON9LOG: u8 = 0x01;
+/// Transport frame type byte for plain text (stdout/stderr) packets.
 pub const TRANSPORT_FRAME_TEXT: u8 = 0x02;
 
 /// CRC-16-CCITT (CCITT-FALSE) initial value, matching `esp_stdio_log_vfs.c`.
 pub const CRC16_CCITT_INIT: u16 = 0xffff;
 
 /// Transport framing bytes from `esp_stdio_log_vfs.c`.
+/// SLIP frame-start marker byte.
 pub const SLIP_START: u8 = 0xa5;
+/// SLIP frame-end marker byte.
 pub const SLIP_END: u8 = 0xc0;
+/// SLIP escape byte — the byte that follows is the escaped form.
 pub const SLIP_ESC: u8 = 0xdb;
+/// Escaped form of [`SLIP_END`] (`0xc0`).
 pub const SLIP_ESC_END: u8 = 0xdc;
+/// Escaped form of [`SLIP_ESC`] (`0xdb`).
 pub const SLIP_ESC_ESC: u8 = 0xdd;
+/// Escaped form of [`SLIP_START`] (`0xa5`).
 pub const SLIP_ESC_START: u8 = 0xde;
+/// Escaped form of `\r` (`0x0d`).
 pub const SLIP_ESC_CR: u8 = 0xd0;
+/// Escaped form of `\n` (`0x0a`).
 pub const SLIP_ESC_LF: u8 = 0xd1;
 
 /// Packet type, stored in the high nibble of `type_level`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum PacketType {
+    /// Normal log message with a format string and typed arguments.
     Log = 0,
+    /// Notification that the device dropped one or more log packets.
     Dropped = 1,
+    /// Time-synchronisation packet (reserved, not currently emitted).
     TimeSync = 2,
+    /// Boot event packet (reserved, not currently emitted).
     Boot = 3,
+    /// Buffer-dump packet carrying a chunk of a memory/binary buffer.
     Buffer = 4,
 }
 
 impl PacketType {
+    /// Convert a raw byte to a [`PacketType`], returning `None` for unknown values.
     pub fn from_byte(b: u8) -> Option<Self> {
         match b {
             0 => Some(Self::Log),
@@ -52,15 +73,22 @@ impl PacketType {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Level {
+    /// No level (used for non-log packets such as dropped notifications).
     None = 0,
+    /// Error-level log message.
     Error = 1,
+    /// Warning-level log message.
     Warn = 2,
+    /// Info-level log message.
     Info = 3,
+    /// Debug-level log message.
     Debug = 4,
+    /// Verbose-level log message.
     Verbose = 5,
 }
 
 impl Level {
+    /// Convert a raw byte to a [`Level`], returning `None` for unknown values.
     pub fn from_byte(b: u8) -> Option<Self> {
         match b {
             0 => Some(Self::None),
@@ -90,14 +118,20 @@ impl Level {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ArgType {
+    /// No argument (placeholder, treated as zero).
     None = 0,
+    /// 32-bit unsigned integer argument.
     Bits32 = 1,
+    /// 64-bit unsigned integer argument (also used for `f64` bit patterns).
     Bits64 = 2,
+    /// Pointer-width (32-bit on ESP32) argument.
     Pointer = 3,
+    /// Dynamic string argument preceded by a 32-bit length.
     DynamicString = 4,
 }
 
 impl ArgType {
+    /// Convert a raw byte to an [`ArgType`], returning `None` for unknown values.
     pub fn from_byte(b: u8) -> Option<Self> {
         match b {
             0 => Some(Self::None),
@@ -113,13 +147,21 @@ impl ArgType {
 /// Parsed 18-byte packet header.
 #[derive(Debug, Clone, Copy)]
 pub struct Header {
+    /// Packet magic byte ([`PACKET_MAGIC`]).
     pub magic: u8,
+    /// Packet type (log, dropped, buffer, etc.).
     pub ptype: PacketType,
+    /// Log severity level.
     pub level: Level,
+    /// Monotonic sequence number (wrapping, used for gap detection).
     pub seq: u16,
+    /// Timestamp in milliseconds since device boot.
     pub time_ms: u32,
+    /// Address of the tag string in ELF memory.
     pub tag_id: u32,
+    /// Address of the format string in ELF memory.
     pub fmt_id: u32,
+    /// Length of the payload following the header (or [`PAYLOAD_LEN_STREAMING`]).
     pub payload_len: u16,
 }
 

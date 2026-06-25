@@ -34,12 +34,19 @@ pub fn stdin_is_tty() -> bool {
 
 /// ANSI SGR color codes used for log levels.
 pub mod color {
+    /// Reset all ANSI attributes to default.
     pub const RESET: &str = "\x1b[0m";
+    /// Red foreground (typically used for `Level::Error`).
     pub const RED: &str = "\x1b[31m";
+    /// Yellow foreground (typically used for `Level::Warn`).
     pub const YELLOW: &str = "\x1b[33m";
+    /// Green foreground (typically used for `Level::Info`).
     pub const GREEN: &str = "\x1b[32m";
+    /// White / default foreground (used for `Level::Debug`/`Level::Verbose`).
     pub const WHITE: &str = "\x1b[37m";
+    /// Bold / increased intensity.
     pub const BOLD: &str = "\x1b[1m";
+    /// Dim / reduced intensity (used for warning prose).
     pub const DIM: &str = "\x1b[2m";
 }
 
@@ -84,6 +91,9 @@ pub fn wrap(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
+/// Hard-break a word that is wider than `width` by pushing one character at a
+/// time onto the current line, wrapping to a new line whenever the width is
+/// exhausted.
 fn push_hard(
     lines: &mut Vec<String>,
     line: &mut String,

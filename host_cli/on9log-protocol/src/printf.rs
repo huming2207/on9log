@@ -117,9 +117,13 @@ pub fn has_printf_conversion(fmt: &str) -> bool {
 /// One decoded argument value, already typed via the payload's arg-type table.
 #[derive(Debug, Clone)]
 pub enum Arg {
+    /// A 32-bit unsigned value (maps to `ArgType::Bits32`).
     U32(u32),
+    /// A 64-bit unsigned value (maps to `ArgType::Bits64`, also carries `f64` bit patterns).
     U64(u64),
+    /// A 32-bit pointer value (maps to `ArgType::Pointer`).
     Ptr(u32),
+    /// A dynamic string (maps to `ArgType::DynamicString`).
     /// `None` represents a null dynamic string (length 0xffffffff).
     Str(Option<Vec<u8>>),
 }
@@ -128,20 +132,32 @@ pub enum Arg {
 /// concrete place for each `&dyn Printf` to borrow from, and the values are
 /// heterogeneous, so a small enum holds them.
 enum Owned {
+    /// Signed 8-bit integer (from `%hhd` conversion).
     I8(i8),
+    /// Unsigned 8-bit integer (from `%hhu` conversion).
     U8(u8),
+    /// Signed 16-bit integer (from `%hd` conversion).
     I16(i16),
+    /// Unsigned 16-bit integer (from `%hu` conversion).
     U16(u16),
+    /// Signed 32-bit integer (from `%d`, `%ld`, `%zd`, etc. on ESP32).
     I32(i32),
+    /// Unsigned 32-bit integer (from `%u`, `%x`, `%lx`, etc. on ESP32).
     U32(u32),
+    /// Signed 64-bit integer (from `%lld` conversion).
     I64(i64),
+    /// Unsigned 64-bit integer (from `%llu`, `%llx`, etc.).
     U64(u64),
+    /// 64-bit float interpreted from `Arg::U64` bit pattern.
     F64(f64),
+    /// String storage (owned heap-allocated).
     Str(String),
+    /// Raw pointer (from `%p` conversion).
     Ptr(*const u8),
 }
 
 impl Owned {
+    /// Return a `&dyn Printf` reference suitable for `sprintf::vsprintf`.
     fn as_printf(&self) -> &dyn Printf {
         match self {
             Owned::I8(v) => v,
@@ -252,6 +268,8 @@ pub fn render(fmt: &str, args: &[Arg]) -> String {
 }
 
 /// Read the next wire arg's integer value (for `*` params), advancing the index.
+///
+/// Returns `0` if no arguments remain.
 fn next_int(args: &[Arg], ai: &mut usize) -> i64 {
     if *ai < args.len() {
         let v = match &args[*ai] {
@@ -292,19 +310,31 @@ fn push_precision_literal(out: &mut String, v: i64) {
     // v < 0 → omit the precision entirely.
 }
 
+/// C printf length modifier, used to pick the Rust integer width for `sprintf`.
 #[derive(Clone, Copy)]
 enum Length {
+    /// No length modifier (default int width).
     Default,
+    /// `hh` — `signed char` / `unsigned char`.
     Char,
+    /// `h` — `short` / `unsigned short`.
     Short,
+    /// `l` — `long` / `unsigned long`.
     Long,
+    /// `ll` — `long long` / `unsigned long long`.
     LongLong,
+    /// `z` — `size_t` / `ssize_t`.
     Size,
+    /// `j` — `intmax_t` / `uintmax_t`.
     IntMax,
+    /// `t` — `ptrdiff_t`.
     PtrDiff,
+    /// `L` — `long double` (treated as 32-bit on ESP32, same as default).
     LongDouble,
 }
 
+/// Consume a C printf length modifier from the character stream, push it onto
+/// `out`, and return the corresponding [`Length`] variant.
 fn parse_length<I: Iterator<Item = char>>(
     chars: &mut std::iter::Peekable<I>,
     out: &mut String,
@@ -357,6 +387,11 @@ fn parse_length<I: Iterator<Item = char>>(
 }
 
 /// Coerce a wire `Arg` to the Rust type its conversion character expects.
+///
+/// The coercion is driven by the printf [`Length`] modifier and the conversion
+/// character, so the value passed to `sprintf::vsprintf` has the correct Rust
+/// type for `%d` (signed), `%u`/`%x` (unsigned), `%f` (f64), `%p` (pointer),
+/// and `%s` (string).
 fn value_to_owned(len: Length, conv: char, arg: &Arg) -> Owned {
     match arg {
         Arg::Str(Some(b)) => Owned::Str(String::from_utf8_lossy(b).into_owned()),
@@ -381,6 +416,9 @@ fn value_to_owned(len: Length, conv: char, arg: &Arg) -> Owned {
     }
 }
 
+/// Cast a raw `u64` value to the signed integer width indicated by `len`.
+///
+/// On ESP32 targets, `long`, `size_t`, and `ptrdiff_t` are 32 bits wide.
 fn signed_int(v: u64, len: Length) -> Owned {
     match len {
         Length::Char => Owned::I8(v as u8 as i8),
@@ -393,6 +431,9 @@ fn signed_int(v: u64, len: Length) -> Owned {
     }
 }
 
+/// Cast a raw `u64` value to the unsigned integer width indicated by `len`.
+///
+/// On ESP32 targets, `long`, `size_t`, and `ptrdiff_t` are 32 bits wide.
 fn unsigned_int(v: u64, len: Length) -> Owned {
     match len {
         Length::Char => Owned::U8(v as u8),
