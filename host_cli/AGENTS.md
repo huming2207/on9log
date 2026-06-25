@@ -112,6 +112,7 @@ Argument type values (`ON9_LOG_ARGS_TYPE_*`):
 
 ```text
 0 NONE           1 32BITS    2 64BITS    3 POINTER    4 DYNAMIC_STRING
+5 DYNAMIC_STRING_VIEW
 ```
 
 Encoded argument values:
@@ -122,11 +123,17 @@ Encoded argument values:
 pointer argument      4 bytes (32-bit address)
 dynamic string        uint32_t length + bytes[length], no trailing NUL
 null dynamic string   uint32_t 0xffffffff, no following bytes
+string view           uint32_t length + bytes[length], no trailing NUL
 ```
 
 For `%.*s`, the precision argument is encoded as a normal 32-bit argument before
-the string argument. The firmware does not parse no-load format strings at
-runtime, so the host applies the precision when rendering.
+the string argument, and the host applies precision when rendering. By default,
+firmware does not scan original format literals because that can retain them in
+the flashed binary. If `ON9LOG_ENABLE_FORMAT_SCAN_HINT=1`, C macro callsites
+pass the original format literal as a scan hint only when a string argument is
+present, so firmware can copy the marked string using the preceding
+non-negative precision byte count instead of relying on NUL termination. The
+emitted `fmt_id` still resolves to the `.noload` format string.
 
 A BUFFER packet payload is:
 

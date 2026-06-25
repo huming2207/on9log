@@ -163,14 +163,23 @@ Encoded argument values use:
 pointer argument      4 bytes
 dynamic string        uint32_t length + copied bytes, no trailing NUL
 null dynamic string   uint32_t 0xffffffff, no copied bytes
+string view           uint32_t length + copied bytes, no trailing NUL
 ```
 
 For `%.*s`, the precision argument is still encoded as its normal 32-bit
-argument before the string. The firmware does not parse no-load format strings
-at runtime, so the host decoder applies the precision when rendering. Argument
-emission must pass one `va_list *` through all argument helpers; passing `va_list`
-by value can restart or duplicate the cursor on ESP32-S3 and causes width or
-precision integers such as `%*s`/`%.*s` arguments to be read as string pointers.
+argument before the string, and the host decoder applies the precision when
+rendering. By default, firmware does not scan original format literals because
+the scan hint can keep those literals in the flashed binary in addition to the
+`.noload` ELF-only copy. If `ON9LOG_ENABLE_FORMAT_SCAN_HINT=1`, the C macro path
+passes the original format literal as a scan hint only when the generated type
+table contains a string argument; when the scan finds a `%.*s` string
+conversion, firmware copies the string argument using the preceding
+non-negative precision as a byte count, capped by
+`ON9LOG_MAX_DYNAMIC_STRING_LEN`, instead of relying on NUL termination.
+Argument emission must pass one `va_list *` through all argument helpers;
+passing `va_list` by value can restart or duplicate the cursor on ESP32-S3 and
+causes width or precision integers such as `%*s`/`%.*s` arguments to be read as
+string pointers.
 
 The host decoder is expected to recover the format string from the ELF, parse
 the format string, read the argument type table, and consume the payload
@@ -378,6 +387,26 @@ argument and may render a replacement character.
 String arguments are not emitted as ELF pointer IDs. The host distinguishes
 copied dynamic strings from non-string pointers by reading the argument type
 table at the start of the payload.
+
+The C++ `on9log::Logger` wrapper also accepts `std::string` and
+`std::string_view`. These use `ON9_LOG_ARGS_TYPE_DYNAMIC_STRING_VIEW`: the
+wrapper passes a small stack descriptor (`const char *data`, `size_t len`) to
+the C encoder, and the encoder copies exactly `len` bytes, capped by
+`ON9LOG_MAX_DYNAMIC_STRING_LEN`. This avoids heap allocation and does not require
+NUL termination, so embedded NUL bytes are preserved in the payload.
+
+The C macro path can optionally pass the original format expression as a scan
+hint only when the generated argument type table contains a string argument.
+This is controlled by `ON9LOG_ENABLE_FORMAT_SCAN_HINT`, which defaults to `0` to
+avoid retaining format literals in the flashed firmware binary. When enabled,
+the core runs a `strstr(format, "%.*s")` guard and, if present, does a
+lightweight printf conversion walk to mark string arguments consumed by `%.*s`.
+Those marked `char *` / `const char *` arguments copy exactly the preceding
+non-negative precision argument's byte count, capped by
+`ON9LOG_MAX_DYNAMIC_STRING_LEN`, instead of calling bounded `strlen`. The
+emitted `fmt_id` still points at the `.noload` format string; the scan hint may
+keep the original format literal in normal read-only storage for string-argument
+logs.
 
 For C printf-style logs, `char *`, `const char *`, and character-array arguments
 mean string data by default. If the caller wants to log the pointer value itself

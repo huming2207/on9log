@@ -89,6 +89,25 @@
 #endif
 
 /**
+ * @brief Enable firmware-side scanning of original format literals for `%.*s`.
+ *
+ * Disabled by default because passing the original format literal as a runtime
+ * scan hint can keep that literal in the flashed firmware binary in addition to
+ * the `.noload` ELF-only copy. When disabled, C `%.*s` string arguments are
+ * emitted like normal `%s` dynamic strings: copied up to the first NUL byte or
+ * `ON9LOG_MAX_DYNAMIC_STRING_LEN`; the host still applies precision while
+ * rendering. Use C++ `std::string_view` for length-aware non-NUL-terminated
+ * string slices without retaining format literals in firmware.
+ */
+#ifndef ON9LOG_ENABLE_FORMAT_SCAN_HINT
+#ifdef CONFIG_ON9LOG_ENABLE_FORMAT_SCAN_HINT
+#define ON9LOG_ENABLE_FORMAT_SCAN_HINT CONFIG_ON9LOG_ENABLE_FORMAT_SCAN_HINT
+#else
+#define ON9LOG_ENABLE_FORMAT_SCAN_HINT 0
+#endif
+#endif
+
+/**
  * @brief Maximum byte size for a single ISR-safe log packet.
  *
  * ISR log packets are pre-allocated from a fixed-size ringbuffer; this constant

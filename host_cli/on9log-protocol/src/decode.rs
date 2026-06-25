@@ -281,7 +281,7 @@ fn decode_arg(t: ArgType, body: &mut &[u8]) -> Result<Arg, String> {
             let v = take_u32(body)?;
             Ok(Arg::Ptr(v))
         }
-        ArgType::DynamicString => {
+        ArgType::DynamicString | ArgType::DynamicStringView => {
             let len = take_u32(body)?;
             if len == NULL_STRING_LEN {
                 return Ok(Arg::Str(None));
@@ -389,6 +389,37 @@ mod tests {
                 assert_eq!(l.tag, "@0x40000000");
                 assert!(l.message.starts_with("<fmt @0x40001000>"));
                 assert!(l.message.contains("u32:42"));
+            }
+            other => panic!("expected Log, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decodes_dynamic_string_view_as_string() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&10u32.to_le_bytes());
+        body.extend_from_slice(b"hello\0view");
+        let payload = build_log_payload(&[ArgType::DynamicStringView as u8], &body);
+        let header = crate::wire::Header {
+            magic: PACKET_MAGIC,
+            ptype: PacketType::Log,
+            level: Level::Info,
+            seq: 1,
+            time_ms: 1000,
+            tag_id: 0x4000_0000,
+            fmt_id: 0x4000_1000,
+            payload_len: 0xffff,
+        };
+        let frame = RawFrame {
+            header,
+            header_bytes: vec![],
+            payload,
+        };
+        let mut dec = Decoder::new();
+        match dec.decode(&frame, None) {
+            DecodedPacket::Log(l) => {
+                assert!(l.message.starts_with("<fmt @0x40001000>"));
+                assert!(l.message.contains("str:hello\0view"));
             }
             other => panic!("expected Log, got {other:?}"),
         }

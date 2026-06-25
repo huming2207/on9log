@@ -75,10 +75,16 @@ ON9_LOGI("debug", "name=%s ptr=%p", name, ON9_PTR(name));
 
 ```cpp
 // C++ wrapper
+#include <string>
+#include <string_view>
+
 on9log::Logger log("demo");
 log.info("value={} name={}", value, name);           // printf-style
 log.info<"value={} name={}">(value, name);            // no-load {} style
 log.warn("status=%d", code);
+std::string label = "pump";
+std::string_view state = "ready";
+log.info("label={} state={}", label, state);          // length-aware, no heap copy
 log.buffer_info(bytes, len);
 log.isr_error("isr fault core=%d", core);
 ```
@@ -90,6 +96,15 @@ emits the packet. `char *` and `const char *` arguments are treated as dynamic
 strings and copied into the log payload for `%s` / `%.*s`. To log a character
 pointer's address with `%p`, cast it to a pointer argument with `ON9_PTR(ptr)`.
 The macro expands to `const void *`, which is encoded as an on9log pointer.
+
+C `%.*s` still renders with host-side precision. By default, firmware does not
+scan the original format literal because that can retain the literal in the
+flashed binary in addition to the `.noload` copy. In that mode, C string
+arguments are copied like `%s`: up to the first NUL byte or
+`ON9LOG_MAX_DYNAMIC_STRING_LEN`. Define `ON9LOG_ENABLE_FORMAT_SCAN_HINT=1` to
+enable firmware-side `%.*s` scanning and length-bounded copying. For
+non-NUL-terminated slices without retaining format literals, prefer the C++
+wrapper with `std::string_view`.
 
 ## Host CLI
 

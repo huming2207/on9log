@@ -128,6 +128,8 @@ pub enum ArgType {
     Pointer = 3,
     /// Dynamic string argument preceded by a 32-bit length.
     DynamicString = 4,
+    /// Length-aware dynamic string argument preceded by a 32-bit length.
+    DynamicStringView = 5,
 }
 
 impl ArgType {
@@ -139,6 +141,7 @@ impl ArgType {
             2 => Some(Self::Bits64),
             3 => Some(Self::Pointer),
             4 => Some(Self::DynamicString),
+            5 => Some(Self::DynamicStringView),
             _ => None,
         }
     }

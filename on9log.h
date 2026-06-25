@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 #include "on9log_config.h"
 
@@ -208,6 +209,37 @@ void on9log_write(on9log_level_t level,
                   const char *arg_types,
                   ...) __attribute__((format(printf, 3, 5)));
 
+/**
+ * @brief Write a log message with an optional original-format scan hint.
+ *
+ * Direct callers may pass @c format_scan when firmware-side `%.*s` detection is
+ * wanted. @c ON9_LOGx() callsites normally use
+ * @ref on9log_write_with_format_scan_metadata instead to avoid rescanning
+ * argument metadata.
+ */
+void on9log_write_with_format_scan(on9log_level_t level,
+                                   const char *tag,
+                                   const char *format,
+                                   const char *format_scan,
+                                   const char *arg_types,
+                                   ...) __attribute__((format(printf, 3, 6)));
+
+/**
+ * @brief Write a log message with precomputed argument metadata.
+ *
+ * This is the optimized entry point used by @c ON9_LOGx(); @c arg_count and
+ * @c has_dynamic_string are computed by the macro so the C encoder can avoid
+ * rescanning @c arg_types on the hot path.
+ */
+void on9log_write_with_format_scan_metadata(on9log_level_t level,
+                                            const char *tag,
+                                            const char *format,
+                                            const char *format_scan,
+                                            const char *arg_types,
+                                            uint8_t arg_count,
+                                            int has_dynamic_string,
+                                            ...) __attribute__((format(printf, 3, 8)));
+
 /*
  * Encodes a bounded packet and enqueues it through the platform ISR backend.
  * Dynamic string arguments are not supported on the ISR path.
@@ -219,8 +251,8 @@ void on9log_write(on9log_level_t level,
  * Encodes a bounded on9log packet and enqueues it through the platform ISR
  * ringbuffer for later processing by a drain task.
  *
- * @note Dynamic string (char*/const char*) arguments are NOT supported on the
- *       ISR path; only 32-bit and 64-bit scalar types are safe.
+ * @note Dynamic string arguments are NOT supported on the ISR path; only
+ *       32-bit scalar, 64-bit scalar, and pointer arguments are safe.
  *
  * @param[in] level     Severity level for this message.
  * @param[in] tag       Tag string.
@@ -389,11 +421,24 @@ typedef enum {
     ON9_LOG_ARGS_TYPE_32BITS = 1,
     /** @brief 64-bit integer, double-precision float, or other 8-byte scalar. */
     ON9_LOG_ARGS_TYPE_64BITS = 2,
-    /** @brief Pointer type (uint8_t* or const uint8_t*). */
+    /** @brief Pointer type encoded as a 32-bit address. */
     ON9_LOG_ARGS_TYPE_POINTER = 3,
     /** @brief Dynamic string (char* or const char*) with inline length prefix. */
     ON9_LOG_ARGS_TYPE_DYNAMIC_STRING = 4,
+    /** @brief Length-aware dynamic string descriptor with inline length prefix. */
+    ON9_LOG_ARGS_TYPE_DYNAMIC_STRING_VIEW = 5,
 } on9log_args_type_t;
+
+/**
+ * @brief Length-aware string argument descriptor.
+ *
+ * Used by the C++ wrapper for std::string and std::string_view arguments so the
+ * logger can copy exactly len bytes without requiring NUL termination.
+ */
+typedef struct {
+    const char *data;
+    size_t len;
+} on9log_string_view_t;
 
 /**
  * @brief Sentinel type used to terminate a variadic argument list in
@@ -606,6 +651,31 @@ constexpr unsigned long long ON9_LOG_DETECT_TYPE_IMPL(const T &, bool is_constan
     (const char *)&__on9log_arg_types; \
 }))
 
+#define ON9_LOG_ARGS_HAVE_STRING(arg_types) (__extension__({ \
+    bool __on9log_has_string = false; \
+    const char *__on9log_type_it = (arg_types); \
+    if (__on9log_type_it != NULL) { \
+        for (unsigned __on9log_type_idx = 0; __on9log_type_idx < 255u; ++__on9log_type_idx) { \
+            unsigned char __on9log_type = (unsigned char)__on9log_type_it[__on9log_type_idx]; \
+            if (__on9log_type == ON9_LOG_ARGS_TYPE_NONE) { \
+                break; \
+            } \
+            if (__on9log_type == ON9_LOG_ARGS_TYPE_DYNAMIC_STRING || \
+                __on9log_type == ON9_LOG_ARGS_TYPE_DYNAMIC_STRING_VIEW) { \
+                __on9log_has_string = true; \
+                break; \
+            } \
+        } \
+    } \
+    __on9log_has_string; \
+}))
+
+#if ON9LOG_ENABLE_FORMAT_SCAN_HINT
+#define ON9_LOG_FORMAT_SCAN_HINT(format, has_string) ((has_string) ? (format) : NULL)
+#else
+#define ON9_LOG_FORMAT_SCAN_HINT(format, has_string) ((void)(format), (void)(has_string), (const char *)NULL)
+#endif
+
 /**
  * @brief Force an argument to be encoded as a pointer, for example with %p.
  *
@@ -639,7 +709,17 @@ constexpr unsigned long long ON9_LOG_DETECT_TYPE_IMPL(const T &, bool is_constan
         if (ON9_LOG_ENABLED(level)) { \
             ON9_LOG_DIAG_PUSH; \
             ON9_LOG_DIAG_IGNORE_FORMAT_OVERFLOW; \
-            on9log_write((level), (tag), ON9_LOG_ATTR_STR(format), ON9_LOG_ARGS_TYPE(__VA_ARGS__), ##__VA_ARGS__); \
+            const char *__on9log_arg_types = ON9_LOG_ARGS_TYPE(__VA_ARGS__); \
+            bool __on9log_has_string = ON9_LOG_ARGS_HAVE_STRING(__on9log_arg_types); \
+            const char *__on9log_format_scan = ON9_LOG_FORMAT_SCAN_HINT((format), __on9log_has_string); \
+            on9log_write_with_format_scan_metadata((level), \
+                                                   (tag), \
+                                                   ON9_LOG_ATTR_STR(format), \
+                                                   __on9log_format_scan, \
+                                                   __on9log_arg_types, \
+                                                   (uint8_t)ON9_LOG_VA_NARG(__VA_ARGS__), \
+                                                   __on9log_has_string, \
+                                                   ##__VA_ARGS__); \
             ON9_LOG_DIAG_POP; \
         } \
     } while (0)

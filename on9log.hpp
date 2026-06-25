@@ -13,6 +13,9 @@
 #include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <string>
+#include <string_view>
+#include <tuple>
 #include <type_traits>
 
 /**
@@ -199,11 +202,33 @@ inline constexpr bool is_supported_pointer_v =
     (std::is_void_v<std::remove_cv_t<std::remove_pointer_t<raw_t<T>>>> ||
      std::is_object_v<std::remove_pointer_t<raw_t<T>>>);
 
+template <typename T>
+struct is_basic_string_view : std::false_type {};
+
+template <typename Traits>
+struct is_basic_string_view<std::basic_string_view<char, Traits>> : std::true_type {};
+
+template <typename T>
+inline constexpr bool is_basic_string_view_v = is_basic_string_view<raw_t<T>>::value;
+
+template <typename T>
+struct is_basic_string : std::false_type {};
+
+template <typename Traits, typename Alloc>
+struct is_basic_string<std::basic_string<char, Traits, Alloc>> : std::true_type {};
+
+template <typename T>
+inline constexpr bool is_basic_string_v = is_basic_string<raw_t<T>>::value;
+
+template <typename T>
+inline constexpr bool is_string_view_arg_v = is_basic_string_view_v<T> || is_basic_string_v<T>;
+
 /**
  * @brief  Map a C++ argument type to the corresponding
  *         @c ON9_LOG_ARGS_TYPE_* code at compile time.
  *
  * The mapping rules are:
+ *  - std::string/std::string_view -> @c ON9_LOG_ARGS_TYPE_DYNAMIC_STRING_VIEW
  *  - char pointers/arrays -> @c ON9_LOG_ARGS_TYPE_DYNAMIC_STRING
  *  - other arrays         -> @c ON9_LOG_ARGS_TYPE_POINTER
  *  - null pointer         -> @c ON9_LOG_ARGS_TYPE_POINTER
@@ -221,7 +246,9 @@ consteval char arg_type_code()
 {
     using Raw = raw_t<T>;
 
-    if constexpr (is_char_pointer_v<T> || is_char_array_v<T>) {
+    if constexpr (is_string_view_arg_v<T>) {
+        return static_cast<char>(ON9_LOG_ARGS_TYPE_DYNAMIC_STRING_VIEW);
+    } else if constexpr (is_char_pointer_v<T> || is_char_array_v<T>) {
         return static_cast<char>(ON9_LOG_ARGS_TYPE_DYNAMIC_STRING);
     } else if constexpr (std::is_array_v<Raw>) {
         return static_cast<char>(ON9_LOG_ARGS_TYPE_POINTER);
@@ -245,7 +272,7 @@ consteval char arg_type_code()
         }
     } else {
         static_assert(dependent_false_v<T>,
-                      "unsupported on9log C++ argument type; pass a scalar, pointer, or C string");
+                      "unsupported on9log C++ argument type; pass a scalar, pointer, C string, std::string, or std::string_view");
     }
 }
 
@@ -321,11 +348,12 @@ constexpr auto integer_bits(T value) noexcept
  *         on9log C API.
  *
  * Dispatch rules:
- *  - char pointer / char array -> @c const char*
- *  - other array / pointer     -> @c const void*
- *  - floating point           -> @ref float_bits result
- *  - integer / enum          -> @ref integer_bits result
- *  - otherwise              -> @c static_assert failure
+ *  - std::string/std::string_view -> @c on9log_string_view_t
+ *  - char pointer / char array    -> @c const char*
+ *  - other array / pointer        -> @c const void*
+ *  - floating point               -> @ref float_bits result
+ *  - integer / enum               -> @ref integer_bits result
+ *  - otherwise                    -> @c static_assert failure
  *
  * @tparam T  The argument type (as forwarded, may include ref).
  * @param value  The argument value.
@@ -336,7 +364,9 @@ constexpr auto wire_arg(T &&value) noexcept
 {
     using Raw = raw_t<T>;
 
-    if constexpr (is_char_pointer_v<T>) {
+    if constexpr (is_string_view_arg_v<T>) {
+        return on9log_string_view_t{value.data(), value.size()};
+    } else if constexpr (is_char_pointer_v<T>) {
         return static_cast<const char *>(value);
     } else if constexpr (is_char_array_v<T>) {
         return static_cast<const char *>(value);
@@ -354,8 +384,31 @@ constexpr auto wire_arg(T &&value) noexcept
         return integer_bits(value);
     } else {
         static_assert(dependent_false_v<T>,
-                      "unsupported on9log C++ argument type; pass a scalar, pointer, or C string");
+                      "unsupported on9log C++ argument type; pass a scalar, pointer, C string, std::string, or std::string_view");
     }
+}
+
+inline const on9log_string_view_t *vararg_value(on9log_string_view_t &value) noexcept
+{
+    return &value;
+}
+
+template <typename T>
+constexpr auto vararg_value(T &value) noexcept
+{
+    return value;
+}
+
+template <typename F, typename... Args>
+decltype(auto) with_wire_args(F &&f, Args &&...args)
+{
+    auto wire_args = std::tuple<decltype(wire_arg(static_cast<Args &&>(args)))...>(
+        wire_arg(static_cast<Args &&>(args))...);
+    return std::apply(
+        [&](auto &...packed) -> decltype(auto) {
+            return static_cast<F &&>(f)(vararg_value(packed)...);
+        },
+        wire_args);
 }
 
 /**
@@ -390,11 +443,11 @@ template <on9log_level_t Level, typename... Args>
 void write_log(const char *tag, const char *format, Args &&...args) noexcept
 {
     if constexpr (level_enabled(Level)) {
-        on9log_write(Level,
-                     tag,
-                     format,
-                     arg_types<Args...>(),
-                     wire_arg(static_cast<Args &&>(args))...);
+        with_wire_args(
+            [&](auto... packed_args) {
+                on9log_write(Level, tag, format, arg_types<Args...>(), packed_args...);
+            },
+            static_cast<Args &&>(args)...);
     }
 }
 
@@ -445,11 +498,13 @@ bool write_log_isr(const char *tag, const char *format, Args &&...args) noexcept
     } else {
         static_assert(((arg_type_code<Args>() != static_cast<char>(ON9_LOG_ARGS_TYPE_DYNAMIC_STRING)) && ...),
                       "on9log ISR logging does not support dynamic string arguments");
-        return on9log_write_isr(Level,
-                                tag,
-                                format,
-                                arg_types<Args...>(),
-                                wire_arg(static_cast<Args &&>(args))...);
+        static_assert(((arg_type_code<Args>() != static_cast<char>(ON9_LOG_ARGS_TYPE_DYNAMIC_STRING_VIEW)) && ...),
+                      "on9log ISR logging does not support dynamic string arguments");
+        return with_wire_args(
+            [&](auto... packed_args) {
+                return on9log_write_isr(Level, tag, format, arg_types<Args...>(), packed_args...);
+            },
+            static_cast<Args &&>(args)...);
     }
 }
 
