@@ -103,6 +103,16 @@ static StaticSemaphore_t s_transport_mutex_storage;
 static portMUX_TYPE s_transport_mutex_init_lock = portMUX_INITIALIZER_UNLOCKED;
 
 /**
+ * @brief Current owner task of the transport mutex, for re-entrancy detection.
+ *
+ * Accessed via @c __atomic_* builtins.  When a re-entrant @ref esp_stdio_log_vfs_write_frame
+ * call (same task already inside write_frame) is detected, the call is dropped
+ * to prevent a self-deadlock on the non-recursive transport mutex and to avoid
+ * interleaving two SLIP frames on the wire.
+ */
+static TaskHandle_t s_transport_owner;
+
+/**
  * @brief Obtain (or lazily create) the transport mutex.
  *
  * Double-checked locking pattern: first a relaxed read, then an acquisition
@@ -400,6 +410,11 @@ esp_err_t esp_stdio_log_vfs_write_frame(uint8_t type, const uint8_t *payload, si
         return ESP_ERR_INVALID_SIZE;
     }
 
+    TaskHandle_t self = xTaskGetCurrentTaskHandle();
+    if (__atomic_load_n(&s_transport_owner, __ATOMIC_ACQUIRE) == self) {
+        return ESP_FAIL;
+    }
+
     uint16_t crc = ESP_STDIO_LOG_VFS_CRC16_CCITT_INIT;
     crc = esp_stdio_log_vfs_crc16_ccitt_update(crc, &type, sizeof(type));
     crc = esp_stdio_log_vfs_crc16_ccitt_update(crc, payload, payload_len);
@@ -411,6 +426,7 @@ esp_err_t esp_stdio_log_vfs_write_frame(uint8_t type, const uint8_t *payload, si
     };
 
     esp_stdio_log_vfs_transport_lock();
+    __atomic_store_n(&s_transport_owner, self, __ATOMIC_RELAXED);
     esp_stdio_log_vfs_frame_writer_put_raw_byte(&writer, ESP_STDIO_LOG_VFS_SLIP_START);
     esp_stdio_log_vfs_frame_writer_put_slip_byte(&writer, type);
     esp_stdio_log_vfs_frame_writer_put_slip(&writer, payload, payload_len);
@@ -418,6 +434,7 @@ esp_err_t esp_stdio_log_vfs_write_frame(uint8_t type, const uint8_t *payload, si
     esp_stdio_log_vfs_frame_writer_put_slip_byte(&writer, (uint8_t)(crc >> 8u));
     esp_stdio_log_vfs_frame_writer_put_raw_byte(&writer, ESP_STDIO_LOG_VFS_SLIP_END);
     esp_stdio_log_vfs_frame_writer_flush(&writer);
+    __atomic_store_n(&s_transport_owner, NULL, __ATOMIC_RELAXED);
     esp_stdio_log_vfs_transport_unlock();
 
     return writer.ok ? ESP_OK : ESP_FAIL;

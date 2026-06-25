@@ -14,8 +14,8 @@
 /**
  * @brief Acquire the on9log global lock.
  *
- * Delegates to @c esp_log_impl_lock() which provides a spin-lock compatible
- * with both task and ISR contexts on ESP-IDF.
+ * Delegates to @c esp_log_impl_lock(), a non-recursive FreeRTOS mutex.
+ * Task-context only; must not be called from ISR.
  *
  * @note Must be matched by a call to @ref on9log_port_unlock.
  */

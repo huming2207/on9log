@@ -124,18 +124,28 @@ fits this VFS transport cap (`3072 - 18 byte on9log header - 12 byte buffer
 metadata`). Non-UART sinks such as MQTT or WebSocket still receive raw on9log
 packet bytes without SLIP wrapping.
 
-The sink takes `esp_log_impl_lock()` from `start_cb()` through `end_cb()` so
-on9log packet buffering does not interleave across tasks/cores. It also takes
-`flockfile(stdout)` for the same interval, flushes `stdout` before emitting the
-transport frame, and releases the file lock after the frame write. Normal stdio
-users such as `printf()`/`fprintf(stdout, ...)` are wrapped by
+The sink holds a dedicated non-recursive FreeRTOS mutex (`s_sink_mutex`,
+statically allocated) from `start_cb()` through `end_cb()` so on9log packet
+buffering does not interleave across tasks/cores.  This mutex is separate from
+ESP-IDF's `esp_log_impl_lock()`, so `ESP_LOG*` calls from other tasks/cores are
+not blocked during an on9log frame write.  The sink does **not** take
+`flockfile(stdout)` or call `fflush(stdout)`; stdout is unbuffered
+(`setvbuf(..., _IONBF, 0)`) and wire serialization is handled by the transport
+mutex inside `esp_stdio_log_vfs_write_frame()`.
+
+Normal stdio users such as `printf()`/`fprintf(stdout, ...)` are wrapped by
 `esp_stdio_log_vfs.c` as text frames. `esp_stdio_log_vfs_write_frame()` uses a
 dedicated transport mutex while writing raw bytes to the configured console fds,
 so stdout, stderr, and on9log binary transport frames share one byte-stream
-serialization point without relying on the ESP log lock. `on9log_esp_vfs_init()`
-disables the core raw ROM UART output with
-`on9log_set_uart_enabled(false)` so framed and unframed log streams are not
-mixed on the console.
+serialization point without relying on the ESP log lock.  In addition,
+`write_frame` has a per-task reentrancy guard (`s_transport_owner`, accessed via
+`__atomic_*` builtins): if the same task re-enters `write_frame` while it is
+already inside one (e.g. a UART driver `ESP_LOGE` fires during a blocking
+`write()`), the re-entrant call is dropped with `ESP_FAIL` to prevent a
+self-deadlock on the non-recursive transport mutex and to avoid interleaving two
+SLIP frames on the wire. `on9log_esp_vfs_init()` disables the core raw ROM UART
+output with `on9log_set_uart_enabled(false)` so framed and unframed log streams
+are not mixed on the console.
 
 Normal log packets use:
 
@@ -226,6 +236,17 @@ log.warn("value=%d", value);
 log.buffer_info(bytes, len);
 ```
 
+Short aliases `e/w/i/d/v` are available for `error/warn/info/debug/verbose`,
+each with the same three overloads (plain, NTTP, token):
+
+```c++
+log.e("error %d", 1);
+log.w<"warn nttp %d">(2);
+log.i("info tok %d"_on9fmt, 3);
+log.d(ON9FMT("debug {}"), 4);
+log.v("verbose %d", 5);
+```
+
 The wrapper calls the same `on9log_write()` / `on9log_write_buffer()` C APIs,
 builds the argument type table with C++ templates, avoids heap-allocating STL
 types, and is compatible with `-fno-exceptions` and `-fno-rtti`. Plain
@@ -300,8 +321,9 @@ link on non-ESP targets. In ESP-IDF builds it must not define
 otherwise the static archive linker can satisfy those references from the weak
 object before pulling in `on9log_esp_port.c`, causing all timestamps to remain
 zero. `on9log_esp_port.c` provides the ESP-IDF implementation using
-`esp_log_impl_lock()` and `esp_log_timestamp()`. It deliberately does not
-override `on9log_port_write()`: ESP-IDF console output should be provided by
+`esp_log_impl_lock()` (a non-recursive FreeRTOS mutex, task-context only) and
+`esp_log_timestamp()`. It deliberately does not override
+`on9log_port_write()`: ESP-IDF console output should be provided by
 `on9log_esp_vfs.c`, which buffers a complete on9log packet and passes it to
 `esp_stdio_log_vfs_write_frame()`.
 
@@ -401,9 +423,10 @@ This is controlled by `ON9LOG_ENABLE_FORMAT_SCAN_HINT`, which defaults to `0` to
 avoid retaining format literals in the flashed firmware binary. When enabled,
 the core runs a `strstr(format, "%.*s")` guard and, if present, does a
 lightweight printf conversion walk to mark string arguments consumed by `%.*s`.
-Those marked `char *` / `const char *` arguments copy exactly the preceding
-non-negative precision argument's byte count, capped by
-`ON9LOG_MAX_DYNAMIC_STRING_LEN`, instead of calling bounded `strlen`. The
+Those marked `char *` / `const char *` arguments copy `min(precision,
+bounded_strlen(str, ON9LOG_MAX_DYNAMIC_STRING_LEN))` bytes, matching standard
+printf `%.*s` semantics (stop at NUL or precision, whichever comes first),
+instead of calling bounded `strlen`. The
 emitted `fmt_id` still points at the `.noload` format string; the scan hint may
 keep the original format literal in normal read-only storage for string-argument
 logs.
@@ -558,7 +581,11 @@ counter.
 On ESP-IDF, `on9log_esp_isr.c` implements the ISR enqueue backend using
 Espressif's `freertos/ringbuf.h` no-split ringbuffer. The user must call
 `on9log_esp_isr_init()` during startup, after registering the sinks/transports
-that should receive ISR logs, to create the ringbuffer and a drain task. The ISR
+that should receive ISR logs, to create the ringbuffer and a drain task. The
+ringbuffer handle is stored as `atomic_uintptr_t` with acquire/release ordering
+so that ISRs on either core observe a consistent handle; the drain task receives
+the ringbuffer handle directly as its task argument, and `on9log_esp_isr_init()`
+publishes the global handle only after the drain task has been created. The ISR
 path checks `on9log_port_isr_ready()` first; if the backend was not initialized,
 `ON9_ISR_LOGx()` is a no-op and does not increment the dropped counter. Once
 initialized, the ISR side uses `xRingbufferSendFromISR()` and returns immediately
@@ -603,10 +630,13 @@ Current shared state is handled as follows:
 
 Sink slots publish `ctx` first and then publish the sink-struct pointer with
 release semantics. Dispatch loads `sink` with acquire semantics and only reads
-`ctx` if `sink` is non-null. At packet start, dispatch snapshots the currently
-registered sink pointers and contexts, then uses that snapshot for all payload
-callbacks and `end_cb()` for that packet. The sink struct must have static or
-otherwise long-lived storage; the logger stores its pointer, not a copy.
+`ctx` if `sink` is non-null. Removal clears only `sink`; the old `ctx` remains in
+the slot until the slot is reused, so an in-flight reader that already observed
+the old sink pointer still sees the matching context. At packet start, dispatch
+snapshots the currently registered sink pointers and contexts, then uses that
+snapshot for all payload callbacks and `end_cb()` for that packet. The sink
+struct must have static or otherwise long-lived storage; the logger stores its
+pointer, not a copy.
 
 This makes normal log emission and sink dispatch lock-free. Registration and
 removal are expected to be infrequent, so keeping those paths locked is a
@@ -680,7 +710,12 @@ these review findings are still open and should be treated as real constraints:
 - **Public `on9log_write()` trusts `arg_types`.** The macro-generated type table
   is NUL-terminated, but direct callers can pass a non-terminated or inconsistent
   table. `on9log_arg_count()` will scan until `ON9_LOG_ARGS_TYPE_NONE` or
-  `UINT8_MAX`, so external callers must provide a valid table.
+  `UINT8_MAX`, so external callers must provide a valid table. The emit loop in
+  `on9log_emit_payload_args()` is bounded by `arg_count` (max 255) and stops on
+  the `NONE` sentinel, so a non-terminated table can read at most 255 bytes OOB
+  rather than unbounded. `on9log_write_with_format_scan_metadata()` additionally
+  trusts the caller-supplied `arg_count` for the type-table wire copy; a
+  mismatched `arg_count` can still cause a bounded OOB read there.
 - **Some VFS output errors are still hidden.** `esp_stdio_log_vfs_add_output()`
   returns `ESP_OK` even if `open()` fails, and the on9log VFS sink currently
   ignores the return value from `esp_stdio_log_vfs_write_frame()`. The shared
@@ -693,9 +728,9 @@ these review findings are still open and should be treated as real constraints:
 - **Sink removal is not an in-flight callback barrier.** The lifetime rule in the
   locking section is part of the API contract until teardown synchronization is
   added.
-- **Firmware build has not been verified in this shell.** Rust host tests and
-  clippy passed, but `idf.py` was not available here, so C-side compatibility must
-  still be confirmed with the ESP-IDF build environment.
+- **Firmware build has not been verified in this shell.** Rust host tests pass,
+  but `idf.py` was not available here, so C-side compatibility must still be
+  confirmed with the ESP-IDF build environment.
 
 ## Current Tradeoffs
 

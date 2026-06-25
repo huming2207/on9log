@@ -11,8 +11,8 @@ extern "C" {
 /**
  * @brief Acquire the on9log mutex/lock.
  *
- * Called before any non-ISR write or sink operation. Must be reentrant-safe
- * if the platform supports nested logging.
+ * Called before sink add/remove and tag-filter mutation.  Non-reentrant;
+ * callers must not log or mutate sinks/filters from within sink callbacks.
  */
 void on9log_port_lock(void);
 /**

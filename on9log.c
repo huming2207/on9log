@@ -46,13 +46,15 @@ typedef uint32_t on9log_arg_mask_t;
 /**
  * @brief An atomic slot in the global sink table.
  *
- * Each slot holds a pointer to a @ref on9log_sink_t and its opaque context,
- * both stored as @c atomic_uintptr_t so that ISR-context writers can read
- * them without locking.
+ * Each slot holds a pointer to a @ref on9log_sink_t and its opaque context.
+ * Writers publish @c ctx first and then publish @c sink with release ordering;
+ * readers load @c sink with acquire ordering before reading @c ctx.  Removal
+ * clears only @c sink, leaving @c ctx available for any in-flight reader that
+ * already observed the old sink pointer.
  */
 typedef struct {
-    atomic_uintptr_t sink; /**< Pointer to the sink descriptor (@ref on9log_sink_t). */
-    atomic_uintptr_t ctx;  /**< Opaque user context passed to every sink callback. */
+    atomic_uintptr_t sink;      /**< Pointer to the sink descriptor (@ref on9log_sink_t). */
+    atomic_uintptr_t ctx;       /**< Opaque user context passed to every sink callback. */
 } on9log_sink_entry_t;
 
 /**
@@ -464,10 +466,8 @@ static void on9log_emit_precision_string(on9log_stream_t *stream,
         return;
     }
 
-    size_t str_len = (size_t)precision;
-    if (str_len > ON9LOG_MAX_DYNAMIC_STRING_LEN) {
-        str_len = ON9LOG_MAX_DYNAMIC_STRING_LEN;
-    }
+    size_t actual_len = on9log_bounded_strlen(str, ON9LOG_MAX_DYNAMIC_STRING_LEN);
+    size_t str_len = ((size_t)precision < actual_len) ? (size_t)precision : actual_len;
     on9log_emit_string_bytes(stream, str, str_len, total_arg_cnt, curr_arg_index);
 }
 
@@ -554,7 +554,7 @@ static void on9log_emit_payload_args(on9log_stream_t *stream,
     uint8_t prev_arg_type = ON9_LOG_ARGS_TYPE_NONE;
     uint32_t prev_u32 = 0;
 
-    for (unsigned idx = 0; on9log_arg_type_at(arg_types, idx) != ON9_LOG_ARGS_TYPE_NONE; ++idx) {
+    for (unsigned idx = 0; idx < total_arg_cnt && on9log_arg_type_at(arg_types, idx) != ON9_LOG_ARGS_TYPE_NONE; ++idx) {
         uint8_t arg_type = on9log_arg_type_at(arg_types, idx);
         switch (arg_type) {
         case ON9_LOG_ARGS_TYPE_32BITS:
@@ -1009,7 +1009,6 @@ on9log_err_t on9log_remove_sink(const on9log_sink_t *sink, void *ctx)
         void *slot_ctx = (void *)atomic_load_explicit(&s_sinks[i].ctx, memory_order_relaxed);
         if (slot_sink == sink && slot_ctx == ctx) {
             atomic_store_explicit(&s_sinks[i].sink, (uintptr_t)NULL, memory_order_release);
-            atomic_store_explicit(&s_sinks[i].ctx, (uintptr_t)NULL, memory_order_relaxed);
             on9log_port_unlock();
             return ON9LOG_OK;
         }
