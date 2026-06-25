@@ -919,6 +919,234 @@ public:
     }
 
     // ------------------------------------------------------------------
+    // Short aliases: e(), w(), i(), d(), v()
+    //
+    // Each short alias mirrors the three overloads of its full-name
+    // counterpart (plain format, NTTP format, token format) and forwards
+    // to the same detail::write_log call.
+    // ------------------------------------------------------------------
+
+    // ------------------------------------------------------------------
+    // e()  --  alias for error()
+    // ------------------------------------------------------------------
+
+    /**
+     * @brief  Alias for @ref error (plain format string).
+     *
+     * @tparam Args  Argument types (inferred).
+     * @param format  printf-style format string.
+     * @param args    Variadic arguments.
+     */
+    template <typename... Args>
+    void e(const char *format, Args &&...args) const noexcept
+    {
+        detail::write_log<ON9_LOG_LEVEL_ERROR>(tag_, format, static_cast<Args &&>(args)...);
+    }
+
+    /**
+     * @brief  Alias for @ref error (NTTP format string).
+     *
+     * @tparam Format  A @ref detail::fixed_string NTTP with the format literal.
+     * @tparam Args    Argument types (inferred).
+     * @param args     Variadic arguments.
+     */
+    template <detail::fixed_string Format, typename... Args>
+    void e(Args &&...args) const noexcept
+    {
+        detail::write_log<ON9_LOG_LEVEL_ERROR>(tag_, detail::format_token<Format>{}, static_cast<Args &&>(args)...);
+    }
+
+    /**
+     * @brief  Alias for @ref error (token format string).
+     *
+     * @tparam Format  Format literal embedded in the token.
+     * @tparam Args    Argument types (inferred).
+     * @param format   A @ref detail::format_token value.
+     * @param args     Variadic arguments.
+     */
+    template <detail::fixed_string Format, typename... Args>
+    void e(detail::format_token<Format> format, Args &&...args) const noexcept
+    {
+        detail::write_log<ON9_LOG_LEVEL_ERROR>(tag_, format, static_cast<Args &&>(args)...);
+    }
+
+    // ------------------------------------------------------------------
+    // w()  --  alias for warn()
+    // ------------------------------------------------------------------
+
+    /**
+     * @brief  Alias for @ref warn (plain format string).
+     *
+     * @tparam Args  Argument types (inferred).
+     * @param format  printf-style format string.
+     * @param args    Variadic arguments.
+     */
+    template <typename... Args>
+    void w(const char *format, Args &&...args) const noexcept
+    {
+        detail::write_log<ON9_LOG_LEVEL_WARN>(tag_, format, static_cast<Args &&>(args)...);
+    }
+
+    /**
+     * @brief  Alias for @ref warn (NTTP format string).
+     *
+     * @tparam Format  A @ref detail::fixed_string NTTP with the format literal.
+     * @tparam Args    Argument types (inferred).
+     * @param args     Variadic arguments.
+     */
+    template <detail::fixed_string Format, typename... Args>
+    void w(Args &&...args) const noexcept
+    {
+        detail::write_log<ON9_LOG_LEVEL_WARN>(tag_, detail::format_token<Format>{}, static_cast<Args &&>(args)...);
+    }
+
+    /**
+     * @brief  Alias for @ref warn (token format string).
+     *
+     * @tparam Format  Format literal embedded in the token.
+     * @tparam Args    Argument types (inferred).
+     * @param format   A @ref detail::format_token value.
+     * @param args     Variadic arguments.
+     */
+    template <detail::fixed_string Format, typename... Args>
+    void w(detail::format_token<Format> format, Args &&...args) const noexcept
+    {
+        detail::write_log<ON9_LOG_LEVEL_WARN>(tag_, format, static_cast<Args &&>(args)...);
+    }
+
+    // ------------------------------------------------------------------
+    // i()  --  alias for info()
+    // ------------------------------------------------------------------
+
+    /**
+     * @brief  Alias for @ref info (plain format string).
+     *
+     * @tparam Args  Argument types (inferred).
+     * @param format  printf-style format string.
+     * @param args    Variadic arguments.
+     */
+    template <typename... Args>
+    void i(const char *format, Args &&...args) const noexcept
+    {
+        detail::write_log<ON9_LOG_LEVEL_INFO>(tag_, format, static_cast<Args &&>(args)...);
+    }
+
+    /**
+     * @brief  Alias for @ref info (NTTP format string).
+     *
+     * @tparam Format  A @ref detail::fixed_string NTTP with the format literal.
+     * @tparam Args    Argument types (inferred).
+     * @param args     Variadic arguments.
+     */
+    template <detail::fixed_string Format, typename... Args>
+    void i(Args &&...args) const noexcept
+    {
+        detail::write_log<ON9_LOG_LEVEL_INFO>(tag_, detail::format_token<Format>{}, static_cast<Args &&>(args)...);
+    }
+
+    /**
+     * @brief  Alias for @ref info (token format string).
+     *
+     * @tparam Format  Format literal embedded in the token.
+     * @tparam Args    Argument types (inferred).
+     * @param format   A @ref detail::format_token value.
+     * @param args     Variadic arguments.
+     */
+    template <detail::fixed_string Format, typename... Args>
+    void i(detail::format_token<Format> format, Args &&...args) const noexcept
+    {
+        detail::write_log<ON9_LOG_LEVEL_INFO>(tag_, format, static_cast<Args &&>(args)...);
+    }
+
+    // ------------------------------------------------------------------
+    // d()  --  alias for debug()
+    // ------------------------------------------------------------------
+
+    /**
+     * @brief  Alias for @ref debug (plain format string).
+     *
+     * @tparam Args  Argument types (inferred).
+     * @param format  printf-style format string.
+     * @param args    Variadic arguments.
+     */
+    template <typename... Args>
+    void d(const char *format, Args &&...args) const noexcept
+    {
+        detail::write_log<ON9_LOG_LEVEL_DEBUG>(tag_, format, static_cast<Args &&>(args)...);
+    }
+
+    /**
+     * @brief  Alias for @ref debug (NTTP format string).
+     *
+     * @tparam Format  A @ref detail::fixed_string NTTP with the format literal.
+     * @tparam Args    Argument types (inferred).
+     * @param args     Variadic arguments.
+     */
+    template <detail::fixed_string Format, typename... Args>
+    void d(Args &&...args) const noexcept
+    {
+        detail::write_log<ON9_LOG_LEVEL_DEBUG>(tag_, detail::format_token<Format>{}, static_cast<Args &&>(args)...);
+    }
+
+    /**
+     * @brief  Alias for @ref debug (token format string).
+     *
+     * @tparam Format  Format literal embedded in the token.
+     * @tparam Args    Argument types (inferred).
+     * @param format   A @ref detail::format_token value.
+     * @param args     Variadic arguments.
+     */
+    template <detail::fixed_string Format, typename... Args>
+    void d(detail::format_token<Format> format, Args &&...args) const noexcept
+    {
+        detail::write_log<ON9_LOG_LEVEL_DEBUG>(tag_, format, static_cast<Args &&>(args)...);
+    }
+
+    // ------------------------------------------------------------------
+    // v()  --  alias for verbose()
+    // ------------------------------------------------------------------
+
+    /**
+     * @brief  Alias for @ref verbose (plain format string).
+     *
+     * @tparam Args  Argument types (inferred).
+     * @param format  printf-style format string.
+     * @param args    Variadic arguments.
+     */
+    template <typename... Args>
+    void v(const char *format, Args &&...args) const noexcept
+    {
+        detail::write_log<ON9_LOG_LEVEL_VERBOSE>(tag_, format, static_cast<Args &&>(args)...);
+    }
+
+    /**
+     * @brief  Alias for @ref verbose (NTTP format string).
+     *
+     * @tparam Format  A @ref detail::fixed_string NTTP with the format literal.
+     * @tparam Args    Argument types (inferred).
+     * @param args     Variadic arguments.
+     */
+    template <detail::fixed_string Format, typename... Args>
+    void v(Args &&...args) const noexcept
+    {
+        detail::write_log<ON9_LOG_LEVEL_VERBOSE>(tag_, detail::format_token<Format>{}, static_cast<Args &&>(args)...);
+    }
+
+    /**
+     * @brief  Alias for @ref verbose (token format string).
+     *
+     * @tparam Format  Format literal embedded in the token.
+     * @tparam Args    Argument types (inferred).
+     * @param format   A @ref detail::format_token value.
+     * @param args     Variadic arguments.
+     */
+    template <detail::fixed_string Format, typename... Args>
+    void v(detail::format_token<Format> format, Args &&...args) const noexcept
+    {
+        detail::write_log<ON9_LOG_LEVEL_VERBOSE>(tag_, format, static_cast<Args &&>(args)...);
+    }
+
+    // ------------------------------------------------------------------
     // log()  --  generic level as a template parameter
     // ------------------------------------------------------------------
 
