@@ -440,6 +440,8 @@ typedef struct {
         on9log_args_end_t: ON9_LOG_ARGS_TYPE_NONE, \
         char*: ON9_LOG_ARGS_TYPE_DYNAMIC_STRING, \
         const char*: ON9_LOG_ARGS_TYPE_DYNAMIC_STRING, \
+        void*: ON9_LOG_ARGS_TYPE_POINTER, \
+        const void*: ON9_LOG_ARGS_TYPE_POINTER, \
         uint8_t*: ON9_LOG_ARGS_TYPE_POINTER, \
         const uint8_t*: ON9_LOG_ARGS_TYPE_POINTER, \
         long long int: ON9_LOG_ARGS_TYPE_64BITS, \
@@ -479,6 +481,20 @@ struct On9LogArgType<char *> {
 template <>
 struct On9LogArgType<const char *> {
     constexpr static unsigned long long log_type = ON9_LOG_ARGS_TYPE_DYNAMIC_STRING;
+    constexpr static unsigned long long constant_log_type = log_type;
+};
+
+/** @brief Specialisation for void* (pointer). */
+template <>
+struct On9LogArgType<void *> {
+    constexpr static unsigned long long log_type = ON9_LOG_ARGS_TYPE_POINTER;
+    constexpr static unsigned long long constant_log_type = log_type;
+};
+
+/** @brief Specialisation for const void* (pointer). */
+template <>
+struct On9LogArgType<const void *> {
+    constexpr static unsigned long long log_type = ON9_LOG_ARGS_TYPE_POINTER;
     constexpr static unsigned long long constant_log_type = log_type;
 };
 
@@ -589,6 +605,14 @@ constexpr unsigned long long ON9_LOG_DETECT_TYPE_IMPL(const T &, bool is_constan
     static const char __on9log_arg_types[] = { __VA_OPT__(ON9_LOG_INIT_ARG_TYPE(ON9_LOG_VA_NARG(__VA_ARGS__), __VA_ARGS__), ) 0 }; \
     (const char *)&__on9log_arg_types; \
 }))
+
+/**
+ * @brief Force an argument to be encoded as a pointer, for example with %p.
+ *
+ * char* and const char* arguments are encoded as dynamic strings by default;
+ * wrap them in ON9_PTR() when the pointer value itself should be logged.
+ */
+#define ON9_PTR(x) ((const void *)(x))
 
 /**
  * @brief Check whether the given log level is enabled at compile time.

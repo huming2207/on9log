@@ -379,6 +379,12 @@ String arguments are not emitted as ELF pointer IDs. The host distinguishes
 copied dynamic strings from non-string pointers by reading the argument type
 table at the start of the payload.
 
+For C printf-style logs, `char *`, `const char *`, and character-array arguments
+mean string data by default. If the caller wants to log the pointer value itself
+with `%p`, they must pass a pointer-typed expression, e.g. `ON9_PTR(str)` or an
+explicit `const void *` / `void *` cast. The C `_Generic` classifier maps
+`void *` and `const void *` to `ON9_LOG_ARGS_TYPE_POINTER`.
+
 This makes dynamic strings self-contained in the log stream while bounding the
 amount of memory scanned for a malformed or non-NUL-terminated `char *`.
 
@@ -638,8 +644,10 @@ these review findings are still open and should be treated as real constraints:
 - **Argument capture is ABI-reliant.** Type detection only special-cases a small
   set of C/C++ types, then `on9log_emit_arg()` reads raw `uint32_t`, `uint64_t`,
   pointer, or string values from `va_arg`. This is not a complete printf ABI
-  model: signed integer promotion, `double`/`float`, arbitrary pointer types,
-  and using `char *` with `%p` are still sharp edges.
+  model: signed integer promotion, `double`/`float`, and arbitrary pointer
+  types are still sharp edges. For `%p`, use `ON9_PTR(x)` or cast to
+  `const void *` / `void *`; bare `char *` is intentionally treated as a copied
+  dynamic string.
 - **Public `on9log_write()` trusts `arg_types`.** The macro-generated type table
   is NUL-terminated, but direct callers can pass a non-terminated or inconsistent
   table. `on9log_arg_count()` will scan until `ON9_LOG_ARGS_TYPE_NONE` or

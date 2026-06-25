@@ -68,6 +68,9 @@ ON9_ISR_LOGW("isr", "overrun on core %d", core);
 // Runtime filtering
 on9log_set_level(ON9_LOG_LEVEL_WARN);
 on9log_set_tag_level("wifi", ON9_LOG_LEVEL_DEBUG);
+
+// char pointers are encoded as copied strings; use ON9_PTR() for pointer values
+ON9_LOGI("debug", "name=%s ptr=%p", name, ON9_PTR(name));
 ```
 
 ```cpp
@@ -79,6 +82,14 @@ log.warn("status=%d", code);
 log.buffer_info(bytes, len);
 log.isr_error("isr fault core=%d", core);
 ```
+
+### C argument caveat
+
+The C macros classify arguments from their expression types before the firmware
+emits the packet. `char *` and `const char *` arguments are treated as dynamic
+strings and copied into the log payload for `%s` / `%.*s`. To log a character
+pointer's address with `%p`, cast it to a pointer argument with `ON9_PTR(ptr)`.
+The macro expands to `const void *`, which is encoded as an on9log pointer.
 
 ## Host CLI
 
