@@ -1,6 +1,8 @@
 # on9log
 
-Custom binary logging library for embedded platforms with a Rust host-side decoder and CLI monitor. Currently targets ESP32-S3; designed for portability to other MCUs and RTOSes.
+Custom binary logging library for embedded platforms. Currently targets ESP32-S3; designed for portability to other MCUs and RTOSes.
+
+The host-side decoder library and CLI tools are at: https://github.com/huming2207/on9log_host
 
 ## Overview
 
@@ -9,7 +11,7 @@ Custom binary logging library for embedded platforms with a Rust host-side decod
 - transport-agnostic forwarding (UART, MQTT, WebSocket);
 - small on-flash footprint via ELF-only format strings.
 
-The firmware sends only addresses for format and tag strings. A matching host decoder resolves them from the firmware ELF, parses printf- or `{}`-style format strings, and renders colorized human-readable output.
+The firmware sends only addresses for format and tag strings. The matching host decoder (separate repo) resolves them from the firmware ELF, parses printf- or `{}`-style format strings, and renders colorized human-readable output.
 
 ## Architecture
 
@@ -24,14 +26,9 @@ The firmware sends only addresses for format and tag strings. A matching host de
 │  esp_stdio_log_vfs.c            │  Shared stdio VFS framer
 └──────────────┬──────────────────┘
                │  typed SLIP frames over UART
-┌──────────────▼──────────────────┐
-│  Host (Linux/macOS / Rust)      │
-│                                 │
-│  on9log-protocol                │  Deframer, decoder, ELF resolver,
-│                                 │  printf/C++23 renderer, crash annotator
-│  on9log-cli                     │  Live monitor with color output
-│  on9log-capture                 │  SQLite capture + offline decode
-└─────────────────────────────────┘
+               ▼
+       Host decoder & CLI
+     (separate repository)
 ```
 
 ## Wire Format
@@ -106,34 +103,12 @@ enable firmware-side `%.*s` scanning and length-bounded copying. For
 non-NUL-terminated slices without retaining format literals, prefer the C++
 wrapper with `std::string_view`.
 
-## Host CLI
+## Host Tools
 
-```bash
-cd host_cli
-cargo build --release
+The host-side decoder library (`on9log-protocol`), live monitor (`on9log-cli`),
+and SQLite capture tool (`on9log-capture`) have moved to a separate repository. 
 
-# Live monitor with ELF resolution
-./target/release/on9log -p /dev/ttyUSB0 -b 115200 --elf firmware.elf
-
-# With local timestamps and file save
-./target/release/on9log -p /dev/ttyUSB0 --elf firmware.elf -t -s
-
-# Capture (no ELF needed) then decode later
-./target/release/on9log-capture capture -p /dev/ttyUSB0 -o session.sqlite
-./target/release/on9log-capture decode session.sqlite --elf firmware.elf -t
-```
-
-### Key flags
-
-| Flag | Description |
-|---|---|
-| `-p, --port` | UART device path |
-| `-b, --baud` | Baud rate (default: 115200) |
-| `--elf` | Firmware ELF for string/symbol resolution |
-| `-t, --timestamp` | Prefix lines with local wall time |
-| `-s, --save` | Save decoded output to file |
-| `--no-color` | Disable ANSI colors |
-| `--no-esp-reset` | Skip DTR/RTS reset on connect |
+See: https://github.com/huming2207/on9log_host
 
 ## Project Structure
 
@@ -150,26 +125,13 @@ on9log/
 ├── esp_stdio_log_vfs.c/.h       Shared stdio VFS framer
 ├── on9log_port_weak.c           Weak no-op stubs for non-ESP targets
 ├── CMakeLists.txt
-├── Kconfig
-└── host_cli/
-    ├── on9log-protocol/         Decoder library (Rust)
-    ├── on9log-cli/              Live monitor binary (Rust)
-    └── on9log-capture/          SQLite capture/replay binary (Rust)
+└── Kconfig
 ```
 
 ## Building
 
-**Firmware** — on ESP-IDF, add as a standard component (place in `components/` or `EXTRA_COMPONENT_DIRS`). On other platforms, implement the hooks in `on9log_port.h` (see `on9log_port_weak.c` for defaults) and link `on9log.c` directly.
-
-**Host tools** — Rust 1.70+:
-
-```bash
-cd host_cli
-cargo build --release
-cargo test --workspace
-```
+On ESP-IDF, add as a standard component (place in `components/` or `EXTRA_COMPONENT_DIRS`). On other platforms, implement the hooks in `on9log_port.h` (see `on9log_port_weak.c` for defaults) and link `on9log.c` directly.
 
 ## License
 
 [WTFPL](https://en.wikipedia.org/wiki/WTFPL)
-
