@@ -168,3 +168,8 @@ cd host_cli
 cargo build --release
 cargo test --workspace
 ```
+
+## License
+
+[WTFPL](https://en.wikipedia.org/wiki/WTFPL)
+
