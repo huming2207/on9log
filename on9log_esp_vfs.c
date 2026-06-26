@@ -5,8 +5,6 @@
  * Implements an @ref on9log_sink_t that collects log-frame payloads into a
  * local buffer and writes a complete SLIP-encoded frame via the
  * @ref esp_stdio_log_vfs transport layer when the sink's @c end_cb is called.
- * UART direct output is disabled once this VFS sink is installed so that all
- * output flows through the VFS path.
  */
 
 #include "on9log_esp_vfs.h"
@@ -179,8 +177,8 @@ static esp_err_t on9log_esp_vfs_to_esp_err(on9log_err_t err)
  * @brief Initialise the on9log ESP VFS sink.
  *
  * Initialises the underlying @ref esp_stdio_log_vfs transport, registers the
- * VFS sink with the on9log core, and disables direct UART output.  Safe to
- * call multiple times; subsequent calls return @c ESP_OK without re-initialising.
+ * VFS sink with the on9log core.  Safe to call multiple times; subsequent
+ * calls return @c ESP_OK without re-initialising.
  *
  * @return
  * - @c ESP_OK on success or if already initialised.
@@ -211,7 +209,6 @@ esp_err_t on9log_esp_vfs_init(void)
         return on9log_esp_vfs_to_esp_err(on9_err);
     }
 
-    on9log_set_uart_enabled(false);
     s_on9log_esp_vfs.installed = true;
     return ESP_OK;
 }

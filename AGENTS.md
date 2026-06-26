@@ -60,9 +60,7 @@ typedef struct {
 
 `payload_len == ON9LOG_PAYLOAD_LEN_STREAMING` means the logger is emitting a
 streamed packet and the transport/sink framing determines the packet end. Sink
-callbacks receive an explicit `end_cb()`. Raw UART output does not add an
-extra end delimiter, so consumers that need streamed packets over UART must add
-a framing layer outside this raw byte stream.
+callbacks receive an explicit `end_cb()`.
 
 ## Default ESP VFS Sink
 
@@ -81,9 +79,9 @@ by `esp_stdio_log_vfs.c`:
 Additional outputs should be added through `esp_stdio_log_vfs_add_output(path)` before or
 after `on9log_esp_vfs_init()`.
 
-Because raw UART output has no packet boundary, the stdio VFS transport uses an
-explicit-start typed SLIP envelope for both on9log binary packets and normal
-plain text:
+Because UART and USB console devices expose byte streams rather than packet
+boundaries, the stdio VFS transport uses an explicit-start typed SLIP envelope
+for both on9log binary packets and normal plain text:
 
 ```text
 0xa5
@@ -143,9 +141,7 @@ serialization point without relying on the ESP log lock.  In addition,
 already inside one (e.g. a UART driver `ESP_LOGE` fires during a blocking
 `write()`), the re-entrant call is dropped with `ESP_FAIL` to prevent a
 self-deadlock on the non-recursive transport mutex and to avoid interleaving two
-SLIP frames on the wire. `on9log_esp_vfs_init()` disables the core raw ROM UART
-output with `on9log_set_uart_enabled(false)` so framed and unframed log streams
-are not mixed on the console.
+SLIP frames on the wire.
 
 Normal log packets use:
 
@@ -312,7 +308,6 @@ Platform-specific services are isolated behind `on9log_port.h`:
 void on9log_port_lock(void);
 void on9log_port_unlock(void);
 uint32_t on9log_port_timestamp_ms(void);
-void on9log_port_write(const uint8_t *data, size_t len);
 ```
 
 `on9log_port_weak.c` provides weak no-op/default implementations so the core can
@@ -322,9 +317,8 @@ otherwise the static archive linker can satisfy those references from the weak
 object before pulling in `on9log_esp_port.c`, causing all timestamps to remain
 zero. `on9log_esp_port.c` provides the ESP-IDF implementation using
 `esp_log_impl_lock()` (a non-recursive FreeRTOS mutex, task-context only) and
-`esp_log_timestamp()`. It deliberately does not override
-`on9log_port_write()`: ESP-IDF console output should be provided by
-`on9log_esp_vfs.c`, which buffers a complete on9log packet and passes it to
+`esp_log_timestamp()`. ESP-IDF console output is provided by `on9log_esp_vfs.c`,
+which buffers a complete on9log packet and passes it to
 `esp_stdio_log_vfs_write_frame()`.
 
 Buffer dump packets use packet type `ON9LOG_PKT_BUFFER`. The `tag_id` field is
@@ -518,10 +512,8 @@ reported explicitly by the dropped packet.
 
 ## Current Transport Behavior
 
-`on9log` currently supports:
-
-- a platform `on9log_port_write()` hook for non-ESP or custom raw transports;
-- registered callback sinks using `on9log_add_sink()`.
+`on9log` forwards packets through registered callback sinks using
+`on9log_add_sink()`.
 
 Sinks use a streaming interface:
 
@@ -572,8 +564,8 @@ called from ISR context.
 one complete on9log packet into a fixed stack buffer of
 `ON9LOG_ISR_PACKET_MAX` bytes, defaulting to 128, and enqueue that packet through
 `on9log_port_isr_enqueue_packet()`. They do not call sinks, VFS, network APIs, or
-blocking UART writes directly from the ISR. Dynamic string arguments are rejected
-on this path; only 32-bit, 64-bit, and pointer arguments are supported. If packet
+blocking transport writes directly from the ISR. Dynamic string arguments are
+rejected on this path; only 32-bit, 64-bit, and pointer arguments are supported. If packet
 encoding exceeds `ON9LOG_ISR_PACKET_MAX`, unsupported argument types are used, or
 the initialized queue is full, the logger increments the normal dropped-packet
 counter.
@@ -623,7 +615,6 @@ Current shared state is handled as follows:
 
 - packet sequence counter: atomic;
 - dropped packet counter: atomic;
-- UART enable flag: atomic;
 - sink stream dispatch: lock-free atomic pointer loads;
 - sink add/remove: still locked to serialize table mutation and duplicate/free
   slot checks.
@@ -681,10 +672,10 @@ Practical options:
 The GCC builtin style looks like:
 
 ```c
-static bool s_uart_enabled = true;
+static bool s_feature_enabled = true;
 
-__atomic_store_n(&s_uart_enabled, enabled, __ATOMIC_RELAXED);
-bool enabled = __atomic_load_n(&s_uart_enabled, __ATOMIC_RELAXED);
+__atomic_store_n(&s_feature_enabled, enabled, __ATOMIC_RELAXED);
+bool enabled = __atomic_load_n(&s_feature_enabled, __ATOMIC_RELAXED);
 ```
 
 This keeps atomic code generation while usually avoiding `clangd`'s `_Atomic`
@@ -723,14 +714,13 @@ these review findings are still open and should be treated as real constraints:
   callback, but binary UART drops still surface mainly as host-side sequence gaps.
 - **Init failure has no rollback.** `esp_stdio_log_vfs_init()` can register the
   VFS and redirect `stdout` before a later failure, and `on9log_esp_vfs_init()`
-  can fail after stdio redirection but before disabling the raw UART path. Failed
+  can fail after stdio redirection but before registering the on9log sink. Failed
   init should be considered potentially partially applied.
 - **Sink removal is not an in-flight callback barrier.** The lifetime rule in the
   locking section is part of the API contract until teardown synchronization is
   added.
-- **Firmware build has not been verified in this shell.** Rust host tests pass,
-  but `idf.py` was not available here, so C-side compatibility must still be
-  confirmed with the ESP-IDF build environment.
+- **Firmware build has not been verified after the latest local edits.** C-side
+  compatibility must still be confirmed with the ESP-IDF build environment.
 
 ## Current Tradeoffs
 
@@ -754,8 +744,9 @@ The host decoder must:
 - decode pointer, scalar, and copied dynamic-string arguments;
 - use sink/transport framing to find the end of streamed packets;
 - decode `ON9LOG_PKT_BUFFER` copied memory dump bytes;
-- pass through verified type `0x02` text and printable raw UART text, preserving
-  device-emitted ANSI bytes rather than inferring colors from text prefixes;
+- pass through verified type `0x02` text and printable console text outside
+  transport frames, preserving device-emitted ANSI bytes rather than inferring
+  colors from text prefixes;
 - recognize ESP panic text (`abort() was called`, `Backtrace:`, Guru
   Meditation, assertions, stack canary messages) and annotate crash PCs/backtrace
   entries using the matching ELF/DWARF data when available;

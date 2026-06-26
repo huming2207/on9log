@@ -4,7 +4,7 @@
  *
  * These symbols provide a safe fallback when the target platform does not
  * supply its own implementations.  On ESP-IDF builds (@c ESP_PLATFORM defined)
- * the ESP-specific port file overrides the lock/timestamp stubs; the write,
+ * the ESP-specific port file overrides the lock/timestamp stubs; the
  * ISR-timestamp, ISR-ready, and ISR-enqueue stubs remain weak so that the
  * ESP port layer can supply them as well.
  */
@@ -45,21 +45,6 @@ ON9LOG_WEAK uint32_t on9log_port_timestamp_ms(void)
     return 0;
 }
 #endif
-
-/**
- * @brief Weak default UART / serial byte output.
- *
- * @param[in] data  Pointer to the byte buffer to write.
- * @param[in] len   Number of bytes to write.
- *
- * @note The default is a no-op.  Platforms that enable UART output must
- *       override this symbol.
- */
-ON9LOG_WEAK void on9log_port_write(const uint8_t *data, size_t len)
-{
-    (void)data;
-    (void)len;
-}
 
 /**
  * @brief Weak default ISR-context timestamp in milliseconds.

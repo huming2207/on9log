@@ -32,16 +32,6 @@ uint32_t on9log_port_timestamp_ms(void);
  */
 uint32_t on9log_port_isr_timestamp_ms(void);
 /**
- * @brief Write a byte buffer to the platform's output transport.
- *
- * Used for task-context writes. The implementation must be thread-safe or
- * rely on the caller holding on9log_port_lock().
- *
- * @param[in] data Pointer to the byte buffer to write.
- * @param[in] len  Number of bytes to write.
- */
-void on9log_port_write(const uint8_t *data, size_t len);
-/**
  * @brief Check whether the ISR packet backend is ready to accept a packet.
  *
  * @return true  if the ISR queue/ringbuffer has capacity,

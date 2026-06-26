@@ -8,7 +8,7 @@ The host-side decoder library and CLI tools are at: https://github.com/huming220
 
 `on9log` provides a compact binary packet format for embedded logging, optimized for:
 - fast in-firmware emission with minimal CPU overhead;
-- transport-agnostic forwarding (UART, MQTT, WebSocket);
+- transport-agnostic forwarding (UART, MQTT, WebSocket etc.);
 - small on-flash footprint via ELF-only format strings.
 
 The firmware sends only addresses for format and tag strings. The matching host decoder (separate repo) resolves them from the firmware ELF, parses printf- or `{}`-style format strings, and renders colorized human-readable output.
@@ -17,7 +17,7 @@ The firmware sends only addresses for format and tag strings. The matching host 
 
 ```
 ┌─────────────────────────────────┐
-│  Firmware (C + C++)              │
+│  Firmware (C + C++)             │
 │                                 │
 │  on9log.h / on9log.c            │  Core packet producer
 │  on9log.hpp                     │  C++20 header-only wrapper
@@ -131,6 +131,11 @@ on9log/
 ## Building
 
 On ESP-IDF, add as a standard component (place in `components/` or `EXTRA_COMPONENT_DIRS`). On other platforms, implement the hooks in `on9log_port.h` (see `on9log_port_weak.c` for defaults) and link `on9log.c` directly.
+
+### Code size
+
+Since there's no string formatter needed inside the firmware binary, the whole logging library size is around 8105 bytes on ESP32. 
+It should be even much smaller than other bare metal platforms where no virtual FS layer is needed. 
 
 ## License
 

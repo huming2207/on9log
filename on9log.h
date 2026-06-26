@@ -120,22 +120,14 @@ on9log_err_t on9log_add_sink(const on9log_sink_t *sink, void *ctx);
 on9log_err_t on9log_remove_sink(const on9log_sink_t *sink, void *ctx);
 
 /**
- * @brief Enable or disable direct UART output of raw on9log packets.
+ * @brief Return the pending dropped-packet count.
  *
- * When enabled, every packet is also written to the platform UART transport
- * in addition to being dispatched through registered sinks.
+ * A packet is counted as dropped when the logger cannot encode it or the ISR
+ * ringbuffer cannot accept it. The count is cleared internally when the logger
+ * emits an ON9LOG_PKT_DROPPED notification before a later successful packet.
+ * Calling this function only reads the current pending value.
  *
- * @param[in] enabled true to enable UART output, false to disable.
- */
-void on9log_set_uart_enabled(bool enabled);
-
-/**
- * @brief Return the total number of packets dropped since boot.
- *
- * A packet is counted as dropped when the ISR ringbuffer or the output
- * transport cannot accept it.
- *
- * @return Cumulative dropped-packet count.
+ * @return Pending dropped-packet count.
  */
 uint32_t on9log_get_dropped_count(void);
 
@@ -192,8 +184,7 @@ on9log_err_t on9log_clear_tag_level(const char *tag);
  * @brief Write a formatted log message (task context only).
  *
  * Encodes the level, tag, format string address, argument types and variadic
- * arguments into an on9log packet and dispatches it through registered sinks
- * and the platform output transport.
+ * arguments into an on9log packet and dispatches it through registered sinks.
  *
  * @warning Must not be called from ISR context. Use on9log_write_isr() instead.
  *
@@ -275,7 +266,7 @@ bool on9log_write_isr(on9log_level_t level,
  * @brief Write a raw binary buffer as a log message (task context only).
  *
  * The buffer contents are packed into one or more ON9LOG_PKT_BUFFER packets
- * and dispatched through registered sinks and the platform output transport.
+ * and dispatched through registered sinks.
  *
  * @warning Must not be called from ISR context.
  *

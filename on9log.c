@@ -89,7 +89,6 @@ typedef struct {
  * holding a lock during the entire multi-payload output sequence.
  */
 typedef struct {
-    bool uart_enabled;                    /**< Snapshot of the UART enabled flag. */
     size_t sink_count;                    /**< Number of sinks captured in @ref sinks. */
     on9log_stream_sink_t sinks[ON9LOG_MAX_SINKS]; /**< Captured sink table. */
 } on9log_stream_t;
@@ -135,13 +134,10 @@ static atomic_uint_fast32_t s_active_tag_filter_count = ATOMIC_VAR_INIT(0);
 /** @brief Default minimum log level (applied when no per-tag filter matches). */
 static atomic_int s_default_level = ATOMIC_VAR_INIT(ON9_LOG_LEVEL_VERBOSE);
 
-/** @brief Whether the platform UART output is enabled. */
-static atomic_bool s_uart_enabled = ATOMIC_VAR_INIT(true);
-
 /** @brief Monotonically increasing packet sequence number. */
 static atomic_uint_fast16_t s_seq = ATOMIC_VAR_INIT(0);
 
-/** @brief Count of log packets dropped since last query (ISR-safe). */
+/** @brief Pending dropped-packet count since the last dropped notification. */
 static atomic_uint_fast32_t s_dropped_count = ATOMIC_VAR_INIT(0);
 
 /**
@@ -264,28 +260,11 @@ static size_t on9log_bounded_strlen(const char *str, size_t max_len)
 }
 
 /**
- * @brief Write raw bytes to the platform UART, if UART output is enabled.
- *
- * @param[in] stream  Stream snapshot (used to check the uart_enabled flag).
- * @param[in] data    Pointer to the bytes to write.
- * @param[in] len     Number of bytes to write.
- */
-static void on9log_uart_write(const on9log_stream_t *stream, const uint8_t *data, size_t len)
-{
-    if (!stream->uart_enabled) {
-        return;
-    }
-
-    on9log_port_write(data, len);
-}
-
-/**
  * @brief Begin a new log stream: snapshot sink table and emit the header.
  *
- * Reads the atomic sink table (with acquire ordering) and captures every
- * non-NULL slot into the stream structure.  The UART enabled flag is
- * snapshotted as well.  After the snapshot, the header bytes are sent to
- * UART first, then forwarded to every captured sink's @c start_cb.
+ * Reads the atomic sink table (with acquire ordering), captures every
+ * non-NULL slot into the stream structure, and forwards the header bytes to
+ * every captured sink's @c start_cb.
  *
  * @param[out] stream      Stream state to initialise.
  * @param[in]  header      Packet header bytes.
@@ -293,7 +272,6 @@ static void on9log_uart_write(const on9log_stream_t *stream, const uint8_t *data
  */
 static void on9log_stream_start(on9log_stream_t *stream, const uint8_t *header, size_t header_len)
 {
-    stream->uart_enabled = atomic_load_explicit(&s_uart_enabled, memory_order_relaxed);
     stream->sink_count = 0;
 
     for (size_t i = 0; i < ON9LOG_MAX_SINKS; ++i) {
@@ -306,8 +284,6 @@ static void on9log_stream_start(on9log_stream_t *stream, const uint8_t *header, 
         }
     }
 
-    on9log_uart_write(stream, header, header_len);
-
     for (size_t i = 0; i < stream->sink_count; ++i) {
         stream->sinks[i].sink->start_cb(header, header_len, stream->sinks[i].ctx);
     }
@@ -316,8 +292,7 @@ static void on9log_stream_start(on9log_stream_t *stream, const uint8_t *header, 
 /**
  * @brief Emit a payload chunk through the current stream.
  *
- * The payload bytes are written to UART (if enabled) and then forwarded to
- * every captured sink's @c payload_cb.
+ * The payload bytes are forwarded to every captured sink's @c payload_cb.
  *
  * @param[in] stream          Stream snapshot.
  * @param[in] payload         Pointer to the payload bytes.
@@ -334,8 +309,6 @@ static void on9log_stream_payload(on9log_stream_t *stream,
     if (payload_len == 0) {
         return;
     }
-
-    on9log_uart_write(stream, payload, payload_len);
 
     for (size_t i = 0; i < stream->sink_count; ++i) {
         stream->sinks[i].sink->payload_cb(payload, payload_len, total_arg_cnt, curr_arg_index, stream->sinks[i].ctx);
@@ -1019,23 +992,10 @@ on9log_err_t on9log_remove_sink(const on9log_sink_t *sink, void *ctx)
 }
 
 /**
- * @brief Enable or disable the platform UART output.
+ * @brief Read the pending dropped-packet counter.
  *
- * When disabled, the stream still forwards data to registered sinks; only
- * the direct UART write (via @ref on9log_port_write) is skipped.
- *
- * @param[in] enabled  @c true to enable UART output, @c false to disable.
- */
-void on9log_set_uart_enabled(bool enabled)
-{
-    atomic_store_explicit(&s_uart_enabled, enabled, memory_order_relaxed);
-}
-
-/**
- * @brief Read and reset the dropped-packet counter.
- *
- * @return The number of packets dropped since the last call to this function
- *         (or since system initialisation).
+ * @return The number of packets dropped since the last emitted dropped-packet
+ *         notification, or since system initialisation if none has been emitted.
  */
 uint32_t on9log_get_dropped_count(void)
 {
