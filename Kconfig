@@ -36,6 +36,15 @@ menu "on9log"
         default 4 if ON9LOG_MAXIMUM_LEVEL_DEBUG
         default 5 if ON9LOG_MAXIMUM_LEVEL_VERBOSE
 
+    config ON9LOG_PLAIN_TEXT
+        bool "Output plain text log instead of binary log"
+        default n
+        help
+            If this option is enabled, then all output will be plain text
+            instead of binary encoded log. All the format string and log tag
+            string will be placed into .rodata instead of .noload. This only
+            recommended for debug builds.
+
     config ON9LOG_MAX_SINKS
         int "Maximum on9log sinks"
         range 1 16
