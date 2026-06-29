@@ -36,6 +36,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "on9log_config.h"
 
 /** @brief VFS device path for the log transport. */
 #define ESP_STDIO_LOG_VFS_PATH "/dev/logger"
@@ -440,6 +441,48 @@ esp_err_t esp_stdio_log_vfs_write_frame(uint8_t type, const uint8_t *payload, si
     return writer.ok ? ESP_OK : ESP_FAIL;
 }
 
+esp_err_t esp_stdio_log_vfs_raw_stream_begin(void)
+{
+    TaskHandle_t self = xTaskGetCurrentTaskHandle();
+    if (__atomic_load_n(&s_transport_owner, __ATOMIC_ACQUIRE) == self) {
+        return ESP_FAIL;
+    }
+
+    esp_stdio_log_vfs_transport_lock();
+    __atomic_store_n(&s_transport_owner, self, __ATOMIC_RELEASE);
+    return ESP_OK;
+}
+
+esp_err_t esp_stdio_log_vfs_raw_stream_write(const uint8_t *data, size_t len)
+{
+    if (data == NULL && len != 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (__atomic_load_n(&s_transport_owner, __ATOMIC_ACQUIRE) != xTaskGetCurrentTaskHandle()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    bool ok = true;
+    for (size_t i = 0; i < s_esp_stdio_log_vfs.output_count; ++i) {
+        if (s_esp_stdio_log_vfs.outputs[i] >= 0 &&
+            !esp_stdio_log_vfs_write_all(s_esp_stdio_log_vfs.outputs[i], data, len)) {
+            ok = false;
+        }
+    }
+    return ok ? ESP_OK : ESP_FAIL;
+}
+
+esp_err_t esp_stdio_log_vfs_raw_stream_end(void)
+{
+    if (__atomic_load_n(&s_transport_owner, __ATOMIC_ACQUIRE) != xTaskGetCurrentTaskHandle()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    __atomic_store_n(&s_transport_owner, NULL, __ATOMIC_RELEASE);
+    esp_stdio_log_vfs_transport_unlock();
+    return ESP_OK;
+}
+
 /**
  * @brief Add a file-system path as a transport output for log frames.
  *
@@ -492,7 +535,9 @@ esp_err_t esp_stdio_log_vfs_add_output(const char *path)
 static ssize_t esp_stdio_log_vfs_write(void *ctx, int fd, const void *data, size_t size)
 {
     const uint8_t *bytes = (const uint8_t *)data;
+#if !ON9LOG_PLAIN_TEXT
     esp_err_t err = ESP_OK;
+#endif
     (void)fd;
     (void)ctx;
 
@@ -500,6 +545,14 @@ static ssize_t esp_stdio_log_vfs_write(void *ctx, int fd, const void *data, size
         return -1;
     }
 
+#if ON9LOG_PLAIN_TEXT
+    if (esp_stdio_log_vfs_raw_stream_begin() != ESP_OK) {
+        return -1;
+    }
+    esp_err_t write_err = esp_stdio_log_vfs_raw_stream_write(bytes, size);
+    esp_err_t end_err = esp_stdio_log_vfs_raw_stream_end();
+    return write_err == ESP_OK && end_err == ESP_OK ? (ssize_t)size : -1;
+#else
     size_t remaining = size;
     while (remaining != 0) {
         size_t chunk_len = remaining;
@@ -519,6 +572,7 @@ static ssize_t esp_stdio_log_vfs_write(void *ctx, int fd, const void *data, size
     }
 
     return (ssize_t)size;
+#endif
 }
 
 /**

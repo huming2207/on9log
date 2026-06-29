@@ -18,6 +18,12 @@
 #include <tuple>
 #include <type_traits>
 
+#if ON9LOG_PLAIN_TEXT
+#include <fmt/format.h>
+
+#include <iterator>
+#endif
+
 /**
  * @brief  Macro to annotate a format string literal with the appropriate
  *         section attribute for flash placement.
@@ -29,7 +35,11 @@
  * @param str  A string literal to annotate.
  */
 #ifndef ON9FMT
+#if ON9LOG_PLAIN_TEXT
+#define ON9FMT(str) (str)
+#else
 #define ON9FMT(str) ON9_LOG_ATTR_STR(str)
+#endif
 #endif
 
 /**
@@ -98,7 +108,11 @@ struct fixed_string {
  * @tparam Format  A @ref fixed_string NTTP containing the format literal.
  */
 template <fixed_string Format>
+#if ON9LOG_PLAIN_TEXT
+inline constexpr auto noload_format_storage __attribute__((used)) = Format;
+#else
 inline constexpr auto noload_format_storage ON9_LOG_NOLOAD_ATTR __attribute__((used)) = Format;
+#endif
 
 /**
  * @brief  Return a pointer to the noload-stored format string.
@@ -426,6 +440,198 @@ constexpr bool level_enabled(on9log_level_t level) noexcept
     return level != ON9_LOG_LEVEL_NONE && level <= ON9_LOG_LOCAL_LEVEL;
 }
 
+#if ON9LOG_PLAIN_TEXT
+class text_output_container {
+public:
+    using value_type = char;
+
+    text_output_container(on9log_text_output_cb_t output, void *ctx) noexcept
+        : output_(output), ctx_(ctx)
+    {
+    }
+
+    void push_back(char value)
+    {
+        output_(&value, 1, ctx_);
+    }
+
+    void append(const char *begin, const char *end)
+    {
+        output_(begin, static_cast<std::size_t>(end - begin), ctx_);
+    }
+
+private:
+    on9log_text_output_cb_t output_;
+    void *ctx_;
+};
+
+template <typename T>
+decltype(auto) plain_text_arg(T &&value)
+{
+    using Raw = raw_t<T>;
+
+    if constexpr (is_char_pointer_v<T> || is_char_array_v<T> || is_string_view_arg_v<T>) {
+        return static_cast<T &&>(value);
+    } else if constexpr (std::is_array_v<Raw>) {
+        return fmt::ptr(static_cast<const void *>(value));
+    } else if constexpr (std::is_null_pointer_v<Raw>) {
+        return static_cast<const void *>(nullptr);
+    } else if constexpr (std::is_pointer_v<Raw>) {
+        static_assert(is_supported_pointer_v<T>,
+                      "on9log C++ wrapper supports object pointers only; cast explicitly if needed");
+        return fmt::ptr(value);
+    } else if constexpr (std::is_enum_v<Raw>) {
+        return fmt::underlying(value);
+    } else {
+        return static_cast<T &&>(value);
+    }
+}
+
+constexpr bool has_fmt_replacement(const char *format) noexcept
+{
+    if (format == nullptr) {
+        return false;
+    }
+    for (const char *p = format; *p != '\0'; ++p) {
+        if (*p != '{') {
+            continue;
+        }
+        if (p[1] == '{') {
+            ++p;
+            continue;
+        }
+        const char next = p[1];
+        if (next == '}' || next == ':' || next == '_' ||
+            (next >= '0' && next <= '9') ||
+            (next >= 'A' && next <= 'Z') ||
+            (next >= 'a' && next <= 'z')) {
+            return true;
+        }
+    }
+    return false;
+}
+
+constexpr bool has_printf_conversion(const char *format) noexcept
+{
+    if (format == nullptr) {
+        return false;
+    }
+    for (const char *p = format; *p != '\0'; ++p) {
+        if (*p != '%') {
+            continue;
+        }
+        ++p;
+        if (*p == '%') {
+            return true;
+        }
+        while (*p == '-' || *p == '+' || *p == ' ' || *p == '#' ||
+               *p == '0' || *p == '\'') {
+            ++p;
+        }
+        if (*p == '*') {
+            ++p;
+        } else {
+            while (*p >= '0' && *p <= '9') {
+                ++p;
+            }
+        }
+        if (*p == '.') {
+            ++p;
+            if (*p == '*') {
+                ++p;
+            } else {
+                while (*p >= '0' && *p <= '9') {
+                    ++p;
+                }
+            }
+        }
+        if (*p == 'h' && p[1] == 'h') {
+            p += 2;
+        } else if (*p == 'l' && p[1] == 'l') {
+            p += 2;
+        } else if (*p == 'h' || *p == 'l' || *p == 'j' || *p == 'z' ||
+                   *p == 't' || *p == 'L') {
+            ++p;
+        }
+        switch (*p) {
+        case 'd':
+        case 'i':
+        case 'o':
+        case 'u':
+        case 'x':
+        case 'X':
+        case 'f':
+        case 'F':
+        case 'e':
+        case 'E':
+        case 'g':
+        case 'G':
+        case 'a':
+        case 'A':
+        case 'c':
+        case 's':
+        case 'p':
+        case 'n':
+            return true;
+        default:
+            break;
+        }
+        if (*p == '\0') {
+            break;
+        }
+    }
+    return false;
+}
+
+constexpr bool uses_printf_format(const char *format) noexcept
+{
+    return !has_fmt_replacement(format) && has_printf_conversion(format);
+}
+
+template <typename T>
+inline constexpr bool is_printf_arg_v =
+    std::is_arithmetic_v<raw_t<T>> ||
+    std::is_enum_v<raw_t<T>> ||
+    std::is_pointer_v<raw_t<T>> ||
+    std::is_array_v<raw_t<T>> ||
+    std::is_null_pointer_v<raw_t<T>>;
+
+template <typename T>
+decltype(auto) printf_arg(T &&value)
+{
+    using Raw = raw_t<T>;
+    if constexpr (std::is_enum_v<Raw>) {
+        return static_cast<std::underlying_type_t<Raw>>(value);
+    } else if constexpr (std::is_null_pointer_v<Raw>) {
+        return static_cast<const void *>(nullptr);
+    } else {
+        return static_cast<T &&>(value);
+    }
+}
+
+template <typename... Args>
+struct text_format_context {
+    const char *format;
+    std::tuple<Args...> args;
+};
+
+template <typename... Args>
+void format_text(on9log_text_output_cb_t output,
+                 void *output_ctx,
+                 void *formatter_ctx)
+{
+    auto &ctx = *static_cast<text_format_context<Args...> *>(formatter_ctx);
+    text_output_container container(output, output_ctx);
+    std::apply(
+        [&](auto &&...values) {
+            fmt::format_to(std::back_inserter(container),
+                           fmt::runtime(ctx.format != nullptr ? ctx.format : ""),
+                           plain_text_arg(static_cast<decltype(values) &&>(values))...);
+        },
+        ctx.args);
+}
+#endif
+
 /**
  * @brief  Write a log message (plain format-string overload).
  *
@@ -436,18 +642,36 @@ constexpr bool level_enabled(on9log_level_t level) noexcept
  * @tparam Level  The on9log severity level.
  * @tparam Args   Argument types (inferred from the actual arguments).
  * @param tag     Tag string (typically the Logger's tag).
- * @param format  printf-style format string (in flash / .rodata).
+ * @param format  fmt-style or printf-style format string.
  * @param args    The variadic arguments to encode.
  */
 template <on9log_level_t Level, typename... Args>
 void write_log(const char *tag, const char *format, Args &&...args) noexcept
 {
     if constexpr (level_enabled(Level)) {
+#if ON9LOG_PLAIN_TEXT
+        if constexpr ((is_printf_arg_v<Args> && ...)) {
+            if (uses_printf_format(format)) {
+                on9log_write(Level,
+                             tag,
+                             format,
+                             NULL,
+                             printf_arg(static_cast<Args &&>(args))...);
+                return;
+            }
+        }
+        text_format_context<Args &&...> ctx = {
+            format,
+            std::forward_as_tuple(static_cast<Args &&>(args)...),
+        };
+        on9log_write_text(Level, tag, format_text<Args &&...>, &ctx);
+#else
         with_wire_args(
             [&](auto... packed_args) {
                 on9log_write(Level, tag, format, arg_types<Args...>(), packed_args...);
             },
             static_cast<Args &&>(args)...);
+#endif
     }
 }
 
@@ -500,11 +724,29 @@ bool write_log_isr(const char *tag, const char *format, Args &&...args) noexcept
                       "on9log ISR logging does not support dynamic string arguments");
         static_assert(((arg_type_code<Args>() != static_cast<char>(ON9_LOG_ARGS_TYPE_DYNAMIC_STRING_VIEW)) && ...),
                       "on9log ISR logging does not support dynamic string arguments");
+#if ON9LOG_PLAIN_TEXT
+        if constexpr ((is_printf_arg_v<Args> && ...)) {
+            if (uses_printf_format(format)) {
+                return on9log_write_isr(Level,
+                                        tag,
+                                        format,
+                                        arg_types<Args...>(),
+                                        printf_arg(static_cast<Args &&>(args))...);
+            }
+        }
+        char text[ON9LOG_ISR_PACKET_MAX];
+        auto result = fmt::format_to_n(text,
+                                       sizeof(text),
+                                       fmt::runtime(format != nullptr ? format : ""),
+                                       plain_text_arg(static_cast<Args &&>(args))...);
+        return on9log_write_text_isr(Level, tag, text, result.size);
+#else
         return with_wire_args(
             [&](auto... packed_args) {
                 return on9log_write_isr(Level, tag, format, arg_types<Args...>(), packed_args...);
             },
             static_cast<Args &&>(args)...);
+#endif
     }
 }
 

@@ -9,6 +9,20 @@
 #endif
 
 /**
+ * @brief Select plain-text rather than binary packet output.
+ *
+ * In ESP-IDF builds this follows CONFIG_ON9LOG_PLAIN_TEXT. It can also be
+ * overridden directly for non-IDF builds.
+ */
+#ifndef ON9LOG_PLAIN_TEXT
+#ifdef CONFIG_ON9LOG_PLAIN_TEXT
+#define ON9LOG_PLAIN_TEXT CONFIG_ON9LOG_PLAIN_TEXT
+#else
+#define ON9LOG_PLAIN_TEXT 0
+#endif
+#endif
+
+/**
  * @brief Compile-time maximum log level for this translation unit.
  *
  * Log statements whose level exceeds this value are compiled out entirely.

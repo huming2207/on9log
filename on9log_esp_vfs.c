@@ -2,9 +2,9 @@
  * @file on9log_esp_vfs.c
  * @brief ESP VFS sink implementation for on9log.
  *
- * Implements an @ref on9log_sink_t that collects log-frame payloads into a
- * local buffer and writes a complete SLIP-encoded frame via the
- * @ref esp_stdio_log_vfs transport layer when the sink's @c end_cb is called.
+ * In binary mode this sink collects one packet and writes a SLIP/CRC frame.
+ * In plain-text mode it forwards payload chunks directly through a serialized
+ * raw transport stream.
  */
 
 #include "on9log_esp_vfs.h"
@@ -26,16 +26,24 @@
  */
 typedef struct {
     bool installed;                                           /**< @c true once @ref on9log_esp_vfs_init completes. */
+#if ON9LOG_PLAIN_TEXT
+    bool raw_stream_active;                                   /**< Raw transport stream is held for this log record. */
+#else
     bool overflow;                                            /**< @c true when the local buffer has overrun this frame. */
     size_t len;                                               /**< Number of valid bytes currently in @ref data. */
     uint8_t data[ESP_STDIO_LOG_VFS_FRAME_MAX_PAYLOAD];        /**< Accumulation buffer for the current frame. */
+#endif
 } on9log_esp_vfs_t;
 
 /** @brief Singleton VFS sink state. */
 static on9log_esp_vfs_t s_on9log_esp_vfs = {
     .installed = false,
+#if ON9LOG_PLAIN_TEXT
+    .raw_stream_active = false,
+#else
     .overflow = false,
     .len = 0,
+#endif
 };
 
 /** @brief Dedicated sink mutex protecting the singleton accumulator buffer.
@@ -57,6 +65,7 @@ static StaticSemaphore_t s_sink_mutex_storage;
  * @param[in] data  Pointer to the bytes to append.
  * @param[in] len   Number of bytes to append.
  */
+#if !ON9LOG_PLAIN_TEXT
 static void on9log_esp_vfs_append(const uint8_t *data, size_t len)
 {
     if (s_on9log_esp_vfs.overflow) {
@@ -70,6 +79,7 @@ static void on9log_esp_vfs_append(const uint8_t *data, size_t len)
         s_on9log_esp_vfs.data[s_on9log_esp_vfs.len++] = data[i];
     }
 }
+#endif
 
 /**
  * @brief Sink @c start_cb: begin a new log frame.
@@ -89,9 +99,16 @@ static void on9log_esp_vfs_start(const uint8_t *header, size_t header_len, void 
     if (s_sink_mutex != NULL) {
         xSemaphoreTake(s_sink_mutex, portMAX_DELAY);
     }
+#if ON9LOG_PLAIN_TEXT
+    (void)header;
+    (void)header_len;
+    s_on9log_esp_vfs.raw_stream_active =
+        esp_stdio_log_vfs_raw_stream_begin() == ESP_OK;
+#else
     s_on9log_esp_vfs.overflow = false;
     s_on9log_esp_vfs.len = 0;
     on9log_esp_vfs_append(header, header_len);
+#endif
 }
 
 /**
@@ -113,7 +130,13 @@ static void on9log_esp_vfs_payload(const uint8_t *payload,
     (void)curr_arg_index;
     (void)ctx;
 
+#if ON9LOG_PLAIN_TEXT
+    if (s_on9log_esp_vfs.raw_stream_active) {
+        (void)esp_stdio_log_vfs_raw_stream_write(payload, payload_len);
+    }
+#else
     on9log_esp_vfs_append(payload, payload_len);
+#endif
 }
 
 /**
@@ -130,11 +153,18 @@ static void on9log_esp_vfs_end(void *ctx)
 {
     (void)ctx;
 
+#if ON9LOG_PLAIN_TEXT
+    if (s_on9log_esp_vfs.raw_stream_active) {
+        (void)esp_stdio_log_vfs_raw_stream_end();
+        s_on9log_esp_vfs.raw_stream_active = false;
+    }
+#else
     if (!s_on9log_esp_vfs.overflow) {
         (void)esp_stdio_log_vfs_write_frame(ESP_STDIO_LOG_VFS_FRAME_TYPE_ON9LOG,
                                             s_on9log_esp_vfs.data,
                                             s_on9log_esp_vfs.len);
     }
+#endif
     if (s_sink_mutex != NULL) {
         xSemaphoreGive(s_sink_mutex);
     }
@@ -192,6 +222,11 @@ esp_err_t on9log_esp_vfs_init(void)
         return ESP_OK;
     }
 
+    on9log_err_t on9_err = on9log_init();
+    if (on9_err != ON9LOG_OK) {
+        return on9log_esp_vfs_to_esp_err(on9_err);
+    }
+
     if (s_sink_mutex == NULL) {
         s_sink_mutex = xSemaphoreCreateMutexStatic(&s_sink_mutex_storage);
         if (s_sink_mutex == NULL) {
@@ -204,7 +239,7 @@ esp_err_t on9log_esp_vfs_init(void)
         return err;
     }
 
-    on9log_err_t on9_err = on9log_add_sink(&s_on9log_esp_vfs_sink, &s_on9log_esp_vfs);
+    on9_err = on9log_add_sink(&s_on9log_esp_vfs_sink, &s_on9log_esp_vfs);
     if (on9_err != ON9LOG_OK) {
         return on9log_esp_vfs_to_esp_err(on9_err);
     }

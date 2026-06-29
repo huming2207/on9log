@@ -1,3 +1,7 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 /**
  * @file on9log.c
  * @brief Core implementation of the on9log logging library.
@@ -27,6 +31,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/queue.h>
+
+#if ON9LOG_PLAIN_TEXT
+#include <stdio.h>
+#include <sys/types.h>
+#endif
 
 #include "on9log_config.h"
 #include "on9log_fmt.h"
@@ -196,6 +205,21 @@ static void on9log_put_u64(on9log_encoder_t *enc, uint64_t val)
     on9log_put_u32(enc, (uint32_t)(val >> 32u));
 }
 
+static void on9log_put_bytes(on9log_encoder_t *enc, const void *data, size_t len)
+{
+    const uint8_t *bytes = (const uint8_t *)data;
+
+    if (len == 0) {
+        return;
+    }
+    if (len > enc->cap - enc->len) {
+        enc->overflow = true;
+        return;
+    }
+    memcpy(&enc->data[enc->len], bytes, len);
+    enc->len += len;
+}
+
 /**
  * @brief Look up the argument type at a given index.
  *
@@ -267,8 +291,8 @@ static size_t on9log_bounded_strlen(const char *str, size_t max_len)
  * every captured sink's @c start_cb.
  *
  * @param[out] stream      Stream state to initialise.
- * @param[in]  header      Packet header bytes.
- * @param[in]  header_len  Length of the header (must equal @c sizeof(on9log_packet_header_t)).
+ * @param[in]  header      Packet header bytes, or NULL for plain text.
+ * @param[in]  header_len  Header length, or zero for plain text.
  */
 static void on9log_stream_start(on9log_stream_t *stream, const uint8_t *header, size_t header_len)
 {
@@ -326,6 +350,116 @@ static void on9log_stream_end(on9log_stream_t *stream)
         stream->sinks[i].sink->end_cb(stream->sinks[i].ctx);
     }
 }
+
+#if ON9LOG_PLAIN_TEXT
+#define ON9LOG_ANSI_RED     "\033[0;31m"
+#define ON9LOG_ANSI_GREEN   "\033[0;32m"
+#define ON9LOG_ANSI_YELLOW  "\033[0;33m"
+#define ON9LOG_ANSI_CYAN    "\033[0;36m"
+#define ON9LOG_ANSI_WHITE   "\033[0;37m"
+#define ON9LOG_ANSI_RESET   "\033[0m"
+
+static void on9log_text_stream_output(const char *data, size_t len, void *ctx)
+{
+    on9log_stream_payload((on9log_stream_t *)ctx,
+                          (const uint8_t *)data,
+                          len,
+                          0,
+                          ON9LOG_PAYLOAD_META_ARG_INDEX);
+}
+
+static void on9log_text_encoder_output(const char *data, size_t len, void *ctx)
+{
+    on9log_put_bytes((on9log_encoder_t *)ctx, data, len);
+}
+
+static const char *on9log_text_level_color(on9log_level_t level)
+{
+    switch (level) {
+    case ON9_LOG_LEVEL_ERROR:
+        return ON9LOG_ANSI_RED;
+    case ON9_LOG_LEVEL_WARN:
+        return ON9LOG_ANSI_YELLOW;
+    case ON9_LOG_LEVEL_INFO:
+        return ON9LOG_ANSI_GREEN;
+    case ON9_LOG_LEVEL_DEBUG:
+        return ON9LOG_ANSI_CYAN;
+    case ON9_LOG_LEVEL_VERBOSE:
+    default:
+        return ON9LOG_ANSI_WHITE;
+    }
+}
+
+static char on9log_text_level_letter(on9log_level_t level)
+{
+    static const char letters[] = "?EWIDV";
+    return (level >= ON9_LOG_LEVEL_ERROR && level <= ON9_LOG_LEVEL_VERBOSE)
+               ? letters[level]
+               : '?';
+}
+
+static void on9log_text_output_u32(on9log_text_output_cb_t output,
+                                   void *output_ctx,
+                                   uint32_t value)
+{
+    char digits[10];
+    size_t len = 0;
+
+    do {
+        digits[len++] = (char)('0' + (value % 10u));
+        value /= 10u;
+    } while (value != 0u);
+
+    for (size_t left = 0, right = len - 1; left < right; ++left, --right) {
+        char tmp = digits[left];
+        digits[left] = digits[right];
+        digits[right] = tmp;
+    }
+    output(digits, len, output_ctx);
+}
+
+static void on9log_text_output_prefix(on9log_text_output_cb_t output,
+                                      void *output_ctx,
+                                      on9log_level_t level,
+                                      uint32_t timestamp_ms,
+                                      const char *tag)
+{
+    const char *color = on9log_text_level_color(level);
+    const char level_letter = on9log_text_level_letter(level);
+    const char *safe_tag = tag != NULL ? tag : "";
+
+    output(color, strlen(color), output_ctx);
+    output(&level_letter, sizeof(level_letter), output_ctx);
+    output(" (", 2, output_ctx);
+    on9log_text_output_u32(output, output_ctx, timestamp_ms);
+    output(") ", 2, output_ctx);
+    output(safe_tag, strlen(safe_tag), output_ctx);
+    output(": ", 2, output_ctx);
+}
+
+static void on9log_text_output_suffix(on9log_text_output_cb_t output, void *output_ctx)
+{
+    static const char suffix[] = ON9LOG_ANSI_RESET "\n";
+    output(suffix, sizeof(suffix) - 1u, output_ctx);
+}
+
+static void on9log_dispatch_text_line(on9log_level_t level,
+                                      const char *tag,
+                                      uint32_t timestamp_ms,
+                                      on9log_text_formatter_cb_t formatter,
+                                      void *formatter_ctx)
+{
+    on9log_stream_t stream = {0};
+
+    on9log_stream_start(&stream, NULL, 0);
+    on9log_text_output_prefix(on9log_text_stream_output, &stream, level, timestamp_ms, tag);
+    if (formatter != NULL) {
+        formatter(on9log_text_stream_output, &stream, formatter_ctx);
+    }
+    on9log_text_output_suffix(on9log_text_stream_output, &stream);
+    on9log_stream_end(&stream);
+}
+#endif
 
 /**
  * @brief Emit the contents of an encoder as a payload chunk (if no overflow).
@@ -777,13 +911,37 @@ static bool on9log_encode_isr_log_packet(uint8_t *packet,
  *
  * @param[in] dropped_count  Number of packets dropped.
  */
+#if ON9LOG_PLAIN_TEXT
+typedef struct {
+    uint32_t count;
+} on9log_dropped_text_ctx_t;
+
+static void on9log_dropped_text_formatter(on9log_text_output_cb_t output,
+                                          void *output_ctx,
+                                          void *formatter_ctx)
+{
+    const on9log_dropped_text_ctx_t *ctx = (const on9log_dropped_text_ctx_t *)formatter_ctx;
+    on9log_text_output_u32(output, output_ctx, ctx->count);
+    output(" log message(s) dropped", sizeof(" log message(s) dropped") - 1u, output_ctx);
+}
+#endif
+
 static void on9log_emit_dropped_packet(uint32_t dropped_count)
 {
+#if ON9LOG_PLAIN_TEXT
+    on9log_dropped_text_ctx_t ctx = {.count = dropped_count};
+    on9log_dispatch_text_line(ON9_LOG_LEVEL_WARN,
+                              "on9log",
+                              on9log_port_timestamp_ms(),
+                              on9log_dropped_text_formatter,
+                              &ctx);
+#else
     on9log_stream_t stream = {0};
 
     on9log_emit_header(&stream, ON9LOG_PKT_DROPPED, ON9_LOG_LEVEL_NONE, 0, 0, sizeof(uint32_t));
     on9log_emit_u32(&stream, dropped_count, 1, 0);
     on9log_stream_end(&stream);
+#endif
 }
 
 /**
@@ -917,6 +1075,30 @@ static bool on9log_level_enabled(on9log_level_t level, const char *tag)
     }
     return level <= runtime_level;
 }
+
+#if ON9LOG_PLAIN_TEXT
+void on9log_write_text(on9log_level_t level,
+                       const char *tag,
+                       on9log_text_formatter_cb_t formatter,
+                       void *formatter_ctx)
+{
+    if (!on9log_level_enabled(level, tag)) {
+        return;
+    }
+
+    uint32_t dropped_count =
+        (uint32_t)atomic_exchange_explicit(&s_dropped_count, 0, memory_order_acq_rel);
+    if (dropped_count != 0) {
+        on9log_emit_dropped_packet(dropped_count);
+    }
+
+    on9log_dispatch_text_line(level,
+                              tag,
+                              on9log_port_timestamp_ms(),
+                              formatter,
+                              formatter_ctx);
+}
+#endif
 
 /**
  * @brief Register a log sink.
@@ -1136,24 +1318,39 @@ on9log_err_t on9log_dispatch_packet(const uint8_t *packet, size_t packet_len)
     uint32_t dropped_count = 0;
     on9log_stream_t stream = {0};
 
+#if ON9LOG_PLAIN_TEXT
+    if (packet == NULL || packet_len == 0) {
+        return ON9LOG_ERR_INVALID_ARG;
+    }
+#else
     if (packet == NULL || packet_len < sizeof(on9log_packet_header_t)) {
         return ON9LOG_ERR_INVALID_ARG;
     }
     if (packet[0] != ON9LOG_PACKET_MAGIC) {
         return ON9LOG_ERR_INVALID_ARG;
     }
+#endif
 
     dropped_count = (uint32_t)atomic_exchange_explicit(&s_dropped_count, 0, memory_order_acq_rel);
     if (dropped_count != 0) {
         on9log_emit_dropped_packet(dropped_count);
     }
 
+#if ON9LOG_PLAIN_TEXT
+    on9log_stream_start(&stream, NULL, 0);
+    on9log_stream_payload(&stream,
+                          packet,
+                          packet_len,
+                          0,
+                          ON9LOG_PAYLOAD_META_ARG_INDEX);
+#else
     on9log_stream_start(&stream, packet, sizeof(on9log_packet_header_t));
     on9log_stream_payload(&stream,
                           &packet[sizeof(on9log_packet_header_t)],
                           packet_len - sizeof(on9log_packet_header_t),
                           0,
                           ON9LOG_PAYLOAD_META_ARG_INDEX);
+#endif
     on9log_stream_end(&stream);
 
     return ON9LOG_OK;
@@ -1255,6 +1452,111 @@ static on9log_arg_mask_t on9log_mark_precision_string_args(const char *format, s
     return mask;
 }
 
+#if ON9LOG_PLAIN_TEXT
+#if defined(ESP_PLATFORM) || defined(__APPLE__) || defined(__FreeBSD__) || \
+    defined(__NetBSD__) || defined(__OpenBSD__)
+#define ON9LOG_USE_FUNOPEN 1
+#else
+#define ON9LOG_USE_FUNOPEN 0
+#endif
+
+typedef struct {
+    on9log_text_output_cb_t output;
+    void *output_ctx;
+} on9log_printf_cookie_t;
+
+typedef struct {
+    const char *format;
+    va_list *args;
+} on9log_printf_formatter_ctx_t;
+
+static on9log_printf_cookie_t s_on9log_printf_cookie;
+static atomic_uintptr_t s_on9log_printf_stream = ATOMIC_VAR_INIT((uintptr_t)NULL);
+
+#if ON9LOG_USE_FUNOPEN
+static int on9log_printf_cookie_write(void *cookie, const char *data, int len)
+{
+    on9log_printf_cookie_t *stream = (on9log_printf_cookie_t *)cookie;
+    stream->output(data, (size_t)len, stream->output_ctx);
+    return len;
+}
+#else
+static ssize_t on9log_printf_cookie_write(void *cookie, const char *data, size_t len)
+{
+    on9log_printf_cookie_t *stream = (on9log_printf_cookie_t *)cookie;
+    stream->output(data, len, stream->output_ctx);
+    return (ssize_t)len;
+}
+#endif
+
+on9log_err_t on9log_init(void)
+{
+    if (atomic_load_explicit(&s_on9log_printf_stream, memory_order_acquire) != (uintptr_t)NULL) {
+        return ON9LOG_OK;
+    }
+
+    on9log_port_lock();
+    if (atomic_load_explicit(&s_on9log_printf_stream, memory_order_relaxed) != (uintptr_t)NULL) {
+        on9log_port_unlock();
+        return ON9LOG_OK;
+    }
+
+#if ON9LOG_USE_FUNOPEN
+    FILE *stream = funopen(&s_on9log_printf_cookie,
+                           NULL,
+                           on9log_printf_cookie_write,
+                           NULL,
+                           NULL);
+#else
+    cookie_io_functions_t functions = {
+        .read = NULL,
+        .write = on9log_printf_cookie_write,
+        .seek = NULL,
+        .close = NULL,
+    };
+    FILE *stream = fopencookie(&s_on9log_printf_cookie, "w", functions);
+#endif
+    if (stream == NULL) {
+        on9log_port_unlock();
+        return ON9LOG_ERR_NO_MEM;
+    }
+    if (setvbuf(stream, NULL, _IONBF, 0) != 0) {
+        (void)fclose(stream);
+        on9log_port_unlock();
+        return ON9LOG_ERR_FAIL;
+    }
+
+    atomic_store_explicit(&s_on9log_printf_stream, (uintptr_t)stream, memory_order_release);
+    on9log_port_unlock();
+    return ON9LOG_OK;
+}
+
+static void on9log_printf_formatter(on9log_text_output_cb_t output,
+                                    void *output_ctx,
+                                    void *formatter_ctx)
+{
+    on9log_printf_formatter_ctx_t *format = (on9log_printf_formatter_ctx_t *)formatter_ctx;
+    FILE *stream = (FILE *)atomic_load_explicit(&s_on9log_printf_stream, memory_order_acquire);
+    if (stream == NULL) {
+        return;
+    }
+
+    flockfile(stream);
+    s_on9log_printf_cookie.output = output;
+    s_on9log_printf_cookie.output_ctx = output_ctx;
+    (void)vfprintf(stream, format->format != NULL ? format->format : "", *format->args);
+    (void)fflush(stream);
+    s_on9log_printf_cookie.output = NULL;
+    s_on9log_printf_cookie.output_ctx = NULL;
+    funlockfile(stream);
+}
+#else
+on9log_err_t on9log_init(void)
+{
+    return ON9LOG_OK;
+}
+#endif
+
 static void on9log_vwrite(on9log_level_t level,
                           const char *tag,
                           const char *format,
@@ -1264,6 +1566,25 @@ static void on9log_vwrite(on9log_level_t level,
                           bool has_dynamic_string,
                           va_list *args)
 {
+#if ON9LOG_PLAIN_TEXT
+    (void)format_scan;
+    (void)arg_types;
+    (void)arg_count;
+    (void)has_dynamic_string;
+
+    if (atomic_load_explicit(&s_on9log_printf_stream, memory_order_acquire) == (uintptr_t)NULL) {
+        if (on9log_level_enabled(level, tag)) {
+            atomic_fetch_add_explicit(&s_dropped_count, 1, memory_order_relaxed);
+        }
+        return;
+    }
+
+    on9log_printf_formatter_ctx_t formatter_ctx = {
+        .format = format,
+        .args = args,
+    };
+    on9log_write_text(level, tag, on9log_printf_formatter, &formatter_ctx);
+#else
     uint32_t dropped_count = 0;
     on9log_stream_t stream = {0};
 
@@ -1293,6 +1614,7 @@ static void on9log_vwrite(on9log_level_t level,
     }
     on9log_emit_payload_args(&stream, arg_types, precision_string_arg_mask, args, arg_count);
     on9log_stream_end(&stream);
+#endif
 }
 
 /**
@@ -1382,12 +1704,78 @@ void on9log_write_with_format_scan_metadata(on9log_level_t level,
  * @return @c true if the packet was successfully enqueued, @c false if it
  *         was dropped (ringbuffer full, non-ISR-safe args, or encoding failure).
  */
+#if ON9LOG_PLAIN_TEXT
+bool on9log_write_text_isr(on9log_level_t level,
+                           const char *tag,
+                           const char *text,
+                           size_t text_len)
+{
+    uint8_t packet[ON9LOG_ISR_PACKET_MAX];
+    on9log_encoder_t enc = {
+        .cap = sizeof(packet),
+        .data = packet,
+    };
+
+    if (!on9log_level_enabled(level, tag)) {
+        return true;
+    }
+    if (!on9log_port_isr_ready()) {
+        return true;
+    }
+    if (text == NULL && text_len != 0) {
+        atomic_fetch_add_explicit(&s_dropped_count, 1, memory_order_relaxed);
+        return false;
+    }
+
+    on9log_text_output_prefix(on9log_text_encoder_output,
+                              &enc,
+                              level,
+                              on9log_port_isr_timestamp_ms(),
+                              tag);
+    on9log_put_bytes(&enc, text, text_len);
+    on9log_text_output_suffix(on9log_text_encoder_output, &enc);
+
+    if (enc.overflow || !on9log_port_isr_enqueue_packet(packet, enc.len)) {
+        atomic_fetch_add_explicit(&s_dropped_count, 1, memory_order_relaxed);
+        return false;
+    }
+
+    return true;
+}
+#endif
+
 bool on9log_write_isr(on9log_level_t level,
                       const char *tag,
                       const char *format,
                       const char *arg_types,
                       ...)
 {
+#if ON9LOG_PLAIN_TEXT
+    char text[ON9LOG_ISR_PACKET_MAX];
+
+    if (!on9log_level_enabled(level, tag)) {
+        return true;
+    }
+    if (!on9log_port_isr_ready()) {
+        return true;
+    }
+    if (!on9log_arg_types_are_isr_safe(arg_types)) {
+        atomic_fetch_add_explicit(&s_dropped_count, 1, memory_order_relaxed);
+        return false;
+    }
+
+    va_list args;
+    va_start(args, arg_types);
+    int text_len = vsnprintf(text, sizeof(text), format != NULL ? format : "", args);
+    va_end(args);
+
+    if (text_len < 0 || (size_t)text_len >= sizeof(text)) {
+        atomic_fetch_add_explicit(&s_dropped_count, 1, memory_order_relaxed);
+        return false;
+    }
+
+    return on9log_write_text_isr(level, tag, text, (size_t)text_len);
+#else
     uint8_t packet[ON9LOG_ISR_PACKET_MAX];
     size_t packet_len = 0;
     bool ok = false;
@@ -1414,6 +1802,7 @@ bool on9log_write_isr(on9log_level_t level,
     }
 
     return true;
+#endif
 }
 
 /**
@@ -1428,12 +1817,49 @@ bool on9log_write_isr(on9log_level_t level,
  * @param[in] buffer     Pointer to the raw data buffer (may be NULL if @c buffer_len is 0).
  * @param[in] buffer_len Length of the buffer in bytes.
  */
+#if ON9LOG_PLAIN_TEXT
+typedef struct {
+    const uint8_t *bytes;
+    uint32_t len;
+} on9log_buffer_text_ctx_t;
+
+static void on9log_buffer_text_formatter(on9log_text_output_cb_t output,
+                                         void *output_ctx,
+                                         void *formatter_ctx)
+{
+    static const char hex[] = "0123456789abcdef";
+    const on9log_buffer_text_ctx_t *ctx = (const on9log_buffer_text_ctx_t *)formatter_ctx;
+    char encoded[3u * 32u];
+    size_t encoded_len = 0;
+
+    output("buffer[", sizeof("buffer[") - 1u, output_ctx);
+    on9log_text_output_u32(output, output_ctx, ctx->len);
+    output("]:", sizeof("]:") - 1u, output_ctx);
+
+    for (uint32_t i = 0; i < ctx->len; ++i) {
+        uint8_t byte = ctx->bytes[i];
+        encoded[encoded_len++] = ' ';
+        encoded[encoded_len++] = hex[byte >> 4u];
+        encoded[encoded_len++] = hex[byte & 0x0fu];
+        if (encoded_len == sizeof(encoded)) {
+            output(encoded, encoded_len, output_ctx);
+            encoded_len = 0;
+        }
+    }
+    if (encoded_len != 0) {
+        output(encoded, encoded_len, output_ctx);
+    }
+}
+#endif
+
 void on9log_write_buffer(on9log_level_t level,
                          const char *tag,
                          const void *buffer,
                          size_t buffer_len)
 {
+#if !ON9LOG_PLAIN_TEXT
     uint32_t dropped_count = 0;
+#endif
     const uint8_t *bytes = (const uint8_t *)buffer;
 
     if (!on9log_level_enabled(level, tag)) {
@@ -1447,6 +1873,15 @@ void on9log_write_buffer(on9log_level_t level,
         atomic_fetch_add_explicit(&s_dropped_count, 1, memory_order_relaxed);
         return;
     }
+
+#if ON9LOG_PLAIN_TEXT
+    on9log_buffer_text_ctx_t formatter_ctx = {
+        .bytes = bytes,
+        .len = (uint32_t)buffer_len,
+    };
+    on9log_write_text(level, tag, on9log_buffer_text_formatter, &formatter_ctx);
+    return;
+#else
 
     dropped_count = (uint32_t)atomic_exchange_explicit(&s_dropped_count, 0, memory_order_acq_rel);
     if (dropped_count != 0) {
@@ -1468,4 +1903,5 @@ void on9log_write_buffer(on9log_level_t level,
         on9log_emit_buffer_packet(level, tag, bytes, total_len, offset, chunk_len);
         offset += chunk_len;
     }
+#endif
 }

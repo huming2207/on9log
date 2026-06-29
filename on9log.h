@@ -54,14 +54,14 @@ typedef enum {
 /**
  * @brief Callback invoked at the start of processing one log packet.
  *
- * @param[in] header     Pointer to the raw on9log packet header.
- * @param[in] header_len Byte length of the header (typically sizeof(on9log_packet_header_t)).
+ * @param[in] header     Raw packet header, or NULL for a plain-text record.
+ * @param[in] header_len Header size, or zero for a plain-text record.
  * @param[in] ctx        User-supplied context pointer from on9log_sink_t registration.
  */
 typedef void (*on9log_sink_start_cb_t)(const uint8_t *header, size_t header_len, void *ctx);
 
 /**
- * @brief Callback invoked for each decoded argument payload in a log packet.
+ * @brief Callback invoked for each packet payload or formatted text chunk.
  *
  * @param[in] payload         Pointer to the serialised argument data.
  * @param[in] payload_len     Byte length of the argument data.
@@ -94,6 +94,27 @@ typedef struct {
     on9log_sink_payload_cb_t payload_cb; /**< @brief Called for each argument in the packet. */
     on9log_sink_end_cb_t end_cb;         /**< @brief Called once after all arguments have been dispatched. */
 } on9log_sink_t;
+
+#if ON9LOG_PLAIN_TEXT
+/** @brief Output callback used by a plain-text formatter. */
+typedef void (*on9log_text_output_cb_t)(const char *data, size_t len, void *ctx);
+
+/**
+ * @brief Formatter callback used by the C++ wrapper and other streaming text
+ *        producers.
+ */
+typedef void (*on9log_text_formatter_cb_t)(on9log_text_output_cb_t output,
+                                           void *output_ctx,
+                                           void *formatter_ctx);
+#endif
+
+/**
+ * @brief Initialize global on9log resources.
+ *
+ * Plain-text mode creates one unbuffered callback-backed FILE used by all
+ * C-style printf logs. Binary mode is an idempotent no-op.
+ */
+on9log_err_t on9log_init(void);
 
 /**
  * @brief Register a log sink to receive decoded log packets.
@@ -231,6 +252,32 @@ void on9log_write_with_format_scan_metadata(on9log_level_t level,
                                             int has_dynamic_string,
                                             ...) __attribute__((format(printf, 3, 8)));
 
+#if ON9LOG_PLAIN_TEXT
+/**
+ * @brief Stream one already-formatted plain-text log body through registered
+ *        sinks.
+ *
+ * The logger emits the ANSI level prefix and final reset/newline around the
+ * bytes produced by @p formatter. Sink start callbacks receive a NULL header
+ * with length zero in plain-text mode.
+ */
+void on9log_write_text(on9log_level_t level,
+                       const char *tag,
+                       on9log_text_formatter_cb_t formatter,
+                       void *formatter_ctx);
+
+/**
+ * @brief Enqueue an already-formatted plain-text body from ISR context.
+ *
+ * The final ANSI log line is bounded by ON9LOG_ISR_PACKET_MAX and dispatched
+ * by the normal ISR drain task.
+ */
+bool on9log_write_text_isr(on9log_level_t level,
+                           const char *tag,
+                           const char *text,
+                           size_t text_len);
+#endif
+
 /*
  * Encodes a bounded packet and enqueues it through the platform ISR backend.
  * Dynamic string arguments are not supported on the ISR path.
@@ -335,7 +382,12 @@ on9log_err_t on9log_dispatch_packet(const uint8_t *packet, size_t packet_len);
  * ELF binary but never loaded into RAM. Apple platforms define this as empty
  * because the mach-o format does not support .noload sections natively.
  */
-#ifndef ON9_LOG_NOLOAD_ATTR
+#if ON9LOG_PLAIN_TEXT
+#ifdef ON9_LOG_NOLOAD_ATTR
+#undef ON9_LOG_NOLOAD_ATTR
+#endif
+#define ON9_LOG_NOLOAD_ATTR
+#elif !defined(ON9_LOG_NOLOAD_ATTR)
 #if defined(__APPLE__)
 #define ON9_LOG_NOLOAD_ATTR
 #else
@@ -355,11 +407,15 @@ on9log_err_t on9log_dispatch_packet(const uint8_t *packet, size_t packet_len);
  *
  * @return Pointer to the .noload-resident string.
  */
+#if ON9LOG_PLAIN_TEXT
+#define ON9_LOG_NOLOAD_STR(str) (str)
+#else
 #define ON9_LOG_NOLOAD_STR(str) \
     (__extension__({ \
         static const ON9_LOG_NOLOAD_ATTR char __on9log_str[] = (str); \
         (const char *)__on9log_str; \
     }))
+#endif
 
 /**
  * @brief Return a .noload-resident pointer for compile-time constant strings,
@@ -369,7 +425,11 @@ on9log_err_t on9log_dispatch_packet(const uint8_t *packet, size_t packet_len);
  *
  * @return Pointer to the string (possibly in the .noload section).
  */
+#if ON9LOG_PLAIN_TEXT
+#define ON9_LOG_ATTR_STR(str) (str)
+#else
 #define ON9_LOG_ATTR_STR(str) (__builtin_constant_p(str) ? ON9_LOG_NOLOAD_STR(str) : (str))
+#endif
 
 /**
  * @defgroup diag_macros Compiler diagnostic pragma helpers
@@ -696,6 +756,16 @@ constexpr unsigned long long ON9_LOG_DETECT_TYPE_IMPL(const T &, bool is_constan
  * @param[in] format  printf-style format string.
  * @param[in] ...     Variadic arguments.
  */
+#if ON9LOG_PLAIN_TEXT
+#define ON9_LOG_LEVEL(level, tag, format, ...) do { \
+        if (ON9_LOG_ENABLED(level)) { \
+            ON9_LOG_DIAG_PUSH; \
+            ON9_LOG_DIAG_IGNORE_FORMAT_OVERFLOW; \
+            on9log_write((level), (tag), ON9_LOG_ATTR_STR(format), NULL, ##__VA_ARGS__); \
+            ON9_LOG_DIAG_POP; \
+        } \
+    } while (0)
+#else
 #define ON9_LOG_LEVEL(level, tag, format, ...) do { \
         if (ON9_LOG_ENABLED(level)) { \
             ON9_LOG_DIAG_PUSH; \
@@ -714,6 +784,7 @@ constexpr unsigned long long ON9_LOG_DETECT_TYPE_IMPL(const T &, bool is_constan
             ON9_LOG_DIAG_POP; \
         } \
     } while (0)
+#endif
 
 /**
  * @brief Log an ERROR-level message (task context).

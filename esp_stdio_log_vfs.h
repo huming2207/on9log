@@ -46,6 +46,15 @@ esp_err_t esp_stdio_log_vfs_add_output(const char *path);
 /* Writes one already-typed transport frame directly to configured outputs. */
 esp_err_t esp_stdio_log_vfs_write_frame(uint8_t type, const uint8_t *payload, size_t payload_len);
 
+/** @brief Begin one serialized raw-output stream without framing or CRC. */
+esp_err_t esp_stdio_log_vfs_raw_stream_begin(void);
+
+/** @brief Write bytes inside a raw-output stream begun by the current task. */
+esp_err_t esp_stdio_log_vfs_raw_stream_write(const uint8_t *data, size_t len);
+
+/** @brief End the current task's raw-output stream and release serialization. */
+esp_err_t esp_stdio_log_vfs_raw_stream_end(void);
+
 #ifdef __cplusplus
 }
 #endif
