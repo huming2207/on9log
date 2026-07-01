@@ -681,6 +681,36 @@ bool enabled = __atomic_load_n(&s_feature_enabled, __ATOMIC_RELAXED);
 This keeps atomic code generation while usually avoiding `clangd`'s `_Atomic`
 type confusion.
 
+## Unix Host Shim And Build Isolation
+
+Standalone Linux/macOS support is isolated in `on9log_unix_port.c` and
+`on9log_unix_stdio.c/.h`. The Unix port supplies pthread locking and a monotonic
+clock. The stdio sink writes plain text directly and writes binary packets with
+the same typed SLIP/CRC framing used by the ESP transport. In macOS binary mode
+it emits a leading `@on9log-image-slide=XXXXXXXX` metadata line so the host CLI
+can normalize 32-bit IDs against the ASLR-enabled Mach-O demo image.
+
+`CMakeLists.txt` selects exactly one platform branch:
+
+- if `idf_component_register` exists, the ESP-IDF source list remains
+  `esp_stdio_log_vfs.c`, `on9log.c`, `on9log_esp_port.c`,
+  `on9log_port_weak.c`, `on9log_esp_vfs.c`, and `on9log_esp_isr.c`;
+- otherwise, CMake requires a Unix host and builds `on9log.c` with only the two
+  Unix shim sources. Host demos/tests default on only for a top-level host
+  build, and Unix link options apply only to `on9log_unix_demo`.
+
+Consequently no pthread, host stdio sink, Mach-O API, host demo, or host test is
+compiled into ESP firmware. The common core, public embedded headers, packet
+format, Kconfig, ESP VFS, and ESP ISR paths are unchanged by the host shim.
+Other embedded ports continue to provide their own platform hooks and build
+files; the standalone CMake branch does not claim to support non-Unix cross
+targets. The top-level ESP project requires CMake 3.22, above the component's
+3.20 minimum.
+
+Host builds and Rust decoder tests have passed, but an ESP-IDF firmware build
+has not been run after these local additions. Do not treat host validation as
+a substitute for `idf.py build`.
+
 ## Known Implementation Risks
 
 The current implementation is usable for the intended ESP32-S3 experiment, but

@@ -1,6 +1,7 @@
 # on9log
 
-Custom binary logging library for embedded platforms. Currently targets ESP32-S3; designed for portability to other MCUs and RTOSes.
+Custom binary and plain-text logging library for embedded platforms, with a
+Linux/macOS shim for host execution and testing.
 
 The host-side decoder library and CLI tools are at: https://github.com/huming2207/on9log_host
 
@@ -30,6 +31,14 @@ The firmware sends only addresses for format and tag strings. The matching host 
        Host decoder & CLI
      (separate repository)
 ```
+
+On Linux and macOS, `on9log_unix_port.c` supplies pthread locking and a
+monotonic clock, while `on9log_unix_stdio.c` supplies the default host sink.
+Binary packets are written to stdio using the same typed SLIP/CRC envelope as
+the ESP transport, so packet boundaries survive redirection and pipes. Plain
+text is written directly to stdio.
+On macOS binary builds, the sink writes a leading image-slide metadata line so
+the host decoder can resolve 32-bit IDs against the ASLR-enabled Mach-O demo.
 
 ## Wire Format
 
@@ -123,6 +132,8 @@ on9log/
 ├── on9log_esp_vfs.c/.h          SLIP+CRC VFS transport sink
 ├── on9log_esp_isr.c/.h          ISR ringbuffer + drain task
 ├── esp_stdio_log_vfs.c/.h       Shared stdio VFS framer
+├── on9log_unix_port.c           Linux/macOS lock and timestamp port
+├── on9log_unix_stdio.c/.h       Linux/macOS stdio sink
 ├── on9log_port_weak.c           Weak no-op stubs for non-ESP targets
 ├── CMakeLists.txt
 └── Kconfig
@@ -130,7 +141,74 @@ on9log/
 
 ## Building
 
-On ESP-IDF, add as a standard component (place in `components/` or `EXTRA_COMPONENT_DIRS`). On other platforms, implement the hooks in `on9log_port.h` (see `on9log_port_weak.c` for defaults) and link `on9log.c` directly.
+On ESP-IDF, add this directory as a standard component (under `components/` or
+through `EXTRA_COMPONENT_DIRS`). The Unix shim files are excluded from that
+build.
+
+### Platform isolation
+
+The CMake file has two disjoint source lists:
+
+- when ESP-IDF provides `idf_component_register`, it builds only the original
+  ESP sources (`on9log.c`, ESP port/VFS/ISR files, the weak ISR fallbacks, and
+  the stdio VFS transport);
+- otherwise, standalone CMake is accepted only on Linux/macOS and builds the
+  core with `on9log_unix_port.c` and `on9log_unix_stdio.c`.
+
+The Unix shim, demos, tests, pthread dependency, Mach-O metadata, and Linux
+`-no-pie` option are therefore never compiled or linked into ESP firmware.
+The shared core and public embedded APIs are unchanged. Other embedded targets
+still need their own `on9log_port.h` implementation and build integration;
+the standalone CMake branch is intentionally a Unix host build, not a generic
+cross-compilation system.
+
+The current ESP-IDF project requires CMake 3.22, which satisfies this
+component's CMake 3.20 minimum. Firmware compatibility after local edits still
+needs confirmation with an actual `idf.py build`; host tests do not replace an
+ESP toolchain build.
+
+For a binary Linux/macOS host build:
+
+```sh
+cmake -S . -B build -DON9LOG_PLAIN_TEXT=OFF
+cmake --build build
+ctest --test-dir build --output-on-failure
+./build/on9log_unix_demo > on9log.bin
+```
+
+For a plain-text host build:
+
+```sh
+cmake -S . -B build-text -DON9LOG_PLAIN_TEXT=ON
+cmake --build build-text
+ctest --test-dir build-text --output-on-failure
+./build-text/on9log_unix_demo
+```
+
+The Unix demo mirrors the ESP32 demo's format, string-slice, C++ wrapper,
+buffer, secondary-sink, runtime-filter, worker-thread, and heartbeat cases.
+ESP chip/flash/FreeRTOS values are replaced with `uname`, hardware concurrency,
+monotonic time, and process RSS values. Set `ON9LOG_BUILD_DEMO=OFF` when using
+this directory only as a dependency.
+
+Initialize the host sink before logging:
+
+```c
+#include "on9log_unix_stdio.h"
+
+int main(void)
+{
+    if (on9log_unix_stdio_init() != ON9LOG_OK) {
+        return 1;
+    }
+    ON9_LOGI("host", "value=%d", 42);
+    return 0;
+}
+```
+
+`on9log_unix_stdio_init()` writes to `stdout`. Tests or applications that need
+another standard stream can call `on9log_unix_stdio_init_file(FILE *)` instead;
+that stream must remain open for the process lifetime.
 
 ### Code size
 
