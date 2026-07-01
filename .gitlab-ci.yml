@@ -1,0 +1,53 @@
+# on9log GitLab CI — Linux host test build (C/CMake)
+#
+# Builds the Unix host shim: libon9log.a, on9log_unix_demo, on9log_unix_smoke.
+#
+# Requires C++23 (gcc-14+ or clang-18+).
+
+stages:
+  - build
+  - test
+
+.default-settings:
+  interruptible: true
+  tags:
+    - linux
+    - x86_64
+
+# ---------------------------------------------------------------------------
+# C/CMake host build + test
+# ---------------------------------------------------------------------------
+build:
+  stage: build
+  extends: .default-settings
+  image: ubuntu:24.04
+  before_script:
+    - apt-get update -qq
+    - apt-get install -y -qq cmake gcc-14 g++-14 make
+    - update-alternatives --install /usr/bin/cc cc /usr/bin/gcc-14 100
+    - update-alternatives --install /usr/bin/c++ c++ /usr/bin/g++-14 100
+  script:
+    - cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
+    - cmake --build build
+  artifacts:
+    paths:
+      - build/libon9log.a
+      - build/on9log_unix_demo
+      - build/on9log_unix_smoke
+    expire_in: 1 day
+
+test:
+  stage: test
+  extends: .default-settings
+  image: ubuntu:24.04
+  needs:
+    - build
+  before_script:
+    - apt-get update -qq
+    - apt-get install -y -qq cmake gcc-14 g++-14 make
+    - update-alternatives --install /usr/bin/cc cc /usr/bin/gcc-14 100
+    - update-alternatives --install /usr/bin/c++ c++ /usr/bin/g++-14 100
+  script:
+    - cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
+    - cmake --build build
+    - ctest --test-dir build --output-on-failure --verbose

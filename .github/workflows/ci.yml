@@ -1,0 +1,50 @@
+name: CI
+
+# on9log — Linux host test build (C/CMake)
+#
+# Builds the Unix host shim: libon9log.a, on9log_unix_demo, on9log_unix_smoke.
+#
+# Requires C++23 (gcc-14 or clang-18).
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+
+  build-test:
+    name: "C build + test (gcc-14)"
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cmake gcc-14 g++-14 make
+          sudo update-alternatives --install /usr/bin/cc cc /usr/bin/gcc-14 100
+          sudo update-alternatives --install /usr/bin/c++ c++ /usr/bin/g++-14 100
+
+      - name: Configure
+        run: cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure --verbose
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: on9log-linux-x86_64
+          path: |
+            build/libon9log.a
+            build/on9log_unix_demo
+            build/on9log_unix_smoke
+          retention-days: 1
