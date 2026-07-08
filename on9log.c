@@ -55,13 +55,19 @@ typedef uint32_t on9log_arg_mask_t;
 /**
  * @brief An atomic slot in the global sink table.
  *
- * Each slot holds a pointer to a @ref on9log_sink_t and its opaque context.
- * Writers publish @c ctx first and then publish @c sink with release ordering;
- * readers load @c sink with acquire ordering before reading @c ctx.  Removal
- * clears only @c sink, leaving @c ctx available for any in-flight reader that
- * already observed the old sink pointer.
+ * Each slot holds a pointer to a @ref on9log_sink_t and its opaque context,
+ * both stored as @c atomic_uintptr_t so that lock-free readers can access
+ * them without taking the port lock.
+ *
+ * A @c generation counter provides a seqlock so that the lock-free dispatch
+ * reader can obtain a consistent @c (sink, ctx) pair even while a concurrent
+ * @c on9log_add_sink / @c on9log_remove_sink modifies the slot.  The writer
+ * increments @c generation to an odd value before the update and to an even
+ * value after; the reader retries if it observes an odd generation or a
+ * generation that changes between the two reads.
  */
 typedef struct {
+    atomic_uint generation;     /**< Seqlock generation (even = stable, odd = write in progress). */
     atomic_uintptr_t sink;      /**< Pointer to the sink descriptor (@ref on9log_sink_t). */
     atomic_uintptr_t ctx;       /**< Opaque user context passed to every sink callback. */
 } on9log_sink_entry_t;
@@ -299,9 +305,23 @@ static void on9log_stream_start(on9log_stream_t *stream, const uint8_t *header, 
     stream->sink_count = 0;
 
     for (size_t i = 0; i < ON9LOG_MAX_SINKS; ++i) {
-        const on9log_sink_t *sink = (const on9log_sink_t *)atomic_load_explicit(&s_sinks[i].sink, memory_order_acquire);
+        const on9log_sink_t *sink;
+        void *ctx;
+        unsigned gen1, gen2;
+        for (;;) {
+            gen1 = atomic_load_explicit(&s_sinks[i].generation, memory_order_acquire);
+            if (gen1 & 1u) {
+                continue;
+            }
+            sink = (const on9log_sink_t *)atomic_load_explicit(&s_sinks[i].sink, memory_order_relaxed);
+            ctx = (void *)atomic_load_explicit(&s_sinks[i].ctx, memory_order_relaxed);
+            gen2 = atomic_load_explicit(&s_sinks[i].generation, memory_order_acquire);
+            if (gen1 == gen2) {
+                break;
+            }
+        }
+
         if (sink != NULL) {
-            void *ctx = (void *)atomic_load_explicit(&s_sinks[i].ctx, memory_order_relaxed);
             stream->sinks[stream->sink_count].sink = sink;
             stream->sinks[stream->sink_count].ctx = ctx;
             ++stream->sink_count;
@@ -357,6 +377,8 @@ static void on9log_stream_end(on9log_stream_t *stream)
 #define ON9LOG_ANSI_YELLOW  "\033[0;33m"
 #define ON9LOG_ANSI_CYAN    "\033[0;36m"
 #define ON9LOG_ANSI_WHITE   "\033[0;37m"
+#define ON9LOG_ANSI_BOLD    "\033[1m"
+#define ON9LOG_ANSI_NORMAL  "\033[22m"
 #define ON9LOG_ANSI_RESET   "\033[0m"
 
 static void on9log_text_stream_output(const char *data, size_t len, void *ctx)
@@ -371,6 +393,41 @@ static void on9log_text_stream_output(const char *data, size_t len, void *ctx)
 static void on9log_text_encoder_output(const char *data, size_t len, void *ctx)
 {
     on9log_put_bytes((on9log_encoder_t *)ctx, data, len);
+}
+
+typedef struct {
+    on9log_text_output_cb_t output;
+    void *output_ctx;
+    uint8_t flags;
+    char last_char;
+} on9log_text_filter_t;
+
+static void on9log_text_filtered_output(const char *data, size_t len, void *ctx)
+{
+    on9log_text_filter_t *filter = (on9log_text_filter_t *)ctx;
+    size_t chunk_start = 0;
+
+    if ((filter->flags & ON9LOG_TEXT_CR) == 0u) {
+        filter->output(data, len, filter->output_ctx);
+        if (len != 0u) {
+            filter->last_char = data[len - 1u];
+        }
+        return;
+    }
+
+    for (size_t i = 0; i < len; ++i) {
+        if (data[i] == '\n' && filter->last_char != '\r') {
+            if (i != chunk_start) {
+                filter->output(&data[chunk_start], i - chunk_start, filter->output_ctx);
+            }
+            filter->output("\r", 1u, filter->output_ctx);
+            chunk_start = i;
+        }
+        filter->last_char = data[i];
+    }
+    if (chunk_start != len) {
+        filter->output(&data[chunk_start], len - chunk_start, filter->output_ctx);
+    }
 }
 
 static const char *on9log_text_level_color(on9log_level_t level)
@@ -418,45 +475,123 @@ static void on9log_text_output_u32(on9log_text_output_cb_t output,
     output(digits, len, output_ctx);
 }
 
+static void on9log_text_output_padded(on9log_text_output_cb_t output,
+                                      void *output_ctx,
+                                      uint32_t value,
+                                      size_t width)
+{
+    char digits[10];
+
+    for (size_t i = width; i != 0; --i) {
+        digits[i - 1u] = (char)('0' + (value % 10u));
+        value /= 10u;
+    }
+    output(digits, width, output_ctx);
+}
+
 static void on9log_text_output_prefix(on9log_text_output_cb_t output,
                                       void *output_ctx,
                                       on9log_level_t level,
                                       uint32_t timestamp_ms,
-                                      const char *tag)
+                                      const char *tag,
+                                      uint8_t flags)
 {
-    const char *color = on9log_text_level_color(level);
-    const char level_letter = on9log_text_level_letter(level);
     const char *safe_tag = tag != NULL ? tag : "";
+    bool has_field = false;
 
-    output(color, strlen(color), output_ctx);
-    output(&level_letter, sizeof(level_letter), output_ctx);
-    output(" (", 2, output_ctx);
-    on9log_text_output_u32(output, output_ctx, timestamp_ms);
-    output(") ", 2, output_ctx);
-    output(safe_tag, strlen(safe_tag), output_ctx);
-    output(": ", 2, output_ctx);
+    if ((flags & (ON9LOG_TEXT_PRETTY | ON9LOG_TEXT_PRETTYLINE)) != 0u) {
+        const char *color = on9log_text_level_color(level);
+        output(ON9LOG_ANSI_BOLD, sizeof(ON9LOG_ANSI_BOLD) - 1u, output_ctx);
+        output(color, strlen(color), output_ctx);
+    }
+
+    if ((flags & ON9LOG_TEXT_SHOWTIMESTAMP) != 0u) {
+        uint32_t hours = timestamp_ms / 3600000u;
+        uint32_t remainder = timestamp_ms % 3600000u;
+        uint32_t minutes = remainder / 60000u;
+        remainder %= 60000u;
+        uint32_t seconds = remainder / 1000u;
+        uint32_t millis = remainder % 1000u;
+
+        if (hours < 100u) {
+            on9log_text_output_padded(output, output_ctx, hours, 2u);
+        } else {
+            on9log_text_output_u32(output, output_ctx, hours);
+        }
+        output(":", 1u, output_ctx);
+        on9log_text_output_padded(output, output_ctx, minutes, 2u);
+        output(":", 1u, output_ctx);
+        on9log_text_output_padded(output, output_ctx, seconds, 2u);
+        output(".", 1u, output_ctx);
+        on9log_text_output_padded(output, output_ctx, millis, 3u);
+        has_field = true;
+    }
+
+    if ((flags & ON9LOG_TEXT_SHOWLEVEL) != 0u) {
+        const char level_letter = on9log_text_level_letter(level);
+        if (has_field) {
+            output(" ", 1u, output_ctx);
+        }
+        output(&level_letter, sizeof(level_letter), output_ctx);
+        has_field = true;
+    }
+
+    if ((flags & ON9LOG_TEXT_SHOWTOPIC) != 0u) {
+        if (has_field) {
+            output(" ", 1u, output_ctx);
+        }
+        output("[", 1u, output_ctx);
+        output(safe_tag, strlen(safe_tag), output_ctx);
+        output("]", 1u, output_ctx);
+        has_field = true;
+    }
+
+    if (has_field) {
+        output(": ", 2u, output_ctx);
+    }
+
+    if ((flags & ON9LOG_TEXT_PRETTYLINE) != 0u) {
+        output(ON9LOG_ANSI_NORMAL, sizeof(ON9LOG_ANSI_NORMAL) - 1u, output_ctx);
+    } else if ((flags & ON9LOG_TEXT_PRETTY) != 0u) {
+        output(ON9LOG_ANSI_RESET, sizeof(ON9LOG_ANSI_RESET) - 1u, output_ctx);
+    }
 }
 
-static void on9log_text_output_suffix(on9log_text_output_cb_t output, void *output_ctx)
+static void on9log_text_output_suffix(on9log_text_output_cb_t output,
+                                      void *output_ctx,
+                                      uint8_t flags)
 {
-    static const char suffix[] = ON9LOG_ANSI_RESET "\n";
-    output(suffix, sizeof(suffix) - 1u, output_ctx);
+    output("\n", 1u, output_ctx);
+    if ((flags & ON9LOG_TEXT_PRETTYLINE) != 0u) {
+        output(ON9LOG_ANSI_RESET, sizeof(ON9LOG_ANSI_RESET) - 1u, output_ctx);
+    }
 }
 
 static void on9log_dispatch_text_line(on9log_level_t level,
                                       const char *tag,
                                       uint32_t timestamp_ms,
+                                      uint8_t flags,
                                       on9log_text_formatter_cb_t formatter,
                                       void *formatter_ctx)
 {
     on9log_stream_t stream = {0};
+    on9log_text_filter_t filter = {
+        .output = on9log_text_stream_output,
+        .output_ctx = &stream,
+        .flags = flags,
+    };
 
     on9log_stream_start(&stream, NULL, 0);
-    on9log_text_output_prefix(on9log_text_stream_output, &stream, level, timestamp_ms, tag);
+    on9log_text_output_prefix(on9log_text_filtered_output,
+                              &filter,
+                              level,
+                              timestamp_ms,
+                              tag,
+                              flags);
     if (formatter != NULL) {
-        formatter(on9log_text_stream_output, &stream, formatter_ctx);
+        formatter(on9log_text_filtered_output, &filter, formatter_ctx);
     }
-    on9log_text_output_suffix(on9log_text_stream_output, &stream);
+    on9log_text_output_suffix(on9log_text_filtered_output, &filter, flags);
     on9log_stream_end(&stream);
 }
 #endif
@@ -933,6 +1068,7 @@ static void on9log_emit_dropped_packet(uint32_t dropped_count)
     on9log_dispatch_text_line(ON9_LOG_LEVEL_WARN,
                               "on9log",
                               on9log_port_timestamp_ms(),
+                              ON9LOG_TEXT_DEFAULT_FLAGS,
                               on9log_dropped_text_formatter,
                               &ctx);
 #else
@@ -1082,6 +1218,19 @@ void on9log_write_text(on9log_level_t level,
                        on9log_text_formatter_cb_t formatter,
                        void *formatter_ctx)
 {
+    on9log_write_text_with_flags(level,
+                                 tag,
+                                 ON9LOG_TEXT_DEFAULT_FLAGS,
+                                 formatter,
+                                 formatter_ctx);
+}
+
+void on9log_write_text_with_flags(on9log_level_t level,
+                                  const char *tag,
+                                  uint8_t text_flags,
+                                  on9log_text_formatter_cb_t formatter,
+                                  void *formatter_ctx)
+{
     if (!on9log_level_enabled(level, tag)) {
         return;
     }
@@ -1095,6 +1244,7 @@ void on9log_write_text(on9log_level_t level,
     on9log_dispatch_text_line(level,
                               tag,
                               on9log_port_timestamp_ms(),
+                              text_flags,
                               formatter,
                               formatter_ctx);
 }
@@ -1132,8 +1282,11 @@ on9log_err_t on9log_add_sink(const on9log_sink_t *sink, void *ctx)
     }
     for (size_t i = 0; i < ON9LOG_MAX_SINKS; ++i) {
         if (atomic_load_explicit(&s_sinks[i].sink, memory_order_acquire) == (uintptr_t)NULL) {
+            unsigned gen = atomic_load_explicit(&s_sinks[i].generation, memory_order_relaxed);
+            atomic_store_explicit(&s_sinks[i].generation, gen + 1u, memory_order_relaxed);
             atomic_store_explicit(&s_sinks[i].ctx, (uintptr_t)ctx, memory_order_relaxed);
             atomic_store_explicit(&s_sinks[i].sink, (uintptr_t)sink, memory_order_release);
+            atomic_store_explicit(&s_sinks[i].generation, gen + 2u, memory_order_release);
             on9log_port_unlock();
             return ON9LOG_OK;
         }
@@ -1163,7 +1316,11 @@ on9log_err_t on9log_remove_sink(const on9log_sink_t *sink, void *ctx)
         const on9log_sink_t *slot_sink = (const on9log_sink_t *)atomic_load_explicit(&s_sinks[i].sink, memory_order_acquire);
         void *slot_ctx = (void *)atomic_load_explicit(&s_sinks[i].ctx, memory_order_relaxed);
         if (slot_sink == sink && slot_ctx == ctx) {
+            unsigned gen = atomic_load_explicit(&s_sinks[i].generation, memory_order_relaxed);
+            atomic_store_explicit(&s_sinks[i].generation, gen + 1u, memory_order_relaxed);
             atomic_store_explicit(&s_sinks[i].sink, (uintptr_t)NULL, memory_order_release);
+            atomic_store_explicit(&s_sinks[i].ctx, (uintptr_t)NULL, memory_order_relaxed);
+            atomic_store_explicit(&s_sinks[i].generation, gen + 2u, memory_order_release);
             on9log_port_unlock();
             return ON9LOG_OK;
         }
@@ -1559,6 +1716,7 @@ on9log_err_t on9log_init(void)
 
 static void on9log_vwrite(on9log_level_t level,
                           const char *tag,
+                          uint8_t text_flags,
                           const char *format,
                           const char *format_scan,
                           const char *arg_types,
@@ -1583,8 +1741,13 @@ static void on9log_vwrite(on9log_level_t level,
         .format = format,
         .args = args,
     };
-    on9log_write_text(level, tag, on9log_printf_formatter, &formatter_ctx);
+    on9log_write_text_with_flags(level,
+                                 tag,
+                                 text_flags,
+                                 on9log_printf_formatter,
+                                 &formatter_ctx);
 #else
+    (void)text_flags;
     uint32_t dropped_count = 0;
     on9log_stream_t stream = {0};
 
@@ -1639,7 +1802,36 @@ void on9log_write(on9log_level_t level,
 {
     va_list args;
     va_start(args, arg_types);
-    on9log_vwrite(level, tag, format, NULL, arg_types, on9log_arg_count(arg_types), false, &args);
+    on9log_vwrite(level,
+                  tag,
+                  ON9LOG_TEXT_DEFAULT_FLAGS,
+                  format,
+                  NULL,
+                  arg_types,
+                  on9log_arg_count(arg_types),
+                  false,
+                  &args);
+    va_end(args);
+}
+
+void on9log_write_with_text_flags(on9log_level_t level,
+                                  const char *tag,
+                                  uint8_t text_flags,
+                                  const char *format,
+                                  const char *arg_types,
+                                  ...)
+{
+    va_list args;
+    va_start(args, arg_types);
+    on9log_vwrite(level,
+                  tag,
+                  text_flags,
+                  format,
+                  NULL,
+                  arg_types,
+                  on9log_arg_count(arg_types),
+                  false,
+                  &args);
     va_end(args);
 }
 
@@ -1655,6 +1847,7 @@ void on9log_write_with_format_scan(on9log_level_t level,
     va_start(args, arg_types);
     on9log_vwrite(level,
                   tag,
+                  ON9LOG_TEXT_DEFAULT_FLAGS,
                   format,
                   format_scan,
                   arg_types,
@@ -1677,6 +1870,7 @@ void on9log_write_with_format_scan_metadata(on9log_level_t level,
     va_start(args, has_dynamic_string);
     on9log_vwrite(level,
                   tag,
+                  ON9LOG_TEXT_DEFAULT_FLAGS,
                   format,
                   format_scan,
                   arg_types,
@@ -1710,10 +1904,28 @@ bool on9log_write_text_isr(on9log_level_t level,
                            const char *text,
                            size_t text_len)
 {
+    return on9log_write_text_isr_with_flags(level,
+                                            tag,
+                                            ON9LOG_TEXT_DEFAULT_FLAGS,
+                                            text,
+                                            text_len);
+}
+
+bool on9log_write_text_isr_with_flags(on9log_level_t level,
+                                      const char *tag,
+                                      uint8_t text_flags,
+                                      const char *text,
+                                      size_t text_len)
+{
     uint8_t packet[ON9LOG_ISR_PACKET_MAX];
     on9log_encoder_t enc = {
         .cap = sizeof(packet),
         .data = packet,
+    };
+    on9log_text_filter_t filter = {
+        .output = on9log_text_encoder_output,
+        .output_ctx = &enc,
+        .flags = text_flags,
     };
 
     if (!on9log_level_enabled(level, tag)) {
@@ -1727,13 +1939,14 @@ bool on9log_write_text_isr(on9log_level_t level,
         return false;
     }
 
-    on9log_text_output_prefix(on9log_text_encoder_output,
-                              &enc,
+    on9log_text_output_prefix(on9log_text_filtered_output,
+                              &filter,
                               level,
                               on9log_port_isr_timestamp_ms(),
-                              tag);
-    on9log_put_bytes(&enc, text, text_len);
-    on9log_text_output_suffix(on9log_text_encoder_output, &enc);
+                              tag,
+                              text_flags);
+    on9log_text_filtered_output(text, text_len, &filter);
+    on9log_text_output_suffix(on9log_text_filtered_output, &filter, text_flags);
 
     if (enc.overflow || !on9log_port_isr_enqueue_packet(packet, enc.len)) {
         atomic_fetch_add_explicit(&s_dropped_count, 1, memory_order_relaxed);
@@ -1744,11 +1957,12 @@ bool on9log_write_text_isr(on9log_level_t level,
 }
 #endif
 
-bool on9log_write_isr(on9log_level_t level,
-                      const char *tag,
-                      const char *format,
-                      const char *arg_types,
-                      ...)
+static bool on9log_vwrite_isr(on9log_level_t level,
+                              const char *tag,
+                              uint8_t text_flags,
+                              const char *format,
+                              const char *arg_types,
+                              va_list *args)
 {
 #if ON9LOG_PLAIN_TEXT
     char text[ON9LOG_ISR_PACKET_MAX];
@@ -1764,18 +1978,20 @@ bool on9log_write_isr(on9log_level_t level,
         return false;
     }
 
-    va_list args;
-    va_start(args, arg_types);
-    int text_len = vsnprintf(text, sizeof(text), format != NULL ? format : "", args);
-    va_end(args);
+    int text_len = vsnprintf(text, sizeof(text), format != NULL ? format : "", *args);
 
     if (text_len < 0 || (size_t)text_len >= sizeof(text)) {
         atomic_fetch_add_explicit(&s_dropped_count, 1, memory_order_relaxed);
         return false;
     }
 
-    return on9log_write_text_isr(level, tag, text, (size_t)text_len);
+    return on9log_write_text_isr_with_flags(level,
+                                            tag,
+                                            text_flags,
+                                            text,
+                                            (size_t)text_len);
 #else
+    (void)text_flags;
     uint8_t packet[ON9LOG_ISR_PACKET_MAX];
     size_t packet_len = 0;
     bool ok = false;
@@ -1791,10 +2007,14 @@ bool on9log_write_isr(on9log_level_t level,
         return false;
     }
 
-    va_list args;
-    va_start(args, arg_types);
-    ok = on9log_encode_isr_log_packet(packet, sizeof(packet), &packet_len, level, tag, format, arg_types, &args);
-    va_end(args);
+    ok = on9log_encode_isr_log_packet(packet,
+                                      sizeof(packet),
+                                      &packet_len,
+                                      level,
+                                      tag,
+                                      format,
+                                      arg_types,
+                                      args);
 
     if (!ok || !on9log_port_isr_enqueue_packet(packet, packet_len)) {
         atomic_fetch_add_explicit(&s_dropped_count, 1, memory_order_relaxed);
@@ -1803,6 +2023,43 @@ bool on9log_write_isr(on9log_level_t level,
 
     return true;
 #endif
+}
+
+bool on9log_write_isr(on9log_level_t level,
+                      const char *tag,
+                      const char *format,
+                      const char *arg_types,
+                      ...)
+{
+    va_list args;
+    va_start(args, arg_types);
+    bool result = on9log_vwrite_isr(level,
+                                    tag,
+                                    ON9LOG_TEXT_DEFAULT_FLAGS,
+                                    format,
+                                    arg_types,
+                                    &args);
+    va_end(args);
+    return result;
+}
+
+bool on9log_write_isr_with_text_flags(on9log_level_t level,
+                                      const char *tag,
+                                      uint8_t text_flags,
+                                      const char *format,
+                                      const char *arg_types,
+                                      ...)
+{
+    va_list args;
+    va_start(args, arg_types);
+    bool result = on9log_vwrite_isr(level,
+                                    tag,
+                                    text_flags,
+                                    format,
+                                    arg_types,
+                                    &args);
+    va_end(args);
+    return result;
 }
 
 /**
@@ -1857,7 +2114,21 @@ void on9log_write_buffer(on9log_level_t level,
                          const void *buffer,
                          size_t buffer_len)
 {
+    on9log_write_buffer_with_text_flags(level,
+                                        tag,
+                                        ON9LOG_TEXT_DEFAULT_FLAGS,
+                                        buffer,
+                                        buffer_len);
+}
+
+void on9log_write_buffer_with_text_flags(on9log_level_t level,
+                                         const char *tag,
+                                         uint8_t text_flags,
+                                         const void *buffer,
+                                         size_t buffer_len)
+{
 #if !ON9LOG_PLAIN_TEXT
+    (void)text_flags;
     uint32_t dropped_count = 0;
 #endif
     const uint8_t *bytes = (const uint8_t *)buffer;
@@ -1879,7 +2150,11 @@ void on9log_write_buffer(on9log_level_t level,
         .bytes = bytes,
         .len = (uint32_t)buffer_len,
     };
-    on9log_write_text(level, tag, on9log_buffer_text_formatter, &formatter_ctx);
+    on9log_write_text_with_flags(level,
+                                 tag,
+                                 text_flags,
+                                 on9log_buffer_text_formatter,
+                                 &formatter_ctx);
     return;
 #else
 

@@ -95,6 +95,20 @@ typedef struct {
     on9log_sink_end_cb_t end_cb;         /**< @brief Called once after all arguments have been dispatched. */
 } on9log_sink_t;
 
+/** Plain-text presentation flags. Binary mode accepts but ignores them. */
+typedef enum {
+    ON9LOG_TEXT_PRETTY = 1u << 0,
+    ON9LOG_TEXT_PRETTYLINE = 1u << 1,
+    ON9LOG_TEXT_SHOWLEVEL = 1u << 2,
+    ON9LOG_TEXT_SHOWTOPIC = 1u << 3,
+    ON9LOG_TEXT_SHOWTIMESTAMP = 1u << 4,
+    ON9LOG_TEXT_CR = 1u << 5,
+} on9log_text_flag_t;
+
+#define ON9LOG_TEXT_DEFAULT_FLAGS \
+    ((uint8_t)(ON9LOG_TEXT_PRETTY | ON9LOG_TEXT_SHOWTOPIC | \
+               ON9LOG_TEXT_SHOWTIMESTAMP | ON9LOG_TEXT_CR))
+
 #if ON9LOG_PLAIN_TEXT
 /** @brief Output callback used by a plain-text formatter. */
 typedef void (*on9log_text_output_cb_t)(const char *data, size_t len, void *ctx);
@@ -222,6 +236,19 @@ void on9log_write(on9log_level_t level,
                   ...) __attribute__((format(printf, 3, 5)));
 
 /**
+ * @brief Write a log with per-Logger plain-text presentation flags.
+ *
+ * In binary mode @p text_flags is deliberately ignored and the emitted
+ * packet is identical to on9log_write().
+ */
+void on9log_write_with_text_flags(on9log_level_t level,
+                                  const char *tag,
+                                  uint8_t text_flags,
+                                  const char *format,
+                                  const char *arg_types,
+                                  ...) __attribute__((format(printf, 4, 6)));
+
+/**
  * @brief Write a log message with an optional original-format scan hint.
  *
  * Direct callers may pass @c format_scan when firmware-side `%.*s` detection is
@@ -266,6 +293,12 @@ void on9log_write_text(on9log_level_t level,
                        on9log_text_formatter_cb_t formatter,
                        void *formatter_ctx);
 
+void on9log_write_text_with_flags(on9log_level_t level,
+                                  const char *tag,
+                                  uint8_t text_flags,
+                                  on9log_text_formatter_cb_t formatter,
+                                  void *formatter_ctx);
+
 /**
  * @brief Enqueue an already-formatted plain-text body from ISR context.
  *
@@ -276,6 +309,12 @@ bool on9log_write_text_isr(on9log_level_t level,
                            const char *tag,
                            const char *text,
                            size_t text_len);
+
+bool on9log_write_text_isr_with_flags(on9log_level_t level,
+                                      const char *tag,
+                                      uint8_t text_flags,
+                                      const char *text,
+                                      size_t text_len);
 #endif
 
 /*
@@ -307,6 +346,13 @@ bool on9log_write_isr(on9log_level_t level,
                       const char *arg_types,
                       ...) __attribute__((format(printf, 3, 5)));
 
+bool on9log_write_isr_with_text_flags(on9log_level_t level,
+                                      const char *tag,
+                                      uint8_t text_flags,
+                                      const char *format,
+                                      const char *arg_types,
+                                      ...) __attribute__((format(printf, 4, 6)));
+
 /* on9log_write_buffer() and ON9_LOG_BUF*() must not be called from ISR context. */
 
 /**
@@ -326,6 +372,12 @@ void on9log_write_buffer(on9log_level_t level,
                          const char *tag,
                          const void *buffer,
                          size_t buffer_len);
+
+void on9log_write_buffer_with_text_flags(on9log_level_t level,
+                                         const char *tag,
+                                         uint8_t text_flags,
+                                         const void *buffer,
+                                         size_t buffer_len);
 
 /**
  * @brief Dispatch a complete raw on9log packet through the normal sink path.

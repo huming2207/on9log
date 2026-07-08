@@ -19,7 +19,7 @@ int main()
     require(capture != nullptr);
     require(on9log_unix_stdio_init_file(capture) == ON9LOG_OK);
 
-    on9log::Logger log("unix-smoke");
+    Logger log("unix-smoke");
     log.info("value=%d", 42);
     log.info("name={} value={}", "host", 42);
 

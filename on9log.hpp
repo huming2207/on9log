@@ -440,6 +440,11 @@ constexpr bool level_enabled(on9log_level_t level) noexcept
     return level != ON9_LOG_LEVEL_NONE && level <= ON9_LOG_LOCAL_LEVEL;
 }
 
+struct logger_target {
+    const char *tag;
+    std::uint8_t text_flags;
+};
+
 #if ON9LOG_PLAIN_TEXT
 class text_output_container {
 public:
@@ -646,17 +651,21 @@ void format_text(on9log_text_output_cb_t output,
  * @param args    The variadic arguments to encode.
  */
 template <on9log_level_t Level, typename... Args>
-void write_log(const char *tag, const char *format, Args &&...args) noexcept
+void write_log(const char *tag,
+               std::uint8_t text_flags,
+               const char *format,
+               Args &&...args) noexcept
 {
     if constexpr (level_enabled(Level)) {
 #if ON9LOG_PLAIN_TEXT
         if constexpr ((is_printf_arg_v<Args> && ...)) {
             if (uses_printf_format(format)) {
-                on9log_write(Level,
-                             tag,
-                             format,
-                             NULL,
-                             printf_arg(static_cast<Args &&>(args))...);
+                on9log_write_with_text_flags(Level,
+                                             tag,
+                                             text_flags,
+                                             format,
+                                             NULL,
+                                             printf_arg(static_cast<Args &&>(args))...);
                 return;
             }
         }
@@ -664,8 +673,13 @@ void write_log(const char *tag, const char *format, Args &&...args) noexcept
             format,
             std::forward_as_tuple(static_cast<Args &&>(args)...),
         };
-        on9log_write_text(Level, tag, format_text<Args &&...>, &ctx);
+        on9log_write_text_with_flags(Level,
+                                     tag,
+                                     text_flags,
+                                     format_text<Args &&...>,
+                                     &ctx);
 #else
+        (void)text_flags;
         with_wire_args(
             [&](auto... packed_args) {
                 on9log_write(Level, tag, format, arg_types<Args...>(), packed_args...);
@@ -689,9 +703,37 @@ void write_log(const char *tag, const char *format, Args &&...args) noexcept
  * @param args     The variadic arguments to encode.
  */
 template <on9log_level_t Level, fixed_string Format, typename... Args>
-void write_log(const char *tag, format_token<Format>, Args &&...args) noexcept
+void write_log(const char *tag,
+               std::uint8_t text_flags,
+               format_token<Format>,
+               Args &&...args) noexcept
 {
-    write_log<Level>(tag, noload_format<Format>(), static_cast<Args &&>(args)...);
+    write_log<Level>(tag,
+                     text_flags,
+                     noload_format<Format>(),
+                     static_cast<Args &&>(args)...);
+}
+
+template <on9log_level_t Level, typename... Args>
+void write_log(const logger_target &target,
+               const char *format,
+               Args &&...args) noexcept
+{
+    write_log<Level>(target.tag,
+                     target.text_flags,
+                     format,
+                     static_cast<Args &&>(args)...);
+}
+
+template <on9log_level_t Level, fixed_string Format, typename... Args>
+void write_log(const logger_target &target,
+               format_token<Format> format,
+               Args &&...args) noexcept
+{
+    write_log<Level>(target.tag,
+                     target.text_flags,
+                     format,
+                     static_cast<Args &&>(args)...);
 }
 
 /**
@@ -715,7 +757,10 @@ void write_log(const char *tag, format_token<Format>, Args &&...args) noexcept
  *         ISR ring buffer was full.
  */
 template <on9log_level_t Level, typename... Args>
-bool write_log_isr(const char *tag, const char *format, Args &&...args) noexcept
+bool write_log_isr(const char *tag,
+                   std::uint8_t text_flags,
+                   const char *format,
+                   Args &&...args) noexcept
 {
     if constexpr (!level_enabled(Level)) {
         return true;
@@ -727,11 +772,13 @@ bool write_log_isr(const char *tag, const char *format, Args &&...args) noexcept
 #if ON9LOG_PLAIN_TEXT
         if constexpr ((is_printf_arg_v<Args> && ...)) {
             if (uses_printf_format(format)) {
-                return on9log_write_isr(Level,
-                                        tag,
-                                        format,
-                                        arg_types<Args...>(),
-                                        printf_arg(static_cast<Args &&>(args))...);
+                return on9log_write_isr_with_text_flags(
+                    Level,
+                    tag,
+                    text_flags,
+                    format,
+                    arg_types<Args...>(),
+                    printf_arg(static_cast<Args &&>(args))...);
             }
         }
         char text[ON9LOG_ISR_PACKET_MAX];
@@ -739,8 +786,16 @@ bool write_log_isr(const char *tag, const char *format, Args &&...args) noexcept
                                        sizeof(text),
                                        fmt::runtime(format != nullptr ? format : ""),
                                        plain_text_arg(static_cast<Args &&>(args))...);
-        return on9log_write_text_isr(Level, tag, text, result.size);
+        if (result.size > sizeof(text)) {
+            return false;
+        }
+        return on9log_write_text_isr_with_flags(Level,
+                                                tag,
+                                                text_flags,
+                                                text,
+                                                result.size);
 #else
+        (void)text_flags;
         return with_wire_args(
             [&](auto... packed_args) {
                 return on9log_write_isr(Level, tag, format, arg_types<Args...>(), packed_args...);
@@ -767,9 +822,37 @@ bool write_log_isr(const char *tag, const char *format, Args &&...args) noexcept
  *         ISR ring buffer was full.
  */
 template <on9log_level_t Level, fixed_string Format, typename... Args>
-bool write_log_isr(const char *tag, format_token<Format>, Args &&...args) noexcept
+bool write_log_isr(const char *tag,
+                   std::uint8_t text_flags,
+                   format_token<Format>,
+                   Args &&...args) noexcept
 {
-    return write_log_isr<Level>(tag, noload_format<Format>(), static_cast<Args &&>(args)...);
+    return write_log_isr<Level>(tag,
+                                text_flags,
+                                noload_format<Format>(),
+                                static_cast<Args &&>(args)...);
+}
+
+template <on9log_level_t Level, typename... Args>
+bool write_log_isr(const logger_target &target,
+                   const char *format,
+                   Args &&...args) noexcept
+{
+    return write_log_isr<Level>(target.tag,
+                                target.text_flags,
+                                format,
+                                static_cast<Args &&>(args)...);
+}
+
+template <on9log_level_t Level, fixed_string Format, typename... Args>
+bool write_log_isr(const logger_target &target,
+                   format_token<Format> format,
+                   Args &&...args) noexcept
+{
+    return write_log_isr<Level>(target.tag,
+                                target.text_flags,
+                                format,
+                                static_cast<Args &&>(args)...);
 }
 
 /**
@@ -783,11 +866,22 @@ bool write_log_isr(const char *tag, format_token<Format>, Args &&...args) noexce
  * @param len     Number of bytes in the buffer.
  */
 template <on9log_level_t Level>
-void write_buffer(const char *tag, const void *buffer, std::size_t len) noexcept
+void write_buffer(const char *tag,
+                  std::uint8_t text_flags,
+                  const void *buffer,
+                  std::size_t len) noexcept
 {
     if constexpr (level_enabled(Level)) {
-        on9log_write_buffer(Level, tag, buffer, len);
+        on9log_write_buffer_with_text_flags(Level, tag, text_flags, buffer, len);
     }
+}
+
+template <on9log_level_t Level>
+void write_buffer(const logger_target &target,
+                  const void *buffer,
+                  std::size_t len) noexcept
+{
+    write_buffer<Level>(target.tag, target.text_flags, buffer, len);
 }
 
 } // namespace detail
@@ -859,25 +953,58 @@ consteval detail::format_token<Format> operator""_on9fmt() noexcept
  */
 class Logger {
 public:
+    /** Presentation flags used by plain-text mode. Binary mode ignores them. */
+    enum Flags : std::uint8_t {
+        PRETTY = ON9LOG_TEXT_PRETTY,
+        PRETTYLINE = ON9LOG_TEXT_PRETTYLINE,
+        SHOWLEVEL = ON9LOG_TEXT_SHOWLEVEL,
+        SHOWTOPIC = ON9LOG_TEXT_SHOWTOPIC,
+        SHOWTIMESTAMP = ON9LOG_TEXT_SHOWTIMESTAMP,
+        CR = ON9LOG_TEXT_CR,
+    };
+
+    /** Singular spelling retained for code that refers to a Flag value. */
+    using Flag = Flags;
+
+    friend constexpr Flags operator|(Flags lhs, Flags rhs) noexcept
+    {
+        return static_cast<Flags>(static_cast<std::uint8_t>(lhs) |
+                                  static_cast<std::uint8_t>(rhs));
+    }
+
+    friend constexpr Flags operator&(Flags lhs, Flags rhs) noexcept
+    {
+        return static_cast<Flags>(static_cast<std::uint8_t>(lhs) &
+                                  static_cast<std::uint8_t>(rhs));
+    }
+
+private:
+    static constexpr Flags DefaultFlags =
+        static_cast<Flags>(static_cast<std::uint8_t>(PRETTY) |
+                           static_cast<std::uint8_t>(SHOWTOPIC) |
+                           static_cast<std::uint8_t>(SHOWTIMESTAMP) |
+                           static_cast<std::uint8_t>(CR));
+
+public:
     /**
      * @brief  Construct a Logger with a given tag.
      *
      * @param tag  A C-string tag; must remain valid for the lifetime of
      *             this Logger.
      */
-    constexpr explicit Logger(const char *tag) noexcept
-        : tag_(tag)
+    constexpr explicit Logger(const char *tag, Flags flags = DefaultFlags) noexcept
+        : tag_{tag, static_cast<std::uint8_t>(flags)}
     {
     }
 
     /** @brief  Return the current tag string.
      *  @return Pointer to the tag C-string. */
-    constexpr const char *tag() const noexcept { return tag_; }
+    constexpr const char *tag() const noexcept { return tag_.tag; }
 
     /** @brief  Replace the tag string.
      *  @param tag  New C-string tag; must remain valid for the lifetime of
      *              this Logger. */
-    constexpr void set_tag(const char *tag) noexcept { tag_ = tag; }
+    constexpr void set_tag(const char *tag) noexcept { tag_.tag = tag; }
 
     /**
      * @brief  Set the global log level (affects all loggers).
@@ -1821,18 +1948,24 @@ public:
 
 private:
     /// Owning reference to the tag C-string (not owned; must outlive this).
-    const char *tag_;
+    detail::logger_target tag_;
 };
 
+} // namespace on9log
+
 /**
- * @brief  Pre-built Logger instance with tag @c "default" at file-scope.
+ * @brief Global public name for the C++ Logger, matching the sg_logger API.
  *
- * Logging through this instance does not require constructing a Logger
- * manually:
+ * Implementation helpers and format literals remain under @c on9log, while
+ * application code can construct a logger as @c Logger{"topic"}.
+ */
+using Logger = on9log::Logger;
+
+/**
+ * @brief Pre-built global Logger instance with tag @c "default".
+ *
  * @code
- *   on9log::debug.info("hello");
+ *   debug.info("hello");
  * @endcode
  */
 inline constexpr Logger debug{"default"};
-
-} // namespace on9log

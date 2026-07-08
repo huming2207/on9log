@@ -84,7 +84,7 @@ ON9_LOGI("debug", "name=%s ptr=%p", name, ON9_PTR(name));
 #include <string>
 #include <string_view>
 
-on9log::Logger log("demo");
+Logger log("demo");
 log.info("value={} name={}", value, name);           // printf-style
 log.info<"value={} name={}">(value, name);            // no-load {} style
 log.warn("status=%d", code);
