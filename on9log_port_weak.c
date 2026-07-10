@@ -35,6 +35,8 @@ ON9LOG_WEAK void on9log_port_lock(void) {}
  */
 ON9LOG_WEAK void on9log_port_unlock(void) {}
 
+ON9LOG_WEAK void on9log_port_yield(void) {}
+
 /**
  * @brief Weak default monotonic timestamp in milliseconds.
  *

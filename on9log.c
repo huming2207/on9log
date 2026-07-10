@@ -70,6 +70,8 @@ typedef struct {
     atomic_uint generation;     /**< Seqlock generation (even = stable, odd = write in progress). */
     atomic_uintptr_t sink;      /**< Pointer to the sink descriptor (@ref on9log_sink_t). */
     atomic_uintptr_t ctx;       /**< Opaque user context passed to every sink callback. */
+    atomic_uint readers;        /**< Dispatch snapshots currently using this slot. */
+    atomic_bool retiring;       /**< Empty slot awaiting completion of old readers. */
 } on9log_sink_entry_t;
 
 /**
@@ -95,6 +97,7 @@ typedef struct {
 typedef struct {
     const on9log_sink_t *sink; /**< The sink descriptor. */
     void *ctx;                 /**< Opaque user context for the sink. */
+    on9log_sink_entry_t *entry; /**< Registry slot whose reader reference is held. */
 } on9log_stream_sink_t;
 
 /**
@@ -111,15 +114,16 @@ typedef struct {
 /**
  * @brief A node in the per-tag filter linked list.
  *
- * Each node stores a tag pointer, a minimum log level, and an active flag.
+ * Each node owns a tag string and stores a minimum log level and active flag.
  * The list is walked atomically (via @ref s_tag_filter_head) by the
  * fast-path filter check.
  */
 typedef struct on9log_tag_filter_node {
     SLIST_ENTRY(on9log_tag_filter_node) entries; /**< BSD sys/queue list entry. */
-    const char *tag;                              /**< Tag string (pointer-identity or strcmp match). */
+    char *tag;                                    /**< Owned tag string. */
     atomic_int level;                             /**< Minimum enabled level for this tag. */
     atomic_bool active;                           /**< @c true while this node is in the live filter list. */
+    atomic_uint readers;                          /**< Lookups currently reading this node. */
 } on9log_tag_filter_node_t;
 
 /** @brief Type alias for the BSD sys/queue singly-linked list header. */
@@ -211,6 +215,7 @@ static void on9log_put_u64(on9log_encoder_t *enc, uint64_t val)
     on9log_put_u32(enc, (uint32_t)(val >> 32u));
 }
 
+#if ON9LOG_PLAIN_TEXT
 static void on9log_put_bytes(on9log_encoder_t *enc, const void *data, size_t len)
 {
     const uint8_t *bytes = (const uint8_t *)data;
@@ -225,6 +230,7 @@ static void on9log_put_bytes(on9log_encoder_t *enc, const void *data, size_t len
     memcpy(&enc->data[enc->len], bytes, len);
     enc->len += len;
 }
+#endif
 
 /**
  * @brief Look up the argument type at a given index.
@@ -316,14 +322,25 @@ static void on9log_stream_start(on9log_stream_t *stream, const uint8_t *header, 
             sink = (const on9log_sink_t *)atomic_load_explicit(&s_sinks[i].sink, memory_order_relaxed);
             ctx = (void *)atomic_load_explicit(&s_sinks[i].ctx, memory_order_relaxed);
             gen2 = atomic_load_explicit(&s_sinks[i].generation, memory_order_acquire);
-            if (gen1 == gen2) {
+            if (gen1 != gen2) {
+                continue;
+            }
+            if (sink == NULL) {
                 break;
             }
+
+            atomic_fetch_add_explicit(&s_sinks[i].readers, 1u, memory_order_acq_rel);
+            if (atomic_load_explicit(&s_sinks[i].generation, memory_order_acquire) == gen2 &&
+                atomic_load_explicit(&s_sinks[i].sink, memory_order_acquire) == (uintptr_t)sink) {
+                break;
+            }
+            atomic_fetch_sub_explicit(&s_sinks[i].readers, 1u, memory_order_release);
         }
 
         if (sink != NULL) {
             stream->sinks[stream->sink_count].sink = sink;
             stream->sinks[stream->sink_count].ctx = ctx;
+            stream->sinks[stream->sink_count].entry = &s_sinks[i];
             ++stream->sink_count;
         }
     }
@@ -368,6 +385,7 @@ static void on9log_stream_end(on9log_stream_t *stream)
 {
     for (size_t i = 0; i < stream->sink_count; ++i) {
         stream->sinks[i].sink->end_cb(stream->sinks[i].ctx);
+        atomic_fetch_sub_explicit(&stream->sinks[i].entry->readers, 1u, memory_order_release);
     }
 }
 
@@ -1168,13 +1186,24 @@ static on9log_level_t on9log_filter_level_for_tag(const char *tag)
         return (on9log_level_t)atomic_load_explicit(&s_default_level, memory_order_relaxed);
     }
 
-    const on9log_tag_filter_node_t *node = (const on9log_tag_filter_node_t *)atomic_load_explicit(
+    on9log_tag_filter_node_t *node = (on9log_tag_filter_node_t *)atomic_load_explicit(
         &s_tag_filter_head,
         memory_order_acquire);
     while (node != NULL) {
-        if (atomic_load_explicit(&node->active, memory_order_acquire) &&
-            on9log_tag_matches(node->tag, tag)) {
-            return (on9log_level_t)atomic_load_explicit(&node->level, memory_order_relaxed);
+        if (atomic_load_explicit(&node->active, memory_order_acquire)) {
+            atomic_fetch_add_explicit(&node->readers, 1u, memory_order_acq_rel);
+            if (atomic_load_explicit(&node->active, memory_order_acquire)) {
+                bool matches = on9log_tag_matches(node->tag, tag);
+                on9log_level_t level = (on9log_level_t)atomic_load_explicit(
+                    &node->level,
+                    memory_order_relaxed);
+                atomic_fetch_sub_explicit(&node->readers, 1u, memory_order_release);
+                if (matches) {
+                    return level;
+                }
+            } else {
+                atomic_fetch_sub_explicit(&node->readers, 1u, memory_order_release);
+            }
         }
         node = SLIST_NEXT(node, entries);
     }
@@ -1281,7 +1310,8 @@ on9log_err_t on9log_add_sink(const on9log_sink_t *sink, void *ctx)
         }
     }
     for (size_t i = 0; i < ON9LOG_MAX_SINKS; ++i) {
-        if (atomic_load_explicit(&s_sinks[i].sink, memory_order_acquire) == (uintptr_t)NULL) {
+        if (atomic_load_explicit(&s_sinks[i].sink, memory_order_acquire) == (uintptr_t)NULL &&
+            !atomic_load_explicit(&s_sinks[i].retiring, memory_order_acquire)) {
             unsigned gen = atomic_load_explicit(&s_sinks[i].generation, memory_order_relaxed);
             atomic_store_explicit(&s_sinks[i].generation, gen + 1u, memory_order_relaxed);
             atomic_store_explicit(&s_sinks[i].ctx, (uintptr_t)ctx, memory_order_relaxed);
@@ -1320,8 +1350,14 @@ on9log_err_t on9log_remove_sink(const on9log_sink_t *sink, void *ctx)
             atomic_store_explicit(&s_sinks[i].generation, gen + 1u, memory_order_relaxed);
             atomic_store_explicit(&s_sinks[i].sink, (uintptr_t)NULL, memory_order_release);
             atomic_store_explicit(&s_sinks[i].ctx, (uintptr_t)NULL, memory_order_relaxed);
+            atomic_store_explicit(&s_sinks[i].retiring, true, memory_order_release);
             atomic_store_explicit(&s_sinks[i].generation, gen + 2u, memory_order_release);
             on9log_port_unlock();
+
+            while (atomic_load_explicit(&s_sinks[i].readers, memory_order_acquire) != 0u) {
+                on9log_port_yield();
+            }
+            atomic_store_explicit(&s_sinks[i].retiring, false, memory_order_release);
             return ON9LOG_OK;
         }
     }
@@ -1372,7 +1408,7 @@ on9log_level_t on9log_get_level(void)
  * If a filter node already exists for the tag its level is updated; otherwise
  * a new node is allocated and inserted at the head of the filter list.
  *
- * @param[in] tag    Tag string (pointer is stored, not copied).
+ * @param[in] tag    Tag string (copied by the logger).
  * @param[in] level  Minimum log level for this tag.
  *
  * @return
@@ -1382,6 +1418,9 @@ on9log_level_t on9log_get_level(void)
  */
 on9log_err_t on9log_set_tag_level(const char *tag, on9log_level_t level)
 {
+    char *tag_copy;
+    size_t tag_len;
+
     if (tag == NULL || !on9log_valid_level(level)) {
         return ON9LOG_ERR_INVALID_ARG;
     }
@@ -1400,16 +1439,63 @@ on9log_err_t on9log_set_tag_level(const char *tag, on9log_level_t level)
             return ON9LOG_OK;
         }
     }
+    on9log_port_unlock();
+
+    tag_len = strlen(tag);
+    tag_copy = (char *)malloc(tag_len + 1u);
+    if (tag_copy == NULL) {
+        return ON9LOG_ERR_NO_MEM;
+    }
+    memcpy(tag_copy, tag, tag_len + 1u);
+
+    /* Recheck after allocating because another writer may have added it. */
+    on9log_port_lock();
+    SLIST_FOREACH(node, &s_tag_filters, entries) {
+        if (on9log_tag_matches(node->tag, tag)) {
+            bool was_active = atomic_load_explicit(&node->active, memory_order_acquire);
+            atomic_store_explicit(&node->level, (int)level, memory_order_relaxed);
+            if (!was_active) {
+                atomic_store_explicit(&node->active, true, memory_order_release);
+                atomic_fetch_add_explicit(&s_active_tag_filter_count, 1, memory_order_acq_rel);
+            }
+            on9log_port_unlock();
+            free(tag_copy);
+            return ON9LOG_OK;
+        }
+    }
+
+    /* Reuse cleared nodes so repeated transient tag names do not grow forever. */
+    on9log_tag_filter_node_t *reusable = NULL;
+    SLIST_FOREACH(node, &s_tag_filters, entries) {
+        if (!atomic_load_explicit(&node->active, memory_order_acquire)) {
+            reusable = node;
+            break;
+        }
+    }
+    if (reusable != NULL) {
+        while (atomic_load_explicit(&reusable->readers, memory_order_acquire) != 0u) {
+            on9log_port_yield();
+        }
+        free(reusable->tag);
+        reusable->tag = tag_copy;
+        atomic_store_explicit(&reusable->level, (int)level, memory_order_relaxed);
+        atomic_store_explicit(&reusable->active, true, memory_order_release);
+        atomic_fetch_add_explicit(&s_active_tag_filter_count, 1, memory_order_acq_rel);
+        on9log_port_unlock();
+        return ON9LOG_OK;
+    }
 
     node = (on9log_tag_filter_node_t *)calloc(1, sizeof(*node));
     if (node == NULL) {
         on9log_port_unlock();
+        free(tag_copy);
         return ON9LOG_ERR_NO_MEM;
     }
 
-    node->tag = tag;
+    node->tag = tag_copy;
     atomic_init(&node->level, (int)level);
     atomic_init(&node->active, true);
+    atomic_init(&node->readers, 0u);
     SLIST_INSERT_HEAD(&s_tag_filters, node, entries);
     atomic_fetch_add_explicit(&s_active_tag_filter_count, 1, memory_order_acq_rel);
     atomic_store_explicit(&s_tag_filter_head, (uintptr_t)SLIST_FIRST(&s_tag_filters), memory_order_release);

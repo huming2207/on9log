@@ -10,6 +10,8 @@
 
 #include "esp_log_timestamp.h"
 #include "esp_private/log_lock.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 /**
  * @brief Acquire the on9log global lock.
@@ -32,6 +34,11 @@ void on9log_port_lock(void)
 void on9log_port_unlock(void)
 {
     esp_log_impl_unlock();
+}
+
+void on9log_port_yield(void)
+{
+    taskYIELD();
 }
 
 /**

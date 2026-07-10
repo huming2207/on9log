@@ -6,6 +6,7 @@
 #include "on9log_port.h"
 
 #include <pthread.h>
+#include <sched.h>
 #include <time.h>
 
 static pthread_mutex_t s_on9log_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -18,6 +19,11 @@ void on9log_port_lock(void)
 void on9log_port_unlock(void)
 {
     (void)pthread_mutex_unlock(&s_on9log_lock);
+}
+
+void on9log_port_yield(void)
+{
+    (void)sched_yield();
 }
 
 uint32_t on9log_port_timestamp_ms(void)

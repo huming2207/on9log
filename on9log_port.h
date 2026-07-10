@@ -19,6 +19,8 @@ void on9log_port_lock(void);
  * @brief Release the on9log mutex/lock previously acquired via on9log_port_lock().
  */
 void on9log_port_unlock(void);
+/** Yield execution while an infrequent task-context mutation waits for readers. */
+void on9log_port_yield(void);
 /**
  * @brief Return a monotonic millisecond timestamp usable from task (non-ISR) context.
  *

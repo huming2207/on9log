@@ -5,6 +5,10 @@
 #include <stdint.h>
 #include <string.h>
 
+#ifdef __cplusplus
+#include <type_traits>
+#endif
+
 #include "on9log_config.h"
 
 #ifdef __cplusplus
@@ -145,7 +149,9 @@ on9log_err_t on9log_add_sink(const on9log_sink_t *sink, void *ctx);
  * @brief Remove a previously registered log sink.
  *
  * Both the sink descriptor pointer and the context pointer must match the
- * values used during registration.
+ * values used during registration. On success, all in-flight callbacks for
+ * this registration have completed, so the caller may release both objects.
+ * This function must not be called from one of the sink's own callbacks.
  *
  * @param[in] sink Pointer to the sink descriptor to remove.
  * @param[in] ctx  User context that was passed at registration time.
@@ -195,7 +201,7 @@ on9log_level_t on9log_get_level(void);
  * When a tag-level override is set, messages with that tag use the override
  * level instead of the global level, provided the override is more restrictive.
  *
- * @param[in] tag   The tag string to filter.
+ * @param[in] tag   The tag string to filter. The logger copies this string.
  * @param[in] level Maximum log level allowed for this tag.
  *
  * @return ON9LOG_OK on success, or an error code on failure.
@@ -470,17 +476,20 @@ on9log_err_t on9log_dispatch_packet(const uint8_t *packet, size_t packet_len);
 #endif
 
 /**
- * @brief Return a .noload-resident pointer for compile-time constant strings,
- *        or pass through runtime strings unchanged.
+ * @brief Return a .noload-resident pointer for a string literal.
  *
- * @param[in] str String that may or may not be a compile-time constant.
+ * Runtime format pointers must use ON9_LOG_RUNTIME_LEVEL() or one of its
+ * level-specific wrappers because C/C++ must still parse an unselected
+ * conditional branch containing a static string-literal initializer.
+ *
+ * @param[in] str String literal.
  *
  * @return Pointer to the string (possibly in the .noload section).
  */
 #if ON9LOG_PLAIN_TEXT
 #define ON9_LOG_ATTR_STR(str) (str)
 #else
-#define ON9_LOG_ATTR_STR(str) (__builtin_constant_p(str) ? ON9_LOG_NOLOAD_STR(str) : (str))
+#define ON9_LOG_ATTR_STR(str) ON9_LOG_NOLOAD_STR(str)
 #endif
 
 /**
@@ -725,9 +734,10 @@ struct On9LogArgType<float> {
  * @return The on9log_args_type_t classification as unsigned long long.
  */
 template <typename T>
-constexpr unsigned long long ON9_LOG_DETECT_TYPE_IMPL(const T &, bool is_constant)
+constexpr unsigned long long ON9_LOG_DETECT_TYPE_IMPL(bool is_constant)
 {
-    return is_constant ? On9LogArgType<T>::constant_log_type : On9LogArgType<T>::log_type;
+    using Raw = std::remove_cv_t<std::remove_reference_t<T>>;
+    return is_constant ? On9LogArgType<Raw>::constant_log_type : On9LogArgType<Raw>::log_type;
 }
 }
 
@@ -736,7 +746,7 @@ constexpr unsigned long long ON9_LOG_DETECT_TYPE_IMPL(const T &, bool is_constan
  *
  * Delegates to the ON9_LOG_DETECT_TYPE_IMPL template function.
  */
-#define ON9_LOG_DETECT_TYPE(arg) ON9_LOG_DETECT_TYPE_IMPL((arg), __builtin_constant_p(arg))
+#define ON9_LOG_DETECT_TYPE(arg) ON9_LOG_DETECT_TYPE_IMPL<decltype(arg)>(__builtin_constant_p(arg))
 #endif
 
 /**
@@ -837,6 +847,49 @@ constexpr unsigned long long ON9_LOG_DETECT_TYPE_IMPL(const T &, bool is_constan
         } \
     } while (0)
 #endif
+
+/**
+ * @brief Log with a runtime format-string pointer.
+ *
+ * Unlike ON9_LOG_LEVEL(), this deliberately keeps the format string in
+ * runtime-accessible storage and does not attempt to place it in .noload.
+ */
+#if ON9LOG_PLAIN_TEXT
+#define ON9_LOG_RUNTIME_LEVEL(level, tag, format, ...) do { \
+        if (ON9_LOG_ENABLED(level)) { \
+            ON9_LOG_DIAG_PUSH; \
+            ON9_LOG_DIAG_IGNORE_FORMAT_OVERFLOW; \
+            on9log_write((level), (tag), (format), NULL, ##__VA_ARGS__); \
+            ON9_LOG_DIAG_POP; \
+        } \
+    } while (0)
+#else
+#define ON9_LOG_RUNTIME_LEVEL(level, tag, format, ...) do { \
+        if (ON9_LOG_ENABLED(level)) { \
+            ON9_LOG_DIAG_PUSH; \
+            ON9_LOG_DIAG_IGNORE_FORMAT_OVERFLOW; \
+            const char *__on9log_runtime_format = (format); \
+            const char *__on9log_arg_types = ON9_LOG_ARGS_TYPE(__VA_ARGS__); \
+            bool __on9log_has_string = ON9_LOG_ARGS_HAVE_STRING(__on9log_arg_types); \
+            const char *__on9log_format_scan = ON9_LOG_FORMAT_SCAN_HINT(__on9log_runtime_format, __on9log_has_string); \
+            on9log_write_with_format_scan_metadata((level), \
+                                                   (tag), \
+                                                   __on9log_runtime_format, \
+                                                   __on9log_format_scan, \
+                                                   __on9log_arg_types, \
+                                                   (uint8_t)ON9_LOG_VA_NARG(__VA_ARGS__), \
+                                                   __on9log_has_string, \
+                                                   ##__VA_ARGS__); \
+            ON9_LOG_DIAG_POP; \
+        } \
+    } while (0)
+#endif
+
+#define ON9_LOG_RUNTIMEE(tag, format, ...) ON9_LOG_RUNTIME_LEVEL(ON9_LOG_LEVEL_ERROR, tag, format, ##__VA_ARGS__)
+#define ON9_LOG_RUNTIMEW(tag, format, ...) ON9_LOG_RUNTIME_LEVEL(ON9_LOG_LEVEL_WARN, tag, format, ##__VA_ARGS__)
+#define ON9_LOG_RUNTIMEI(tag, format, ...) ON9_LOG_RUNTIME_LEVEL(ON9_LOG_LEVEL_INFO, tag, format, ##__VA_ARGS__)
+#define ON9_LOG_RUNTIMED(tag, format, ...) ON9_LOG_RUNTIME_LEVEL(ON9_LOG_LEVEL_DEBUG, tag, format, ##__VA_ARGS__)
+#define ON9_LOG_RUNTIMEV(tag, format, ...) ON9_LOG_RUNTIME_LEVEL(ON9_LOG_LEVEL_VERBOSE, tag, format, ##__VA_ARGS__)
 
 /**
  * @brief Log an ERROR-level message (task context).
