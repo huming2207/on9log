@@ -65,7 +65,7 @@ callbacks receive an explicit `end_cb()`.
 ## Default ESP VFS Sink
 
 `on9log_esp_vfs.c` provides the default framed ESP VFS sink. This VFS path
-has been validated with ESP-IDF v6.0.1; ESP-IDF v6.0 had an ISR WDT issue in
+has been validated with ESP-IDF v6.0.2; ESP-IDF v6.0 had an ISR WDT issue in
 this usage. It calls
 `esp_stdio_log_vfs_init()`, registers an `on9log_sink_t`, buffers each raw on9log
 packet until `end_cb()`, and forwards it through the shared stdio transport
@@ -220,6 +220,15 @@ typedef enum {
 `ESP_LOG_*`. C++ users can include `on9log.hpp` and use the header-only
 `on9log::Logger` wrapper instead:
 
+Binary C macros require a format literal so it can be placed in `.noload`.
+Use `ON9_LOG_RUNTIMEE/W/I/D/V()` for a runtime format pointer; runtime formats
+remain in addressable firmware storage.
+
+When these C macros are included from C++, argument classification uses
+`decltype(arg)` and type traits only. It must remain an unevaluated operation:
+expressions with side effects are evaluated exactly once, when passed to the
+actual logging call.
+
 ```c++
 using namespace on9log::literals;
 
@@ -273,12 +282,16 @@ on9log::Logger::clear_tag_level("wifi");
 
 `ON9_LOG_LOCAL_LEVEL` remains a hard compile-time ceiling; runtime filtering can
 only suppress logs that pass that ceiling. A filtered log emits no packet and no
-bytes. Per-tag filters are stored in an internal `SLIST` and are matched by tag
-pointer first, then by string contents. The no-filter hot path checks only the
-runtime default level and the compile-time ceiling. When tag filters are active,
-readers traverse an atomically published SLIST without taking the port lock;
-writers use `on9log_port_lock()`. Cleared tag-filter nodes are marked inactive
-but not freed, so in-flight lock-free readers cannot observe freed memory.
+bytes. `on9log_set_tag_level()` copies the supplied tag; callers do not need to
+retain the original string. Per-tag filters are stored in an internal `SLIST`
+and are matched by tag pointer first, then by string contents. The no-filter hot
+path checks only the runtime default level and the compile-time ceiling. When
+tag filters are active, readers take a per-node atomic reader reference before
+accessing the owned tag. Writers use `on9log_port_lock()`. Clearing marks a node
+inactive, and a later distinct tag may reuse that node only after its readers
+drain. This prevents dangling tag reads while bounding allocation growth to the
+peak number of simultaneously retained filter nodes rather than historical tag
+churn.
 
 In ESP-IDF builds, `Kconfig` exposes:
 
@@ -307,6 +320,7 @@ Platform-specific services are isolated behind `on9log_port.h`:
 ```c
 void on9log_port_lock(void);
 void on9log_port_unlock(void);
+void on9log_port_yield(void);
 uint32_t on9log_port_timestamp_ms(void);
 ```
 
@@ -594,13 +608,37 @@ non-ESP ports should implement `on9log_port_isr_enqueue_packet()` using the
 platform's own ISR-safe queue, lock-free ring, or interrupt-safe handoff
 primitive.
 
-`ON9_ISR_LOGx()` is ISR-safe in the normal FreeRTOS sense, but it is not
-guaranteed IRAM-safe or flash-cache-disabled safe on ESP-IDF. The current path is
-not marked `IRAM_ATTR`, and marking only the public function would be
-misleading: every helper it calls and every data object it reads, directly or
-indirectly, would also need to live in IRAM/DRAM. ESP interrupts registered with
-`ESP_INTR_FLAG_IRAM` should not use this path unless a future dedicated
-IRAM/DRAM-safe variant is added and audited end-to-end.
+The uninitialized-backend behavior is intentional: when
+`on9log_port_isr_ready()` is false, `ON9_ISR_LOGx()` returns success as a silent
+no-op and does not increment the dropped counter. Do not change this without an
+explicit design decision.
+
+`ON9_ISR_LOGx()` is currently ISR-safe only while flash cache is available. It
+is **not yet** safe for `ESP_INTR_FLAG_IRAM` handlers or interrupts that run
+during flash erase/write operations. Merely adding `IRAM_ATTR` to the public
+entry point is insufficient. Cache-disabled support is pending and should use
+this design:
+
+- keep it binary-mode-only; plain-text `fmt`/`vsnprintf` formatting is outside
+  the cache-disabled guarantee;
+- split the ISR encoder and its scalar/header helpers into a small dedicated
+  translation unit, then map that object's text and literal pools to
+  `noflash_text` with an ESP-IDF linker fragment;
+- use a dedicated ISR filter that never dereferences flash-resident tags. The
+  preferred behavior is global-level filtering plus optional pointer-identity
+  per-tag matching; the tag and `.noload` format addresses can still be copied
+  into the packet and resolved from the ELF without reading their contents;
+- place ISR-visible mutable state in internal DRAM and create the ringbuffer
+  with `xRingbufferCreateWithCaps(..., MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)`
+  so enabling PSRAM cannot move it behind a disabled cache;
+- require `CONFIG_RINGBUF_PLACE_ISR_FUNCTIONS_INTO_FLASH=n`. ESP-IDF then maps
+  `xRingbufferSendFromISR()` and its helpers to IRAM; it also maps
+  `xTaskGetTickCountFromISR()` to IRAM;
+- verify the linked call graph, literal pools, compiler helpers, and data
+  addresses from an ELF that actually retains an ISR callsite, then run a
+  hardware test that fires an IRAM interrupt during a flash operation.
+
+No part of that cache-disabled design has been implemented yet.
 
 The C++ `on9log::Logger` wrapper exposes matching
 `isr_error/warn/info/debug/verbose()` methods that call `on9log_write_isr()`.
@@ -615,36 +653,28 @@ Current shared state is handled as follows:
 
 - packet sequence counter: atomic;
 - dropped packet counter: atomic;
-- sink stream dispatch: lock-free atomic pointer loads;
+- sink stream dispatch: lock-free atomic pointer loads plus per-slot reader
+  references;
 - sink add/remove: still locked to serialize table mutation and duplicate/free
   slot checks.
 
 Sink slots publish `ctx` first and then publish the sink-struct pointer with
-release semantics. Dispatch loads `sink` with acquire semantics and only reads
-`ctx` if `sink` is non-null. Removal clears only `sink`; the old `ctx` remains in
-the slot until the slot is reused, so an in-flight reader that already observed
-the old sink pointer still sees the matching context. At packet start, dispatch
-snapshots the currently registered sink pointers and contexts, then uses that
-snapshot for all payload callbacks and `end_cb()` for that packet. The sink
-struct must have static or otherwise long-lived storage; the logger stores its
-pointer, not a copy.
+release semantics. Dispatch obtains a per-slot reader reference, revalidates the
+slot generation and sink pointer, and retains that reference through
+`end_cb()`. Removal clears the published entry, marks the slot as retiring, and
+waits outside the port lock until existing readers finish. The slot cannot be
+reused during retirement. Therefore a successful `on9log_remove_sink()` is an
+in-flight callback barrier: after it returns, the caller may release the sink
+descriptor and context. Calling remove from that sink's own callback is invalid
+because it would wait for its own reader reference.
 
 This makes normal log emission and sink dispatch lock-free. Registration and
 removal are expected to be infrequent, so keeping those paths locked is a
 reasonable tradeoff.
 
-One important lifetime rule:
-
-```text
-After on9log_remove_sink(), do not immediately free ctx or the sink struct if
-another core may already have loaded the callback pointer.
-```
-
-Removal prevents future dispatches after the cleared sink pointer is observed,
-but it is not an in-flight callback barrier. A sink already captured in a packet
-snapshot may still receive payload callbacks and `end_cb()`. If strict teardown
-is needed later, add reference counting, an epoch/RCU scheme, or make sinks
-init-only.
+Mutation paths use `on9log_port_yield()` while waiting for reader references.
+ESP-IDF implements it with `taskYIELD()` and the Unix port uses `sched_yield()`;
+custom preemptive ports should provide an equivalent task-context operation.
 
 ## clangd Atomic Diagnostics
 
@@ -707,20 +737,20 @@ files; the standalone CMake branch does not claim to support non-Unix cross
 targets. The top-level ESP project requires CMake 3.22, above the component's
 3.20 minimum.
 
-Host builds and Rust decoder tests have passed, but an ESP-IDF firmware build
-has not been run after these local additions. Do not treat host validation as
-a substitute for `idf.py build`.
+The current changes have passed binary and plain-text Unix ASan/UBSan tests, a
+ThreadSanitizer concurrency regression, targeted C/C++ macro probes, and a full
+ESP-IDF v6.0.2 ESP32-S3 `idf.py build`. Hardware execution and the separate Rust
+decoder test suite were not rerun as part of this change.
 
 ## Known Implementation Risks
 
 The current implementation is usable for the intended ESP32-S3 experiment, but
 these review findings are still open and should be treated as real constraints:
 
-- **Non-constant format strings are not rejected.** `ON9_LOG_ATTR_STR(str)` falls
-  back to `(str)` when `__builtin_constant_p(str)` is false. Such logs can still
-  compile, but the firmware only sends the pointer as `fmt_id`; the host resolver
-  expects format strings in `.noload` and will render unresolved dynamic formats
-  as `<fmt @0x........>`.
+- **Runtime formats require explicit macros.** Binary `ON9_LOGE/W/I/D/V()`
+  require a literal so the format can be placed in `.noload`. Runtime pointers
+  use `ON9_LOG_RUNTIMEE/W/I/D/V()` and remain in addressable firmware storage;
+  the matching ELF must retain that storage for host resolution.
 - **Argument capture is ABI-reliant.** Type detection only special-cases a small
   set of C/C++ types, then `on9log_emit_arg()` reads raw `uint32_t`, `uint64_t`,
   pointer, or string values from `va_arg`. This is not a complete printf ABI
@@ -746,11 +776,10 @@ these review findings are still open and should be treated as real constraints:
   VFS and redirect `stdout` before a later failure, and `on9log_esp_vfs_init()`
   can fail after stdio redirection but before registering the on9log sink. Failed
   init should be considered potentially partially applied.
-- **Sink removal is not an in-flight callback barrier.** The lifetime rule in the
-  locking section is part of the API contract until teardown synchronization is
-  added.
-- **Firmware build has not been verified after the latest local edits.** C-side
-  compatibility must still be confirmed with the ESP-IDF build environment.
+- **Cache-disabled ISR logging is pending.** The ordinary ISR queue path is
+  implemented, but flash-operation/`ESP_INTR_FLAG_IRAM` support must follow the
+  dedicated IRAM/internal-DRAM design in the ISR section before it can be
+  advertised as safe.
 
 ## Current Tradeoffs
 

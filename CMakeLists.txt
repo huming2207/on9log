@@ -72,6 +72,10 @@ else()
         add_executable(on9log_unix_smoke tests/on9log_unix_smoke.cpp)
         target_link_libraries(on9log_unix_smoke PRIVATE on9log::on9log)
         add_test(NAME on9log_unix_smoke COMMAND on9log_unix_smoke)
+
+        add_executable(on9log_core_regression tests/on9log_core_regression.cpp)
+        target_link_libraries(on9log_core_regression PRIVATE on9log::on9log)
+        add_test(NAME on9log_core_regression COMMAND on9log_core_regression)
     endif()
 
     if(ON9LOG_BUILD_DEMO)

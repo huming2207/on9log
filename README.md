@@ -68,6 +68,11 @@ ON9_LOGE("wifi", "connection failed: %d", err);
 ON9_LOGI("sensor", "value=%d name=%s", val, name);
 ON9_LOG_BUFI("stack", buf, len);
 
+// Runtime format pointers use the explicit runtime variant. Literal macros
+// keep their format strings in the ELF-only .noload section.
+const char *runtime_fmt = select_format();
+ON9_LOG_RUNTIMEI("sensor", runtime_fmt, val);
+
 // ISR-safe (no dynamic strings)
 ON9_ISR_LOGW("isr", "overrun on core %d", core);
 

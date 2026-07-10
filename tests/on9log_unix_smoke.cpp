@@ -36,8 +36,9 @@ int main()
 
 #if ON9LOG_PLAIN_TEXT
     const char *text = reinterpret_cast<const char *>(output);
-    require(std::strstr(text, "unix-smoke: value=42") != nullptr);
-    require(std::strstr(text, "unix-smoke: name=host value=42") != nullptr);
+    require(std::strstr(text, "[unix-smoke]") != nullptr);
+    require(std::strstr(text, "value=42") != nullptr);
+    require(std::strstr(text, "name=host value=42") != nullptr);
     require(output[length - 1] == '\n');
 #else
     std::size_t frame_offset = 0;
