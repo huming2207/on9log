@@ -1,5 +1,6 @@
 #include "on9log.hpp"
 #include "on9log_fmt.h"
+#include "on9log_transport.h"
 #include "on9log_unix_stdio.h"
 
 #include <cstdlib>
@@ -55,6 +56,15 @@ int main()
     require(output[frame_offset + 1] == 0x01u);
     require(output[frame_offset + 2] == ON9LOG_PACKET_MAGIC);
     require(output[length - 1] == 0xc0u);
+
+    require(std::fseek(capture, 0, SEEK_END) == 0);
+    const long size_before_oversized = std::ftell(capture);
+    unsigned char oversized[ON9LOG_TRANSPORT_MAX_PAYLOAD + 1u]{};
+    oversized[0] = ON9LOG_PACKET_MAGIC;
+    require(on9log_dispatch_packet(oversized, sizeof(oversized)) == ON9LOG_OK);
+    require(std::fflush(capture) == 0);
+    require(std::fseek(capture, 0, SEEK_END) == 0);
+    require(std::ftell(capture) == size_before_oversized);
 #endif
 
     require(std::fclose(capture) == 0);

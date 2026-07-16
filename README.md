@@ -35,8 +35,10 @@ The firmware sends only addresses for format and tag strings. The matching host 
 On Linux and macOS, `on9log_unix_port.c` supplies pthread locking and a
 monotonic clock, while `on9log_unix_stdio.c` supplies the default host sink.
 Binary packets are written to stdio using the same typed SLIP/CRC envelope as
-the ESP transport, so packet boundaries survive redirection and pipes. Plain
-text is written directly to stdio.
+the ESP transport, so packet boundaries survive redirection and pipes. Both
+transports enforce the shared 3072-byte `ON9LOG_TRANSPORT_MAX_PAYLOAD` cap and
+drop an oversized binary packet as a whole. Plain text is written directly to
+stdio.
 On macOS binary builds, the sink writes a leading image-slide metadata line so
 the host decoder can resolve 32-bit IDs against the ASLR-enabled Mach-O demo.
 

@@ -8,8 +8,10 @@ extern "C" {
 #include <stddef.h>
 #include <stdint.h>
 
+#include "on9log_transport.h"
+
 /** @brief Maximum payload byte size for a single VFS transport frame. */
-#define ESP_STDIO_LOG_VFS_FRAME_MAX_PAYLOAD 3072u
+#define ESP_STDIO_LOG_VFS_FRAME_MAX_PAYLOAD ON9LOG_TRANSPORT_MAX_PAYLOAD
 /** @brief Frame type tag for on9log binary packets. */
 #define ESP_STDIO_LOG_VFS_FRAME_TYPE_ON9LOG 0x01u
 /** @brief Frame type tag for plain-text log output. */

@@ -9,6 +9,9 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
+
+#include "on9log_transport.h"
 
 #if defined(__APPLE__) && !ON9LOG_PLAIN_TEXT
 #include <inttypes.h>
@@ -26,6 +29,9 @@ typedef struct {
     FILE *stream;
 #if !ON9LOG_PLAIN_TEXT
     uint16_t crc;
+    uint8_t frame_payload[ON9LOG_TRANSPORT_MAX_PAYLOAD];
+    size_t frame_payload_len;
+    bool drop_frame;
 #endif
     bool write_failed;
 } on9log_unix_stdio_state_t;
@@ -102,10 +108,12 @@ static void on9log_unix_stdio_start(const uint8_t *header,
     (void)header;
     (void)header_len;
 #else
-    s_stdio.crc = 0xffffu;
-    on9log_unix_write_raw(ON9LOG_UNIX_FRAME_START);
-    on9log_unix_write_binary_bytes((const uint8_t[]){ON9LOG_UNIX_FRAME_TYPE_BINARY}, 1u);
-    on9log_unix_write_binary_bytes(header, header_len);
+    s_stdio.frame_payload_len = 0;
+    s_stdio.drop_frame = header == NULL || header_len > ON9LOG_TRANSPORT_MAX_PAYLOAD;
+    if (!s_stdio.drop_frame) {
+        memcpy(s_stdio.frame_payload, header, header_len);
+        s_stdio.frame_payload_len = header_len;
+    }
 #endif
 }
 
@@ -125,7 +133,16 @@ static void on9log_unix_stdio_payload(const uint8_t *payload,
         s_stdio.write_failed = true;
     }
 #else
-    on9log_unix_write_binary_bytes(payload, payload_len);
+    if (!s_stdio.drop_frame) {
+        if ((payload == NULL && payload_len != 0) ||
+            payload_len > ON9LOG_TRANSPORT_MAX_PAYLOAD - s_stdio.frame_payload_len) {
+            s_stdio.drop_frame = true;
+            s_stdio.frame_payload_len = 0;
+        } else if (payload_len != 0) {
+            memcpy(&s_stdio.frame_payload[s_stdio.frame_payload_len], payload, payload_len);
+            s_stdio.frame_payload_len += payload_len;
+        }
+    }
 #endif
 }
 
@@ -134,9 +151,15 @@ static void on9log_unix_stdio_end(void *ctx)
     (void)ctx;
 
 #if !ON9LOG_PLAIN_TEXT
-    on9log_unix_write_escaped((uint8_t)(s_stdio.crc & 0xffu));
-    on9log_unix_write_escaped((uint8_t)(s_stdio.crc >> 8u));
-    on9log_unix_write_raw(ON9LOG_UNIX_FRAME_END);
+    if (!s_stdio.drop_frame) {
+        s_stdio.crc = 0xffffu;
+        on9log_unix_write_raw(ON9LOG_UNIX_FRAME_START);
+        on9log_unix_write_binary_bytes((const uint8_t[]){ON9LOG_UNIX_FRAME_TYPE_BINARY}, 1u);
+        on9log_unix_write_binary_bytes(s_stdio.frame_payload, s_stdio.frame_payload_len);
+        on9log_unix_write_escaped((uint8_t)(s_stdio.crc & 0xffu));
+        on9log_unix_write_escaped((uint8_t)(s_stdio.crc >> 8u));
+        on9log_unix_write_raw(ON9LOG_UNIX_FRAME_END);
+    }
 #endif
     (void)fflush(s_stdio.stream);
     funlockfile(s_stdio.stream);

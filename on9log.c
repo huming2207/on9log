@@ -51,6 +51,8 @@
 /** @brief Compact bitset for precision-bounded string argument indexes. */
 typedef uint32_t on9log_arg_mask_t;
 #define ON9LOG_ARG_MASK_BITS ((unsigned)(sizeof(on9log_arg_mask_t) * 8u))
+/** Maximum lock-free attempts to snapshot one sink slot before skipping it. */
+#define ON9LOG_SINK_SNAPSHOT_MAX_RETRIES 8u
 
 /**
  * @brief An atomic slot in the global sink table.
@@ -313,28 +315,37 @@ static void on9log_stream_start(on9log_stream_t *stream, const uint8_t *header, 
     for (size_t i = 0; i < ON9LOG_MAX_SINKS; ++i) {
         const on9log_sink_t *sink;
         void *ctx;
-        unsigned gen1, gen2;
-        for (;;) {
+        unsigned gen1 = 0;
+        unsigned gen2 = 0;
+        bool consistent = false;
+        for (unsigned retry = 0; retry < ON9LOG_SINK_SNAPSHOT_MAX_RETRIES; ++retry) {
             gen1 = atomic_load_explicit(&s_sinks[i].generation, memory_order_acquire);
             if (gen1 & 1u) {
                 continue;
             }
             sink = (const on9log_sink_t *)atomic_load_explicit(&s_sinks[i].sink, memory_order_relaxed);
             ctx = (void *)atomic_load_explicit(&s_sinks[i].ctx, memory_order_relaxed);
-            gen2 = atomic_load_explicit(&s_sinks[i].generation, memory_order_acquire);
+            atomic_thread_fence(memory_order_acquire);
+            gen2 = atomic_load_explicit(&s_sinks[i].generation, memory_order_relaxed);
             if (gen1 != gen2) {
                 continue;
             }
             if (sink == NULL) {
+                consistent = true;
                 break;
             }
 
             atomic_fetch_add_explicit(&s_sinks[i].readers, 1u, memory_order_acq_rel);
             if (atomic_load_explicit(&s_sinks[i].generation, memory_order_acquire) == gen2 &&
                 atomic_load_explicit(&s_sinks[i].sink, memory_order_acquire) == (uintptr_t)sink) {
+                consistent = true;
                 break;
             }
             atomic_fetch_sub_explicit(&s_sinks[i].readers, 1u, memory_order_release);
+        }
+
+        if (!consistent) {
+            continue;
         }
 
         if (sink != NULL) {
@@ -1314,6 +1325,7 @@ on9log_err_t on9log_add_sink(const on9log_sink_t *sink, void *ctx)
             !atomic_load_explicit(&s_sinks[i].retiring, memory_order_acquire)) {
             unsigned gen = atomic_load_explicit(&s_sinks[i].generation, memory_order_relaxed);
             atomic_store_explicit(&s_sinks[i].generation, gen + 1u, memory_order_relaxed);
+            atomic_thread_fence(memory_order_release);
             atomic_store_explicit(&s_sinks[i].ctx, (uintptr_t)ctx, memory_order_relaxed);
             atomic_store_explicit(&s_sinks[i].sink, (uintptr_t)sink, memory_order_release);
             atomic_store_explicit(&s_sinks[i].generation, gen + 2u, memory_order_release);
@@ -1348,6 +1360,7 @@ on9log_err_t on9log_remove_sink(const on9log_sink_t *sink, void *ctx)
         if (slot_sink == sink && slot_ctx == ctx) {
             unsigned gen = atomic_load_explicit(&s_sinks[i].generation, memory_order_relaxed);
             atomic_store_explicit(&s_sinks[i].generation, gen + 1u, memory_order_relaxed);
+            atomic_thread_fence(memory_order_release);
             atomic_store_explicit(&s_sinks[i].sink, (uintptr_t)NULL, memory_order_release);
             atomic_store_explicit(&s_sinks[i].ctx, (uintptr_t)NULL, memory_order_relaxed);
             atomic_store_explicit(&s_sinks[i].retiring, true, memory_order_release);

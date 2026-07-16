@@ -112,10 +112,12 @@ unescaped frame type byte and payload bytes. The final two CRC bytes are
 appended little-endian and SLIP-escaped before the ending `0xc0`. The
 implementation is LUT-based and does not use the ESP ROM CRC implementation.
 
-`ESP_STDIO_LOG_VFS_FRAME_MAX_PAYLOAD` is currently 3072 bytes. Text writes are
-chunked into multiple text frames if needed. On9log binary packets are emitted as
-one transport frame; if `header + payload` exceeds the 3072-byte transport
-payload cap, the VFS sink drops that UART transport frame. `ON9_LOG_BUF*()`
+`ON9LOG_TRANSPORT_MAX_PAYLOAD` is the shared 3072-byte typed-transport cap;
+`ESP_STDIO_LOG_VFS_FRAME_MAX_PAYLOAD` remains its ESP-facing alias. Text writes
+are chunked into multiple text frames if needed. On9log binary packets are
+emitted as one transport frame; if `header + payload` exceeds the cap, both the
+ESP VFS sink and Unix stdio sink drop that complete transport frame.
+`ON9_LOG_BUF*()`
 dumps are chunked by the core into multiple `ON9LOG_PKT_BUFFER` packets, and the
 default `ON9LOG_BUFFER_CHUNK_SIZE` is 3042 bytes so each default buffer packet
 fits this VFS transport cap (`3072 - 18 byte on9log header - 12 byte buffer
@@ -142,6 +144,17 @@ already inside one (e.g. a UART driver `ESP_LOGE` fires during a blocking
 `write()`), the re-entrant call is dropped with `ESP_FAIL` to prevent a
 self-deadlock on the non-recursive transport mutex and to avoid interleaving two
 SLIP frames on the wire.
+
+In the current ESP-IDF log-v1 configuration, `ESP_LOG*` releases its tag-level
+lock before calling the configured `vprintf`, and libc's stdio lock is
+recursive. A same-task log emitted by a console driver can therefore reach the
+VFS callback, where the transport-owner guard drops it instead of recursively
+taking the transport mutex. This path does not depend on
+`esp_log_impl_lock()` being recursive. Console output drivers should still be
+log-free: their descriptors are opened in blocking mode, and a backend that
+never returns from `write()` stalls the transport mutex and all stdout/stderr
+producers. Short writes and `EINTR` are retried; another write error drops the
+current output operation.
 
 Normal log packets use:
 
@@ -658,12 +671,20 @@ Current shared state is handled as follows:
 - sink add/remove: still locked to serialize table mutation and duplicate/free
   slot checks.
 
-Sink slots publish `ctx` first and then publish the sink-struct pointer with
-release semantics. Dispatch obtains a per-slot reader reference, revalidates the
-slot generation and sink pointer, and retains that reference through
-`end_cb()`. Removal clears the published entry, marks the slot as retiring, and
-waits outside the port lock until existing readers finish. The slot cannot be
-reused during retirement. Therefore a successful `on9log_remove_sink()` is an
+Each sink slot uses an even/odd generation seqlock around its atomic `(sink,
+ctx)` pair. Writers publish the odd generation before changing either pointer
+and publish the next even generation with release ordering. Dispatch reads an
+even generation, snapshots both pointers, executes an acquire fence, and
+validates the generation again. For a non-empty stable snapshot, dispatch then
+obtains a per-slot reader reference, revalidates the generation and sink
+pointer, and retains that reference through `end_cb()`. A slot that cannot
+produce and retain a stable snapshot in eight attempts is skipped for that
+packet, preventing a preempted or abandoned writer from livelocking all
+logging.
+
+Removal clears both `sink` and `ctx`, marks the slot as retiring, and waits
+outside the port lock until existing readers finish. The slot cannot be reused
+during retirement. Therefore a successful `on9log_remove_sink()` is an
 in-flight callback barrier: after it returns, the caller may release the sink
 descriptor and context. Calling remove from that sink's own callback is invalid
 because it would wait for its own reader reference.
@@ -715,8 +736,9 @@ type confusion.
 
 Standalone Linux/macOS support is isolated in `on9log_unix_port.c` and
 `on9log_unix_stdio.c/.h`. The Unix port supplies pthread locking and a monotonic
-clock. The stdio sink writes plain text directly and writes binary packets with
-the same typed SLIP/CRC framing used by the ESP transport. In macOS binary mode
+clock. The stdio sink writes plain text directly and buffers binary packets up
+to `ON9LOG_TRANSPORT_MAX_PAYLOAD` before writing the same typed SLIP/CRC framing
+used by the ESP transport. Oversized packets are dropped as a whole. In macOS binary mode
 it emits a leading `@on9log-image-slide=XXXXXXXX` metadata line so the host CLI
 can normalize 32-bit IDs against the ASLR-enabled Mach-O demo image.
 

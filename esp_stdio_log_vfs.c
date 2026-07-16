@@ -19,6 +19,7 @@
 
 #include "esp_stdio_log_vfs.h"
 
+#include <errno.h>
 #include "sdkconfig.h"
 
 #include <fcntl.h>
@@ -244,6 +245,9 @@ static bool esp_stdio_log_vfs_write_all(int fd, const uint8_t *data, size_t len)
 {
     while (len != 0) {
         ssize_t written = write(fd, data, len);
+        if (written < 0 && errno == EINTR) {
+            continue;
+        }
         if (written <= 0) {
             return false;
         }
