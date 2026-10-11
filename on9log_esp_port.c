@@ -55,6 +55,27 @@ uint32_t on9log_port_timestamp_ms(void)
     return esp_log_timestamp();
 }
 
+/* Defined by the ESP-IDF linker scripts on every target. */
+extern const char _rodata_reserved_start[];
+extern const char _rodata_reserved_end[];
+extern const char _noload_keep_in_elf_start[];
+extern const char _noload_keep_in_elf_end[];
+
+/**
+ * @brief Report whether the host can resolve a string from its address.
+ *
+ * Flash read-only data and the ELF-only `.noload_keep_in_elf` section (linked
+ * at address 0) are in the ELF. Anything else, such as DRAM, PSRAM, stack, heap
+ * or a partition mapped with esp_partition_mmap(), is not.
+ */
+bool on9log_port_addr_in_image(const void *addr)
+{
+    uintptr_t a = (uintptr_t)addr;
+
+    return (a >= (uintptr_t)_rodata_reserved_start && a < (uintptr_t)_rodata_reserved_end) ||
+           (a >= (uintptr_t)_noload_keep_in_elf_start && a < (uintptr_t)_noload_keep_in_elf_end);
+}
+
 on9log_reset_reason_t on9log_port_reset_reason(void)
 {
     switch (esp_reset_reason()) {

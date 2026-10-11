@@ -42,6 +42,25 @@ uint32_t on9log_port_isr_timestamp_ms(void);
  */
 on9log_reset_reason_t on9log_port_reset_reason(void);
 /**
+ * @brief Check whether the host can resolve a string from its address alone.
+ *
+ * Called for every tag and format pointer, from task and ISR context, so it
+ * must be cheap and must not block, allocate, or read the string. Return true
+ * only when @p addr lies in a part of the firmware image the host decoder
+ * reads (read-only data, or the `.noload_keep_in_elf` section) and fits the
+ * 32-bit wire ID. Return false otherwise, and the logger copies the string
+ * into the packet instead (see ON9LOG_ID_INLINE).
+ *
+ * A bare-metal port typically compares @p addr against linker-script symbols
+ * around its flash read-only data and its `.noload_keep_in_elf` output
+ * section. The weak default returns true, which sends every address as is.
+ *
+ * @param[in] addr Tag or format pointer; never NULL.
+ *
+ * @return true if the address can be sent instead of the string.
+ */
+bool on9log_port_addr_in_image(const void *addr);
+/**
  * @brief Check whether the ISR packet backend is ready to accept a packet.
  *
  * @return true  if the ISR queue/ringbuffer has capacity,

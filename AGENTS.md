@@ -342,6 +342,7 @@ void on9log_port_lock(void);
 void on9log_port_unlock(void);
 void on9log_port_yield(void);
 uint32_t on9log_port_timestamp_ms(void);
+bool on9log_port_addr_in_image(const void *addr);
 ```
 
 `on9log_port_weak.c` provides weak no-op/default implementations so the core can
@@ -405,8 +406,40 @@ packet; it sends the `.rodata` address as `fmt_id`. The no-load forms also send
 only an address, but that address points into the ELF-only no-load section. The
 only difference is whether the format literal is present in the flashed binary.
 
-Tags are currently passed as pointer values too. If a tag is static, the host can
-resolve it from the ELF or from normal read-only sections.
+Tags are passed as pointer values too. If a tag is static, the host can resolve
+it from the ELF or from normal read-only sections.
+
+A tag or format whose address the host cannot resolve is copied into the packet
+instead. The core asks `on9log_port_addr_in_image()` for every non-NULL tag and
+format pointer; when it returns false the header ID becomes `ON9LOG_ID_INLINE`
+(`0xffffffff`) and the payload starts with the inline tag, then the inline
+format, each as `uint32_t length + bytes` (no NUL, capped by
+`ON9LOG_MAX_DYNAMIC_STRING_LEN`), before the normal payload. This applies to
+log packets, ISR log packets (the scan is also bounded by
+`ON9LOG_ISR_PACKET_MAX`; a string that does not fit drops the packet), and
+buffer packets. Each buffer chunk repeats the inline tag and shrinks its data by
+the tag's size, so a chunk packet keeps the size the transport expects.
+`payload_len` includes the inline bytes.
+
+Port implementations:
+
+- ESP-IDF: inside `[_rodata_reserved_start, _rodata_reserved_end)` (flash
+  rodata) or `[_noload_keep_in_elf_start, _noload_keep_in_elf_end)` (the ELF-only
+  section, linked at address 0). DRAM, PSRAM, stack, heap and
+  `esp_partition_mmap()` regions go inline. These symbols exist on every
+  ESP-IDF target.
+- Linux: inside a read-only `PT_LOAD` segment of the main executable (found once
+  with `dl_iterate_phdr()`) and at or below `UINT32_MAX`, so a PIE build sends
+  its strings inline rather than truncated addresses.
+- macOS: inside the main image's `__TEXT` segment; IDs stay truncated and the
+  host applies the image slide.
+- Weak default (any other port): always true, i.e. the old address-only
+  behaviour. A bare-metal port (e.g. STM32) should compare against its linker
+  script's flash rodata symbols and a `.noload_keep_in_elf` section placed at
+  address 0 with `(INFO)`, as in the ESP-IDF `ld.debug.sections`.
+
+The hook must stay cheap, non-blocking and ISR-safe; it must not read the
+string. The cache-disabled ISR design below would also need it in IRAM.
 
 ## Dynamic Strings
 

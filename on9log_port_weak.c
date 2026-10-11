@@ -49,15 +49,31 @@ ON9LOG_WEAK uint32_t on9log_port_timestamp_ms(void)
 #endif
 
 /**
- * @brief Weak default ISR-context timestamp in milliseconds.
+ * @brief Weak default reset reason.
  *
- * @return The value of @ref on9log_port_timestamp_ms() (the non-ISR variant).
+ * @return @c ON9LOG_RESET_UNKNOWN.
  */
 ON9LOG_WEAK on9log_reset_reason_t on9log_port_reset_reason(void)
 {
     return ON9LOG_RESET_UNKNOWN;
 }
 
+/**
+ * @brief Weak default image-address check.
+ *
+ * @return @c true, so every tag and format is sent by address as before.
+ */
+ON9LOG_WEAK bool on9log_port_addr_in_image(const void *addr)
+{
+    (void)addr;
+    return true;
+}
+
+/**
+ * @brief Weak default ISR-context timestamp in milliseconds.
+ *
+ * @return The value of @ref on9log_port_timestamp_ms() (the non-ISR variant).
+ */
 ON9LOG_WEAK uint32_t on9log_port_isr_timestamp_ms(void)
 {
     return on9log_port_timestamp_ms();

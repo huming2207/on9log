@@ -218,7 +218,6 @@ static void on9log_put_u64(on9log_encoder_t *enc, uint64_t val)
     on9log_put_u32(enc, (uint32_t)(val >> 32u));
 }
 
-#if ON9LOG_PLAIN_TEXT
 static void on9log_put_bytes(on9log_encoder_t *enc, const void *data, size_t len)
 {
     const uint8_t *bytes = (const uint8_t *)data;
@@ -233,7 +232,6 @@ static void on9log_put_bytes(on9log_encoder_t *enc, const void *data, size_t len
     memcpy(&enc->data[enc->len], bytes, len);
     enc->len += len;
 }
-#endif
 
 /**
  * @brief Look up the argument type at a given index.
@@ -757,11 +755,58 @@ static void on9log_emit_string(on9log_stream_t *stream,
     on9log_emit_string_bytes(stream, str, str_len, total_arg_cnt, curr_arg_index);
 }
 
+#if !ON9LOG_PLAIN_TEXT
+/** How a tag or format travels: by address, or copied into the payload. */
+typedef struct {
+    uint32_t id;  /**< Header ID: the address, or ON9LOG_ID_INLINE. */
+    uint32_t len; /**< Bytes copied into the payload when inline. */
+} on9log_wire_str_t;
+
+/**
+ * @brief Decide whether a tag or format can be sent by address.
+ *
+ * @param[in] str     Tag or format pointer (NULL is sent as address 0).
+ * @param[in] max_len Longest string to copy when it must go inline.
+ */
+static on9log_wire_str_t on9log_wire_str(const char *str, size_t max_len)
+{
+    on9log_wire_str_t wire = {.id = (uint32_t)(uintptr_t)str, .len = 0};
+
+    if (str != NULL && !on9log_port_addr_in_image(str)) {
+        wire.id = ON9LOG_ID_INLINE;
+        wire.len = (uint32_t)on9log_bounded_strlen(str, max_len);
+    }
+    return wire;
+}
+
+/** @brief Payload bytes the string adds in front of the packet's normal payload. */
+static size_t on9log_wire_str_size(on9log_wire_str_t wire)
+{
+    return wire.id == ON9LOG_ID_INLINE ? sizeof(uint32_t) + wire.len : 0u;
+}
+
+static void on9log_emit_wire_str(on9log_stream_t *stream, const char *str, on9log_wire_str_t wire, size_t total_arg_cnt)
+{
+    if (wire.id == ON9LOG_ID_INLINE) {
+        on9log_emit_string_bytes(stream, str, wire.len, total_arg_cnt, ON9LOG_PAYLOAD_META_ARG_INDEX);
+    }
+}
+
+static void on9log_put_wire_str(on9log_encoder_t *enc, const char *str, on9log_wire_str_t wire)
+{
+    if (wire.id == ON9LOG_ID_INLINE) {
+        on9log_put_u32(enc, wire.len);
+        on9log_put_bytes(enc, str, wire.len);
+    }
+}
+#endif
+
 /**
  * @brief First pass over a log call's arguments: payload size and string lengths.
  *
- * Consumes @p args, so pass a va_copy. The payload is the argument count, the
- * type table, then each argument as written by @ref on9log_emit_payload_args.
+ * Consumes @p args, so pass a va_copy. The payload is @p prefix_len bytes of
+ * inline tag/format, the argument count, the type table, then each argument as
+ * written by @ref on9log_emit_payload_args.
  *
  * @return @c false if the call cannot be described by a header (more than 32
  *         arguments, or a payload over @ref ON9LOG_PAYLOAD_LEN_MAX); the
@@ -771,6 +816,7 @@ static bool on9log_measure_payload(const char *arg_types,
                                    on9log_arg_mask_t precision_string_arg_mask,
                                    va_list *args,
                                    size_t arg_count,
+                                   size_t prefix_len,
                                    on9log_string_lens_t *lens,
                                    uint16_t *payload_len)
 {
@@ -778,7 +824,7 @@ static bool on9log_measure_payload(const char *arg_types,
         return false;
     }
 
-    size_t total = 1u + arg_count;
+    size_t total = prefix_len + 1u + arg_count;
     uint8_t prev_arg_type = ON9_LOG_ARGS_TYPE_NONE;
     uint32_t prev_u32 = 0;
 
@@ -1024,6 +1070,7 @@ static bool on9log_arg_types_are_isr_safe(const char *arg_types)
  * @return @c true on success, @c false if encoding overflowed (e.g. dynamic
  *         string encountered or buffer too small).
  */
+#if !ON9LOG_PLAIN_TEXT
 static bool on9log_encode_isr_log_packet(uint8_t *packet,
                                          size_t packet_cap,
                                          size_t *packet_len,
@@ -1038,15 +1085,21 @@ static bool on9log_encode_isr_log_packet(uint8_t *packet,
         .data = packet,
     };
     uint8_t arg_count = on9log_arg_count(arg_types);
+    /* Scanning past the packet size is pointless: such a string would not fit anyway. */
+    size_t inline_max = packet_cap < ON9LOG_MAX_DYNAMIC_STRING_LEN ? packet_cap : ON9LOG_MAX_DYNAMIC_STRING_LEN;
+    on9log_wire_str_t tag_wire = on9log_wire_str(tag, inline_max);
+    on9log_wire_str_t format_wire = on9log_wire_str(format, inline_max);
 
     on9log_put_header(&enc,
                       ON9LOG_PKT_LOG,
                       level,
                       (uint16_t)atomic_fetch_add_explicit(&s_seq, 1, memory_order_relaxed),
                       on9log_port_isr_timestamp_ms(),
-                      (uint32_t)(uintptr_t)tag,
-                      (uint32_t)(uintptr_t)format,
+                      tag_wire.id,
+                      format_wire.id,
                       0); /* patched below, once the payload size is known */
+    on9log_put_wire_str(&enc, tag, tag_wire);
+    on9log_put_wire_str(&enc, format, format_wire);
     on9log_put_u8(&enc, arg_count);
     for (unsigned idx = 0; idx < arg_count; ++idx) {
         on9log_put_u8(&enc, on9log_arg_type_at(arg_types, idx));
@@ -1085,6 +1138,7 @@ static bool on9log_encode_isr_log_packet(uint8_t *packet,
     *packet_len = enc.len;
     return true;
 }
+#endif
 
 /**
  * @brief Emit a "dropped packets" notification packet (type @c ON9LOG_PKT_DROPPED).
@@ -1202,14 +1256,17 @@ size_t on9log_encode_time_sync(uint8_t *buf, size_t cap, uint32_t boot_id)
  * buffers are split into multiple packets; this function emits one chunk.
  *
  * @param[in] level      Log level.
- * @param[in] tag        Tag string (stored as pointer).
+ * @param[in] tag        Tag string.
+ * @param[in] tag_wire   How the tag is sent (by address or inline).
  * @param[in] bytes      Pointer to the buffer bytes.
  * @param[in] total_len  Total buffer length across all chunks.
  * @param[in] offset     Byte offset of this chunk in the original buffer.
  * @param[in] chunk_len  Length of this chunk in bytes.
  */
+#if !ON9LOG_PLAIN_TEXT
 static void on9log_emit_buffer_packet(on9log_level_t level,
                                        const char *tag,
+                                       on9log_wire_str_t tag_wire,
                                        const uint8_t *bytes,
                                        uint32_t total_len,
                                        uint32_t offset,
@@ -1220,9 +1277,10 @@ static void on9log_emit_buffer_packet(on9log_level_t level,
     on9log_emit_header(&stream,
                        ON9LOG_PKT_BUFFER,
                        level,
-                       (uint32_t)(uintptr_t)tag,
+                       tag_wire.id,
                        0,
-                       (uint16_t)(3u * sizeof(uint32_t) + chunk_len));
+                       (uint16_t)(on9log_wire_str_size(tag_wire) + 3u * sizeof(uint32_t) + chunk_len));
+    on9log_emit_wire_str(&stream, tag, tag_wire, 1);
     on9log_emit_u32(&stream, total_len, 1, ON9LOG_PAYLOAD_META_ARG_INDEX);
     on9log_emit_u32(&stream, offset, 1, ON9LOG_PAYLOAD_META_ARG_INDEX);
     on9log_emit_u32(&stream, chunk_len, 1, ON9LOG_PAYLOAD_META_ARG_INDEX);
@@ -1231,6 +1289,7 @@ static void on9log_emit_buffer_packet(on9log_level_t level,
     }
     on9log_stream_end(&stream);
 }
+#endif
 
 /**
  * @brief Validate a log level value.
@@ -1950,11 +2009,19 @@ static void on9log_vwrite(on9log_level_t level,
         precision_string_arg_mask = on9log_mark_precision_string_args(format_scan, arg_count);
     }
 
+    on9log_wire_str_t tag_wire = on9log_wire_str(tag, ON9LOG_MAX_DYNAMIC_STRING_LEN);
+    on9log_wire_str_t format_wire = on9log_wire_str(format, ON9LOG_MAX_DYNAMIC_STRING_LEN);
     on9log_string_lens_t string_lens;
     uint16_t payload_len = 0;
     va_list measure_args;
     va_copy(measure_args, *args);
-    bool fits = on9log_measure_payload(arg_types, precision_string_arg_mask, &measure_args, arg_count, &string_lens, &payload_len);
+    bool fits = on9log_measure_payload(arg_types,
+                                       precision_string_arg_mask,
+                                       &measure_args,
+                                       arg_count,
+                                       on9log_wire_str_size(tag_wire) + on9log_wire_str_size(format_wire),
+                                       &string_lens,
+                                       &payload_len);
     va_end(measure_args);
     if (!fits) {
         atomic_fetch_add_explicit(&s_dropped_count, 1, memory_order_relaxed);
@@ -1964,9 +2031,11 @@ static void on9log_vwrite(on9log_level_t level,
     on9log_emit_header(&stream,
                        ON9LOG_PKT_LOG,
                        level,
-                       (uint32_t)(uintptr_t)tag,
-                       (uint32_t)(uintptr_t)format,
+                       tag_wire.id,
+                       format_wire.id,
                        payload_len);
+    on9log_emit_wire_str(&stream, tag, tag_wire, arg_count);
+    on9log_emit_wire_str(&stream, format, format_wire, arg_count);
     on9log_emit_u8(&stream, arg_count, arg_count, ON9LOG_PAYLOAD_META_ARG_INDEX);
     if (arg_count != 0) {
         on9log_stream_payload(&stream, (const uint8_t *)arg_types, arg_count, arg_count, ON9LOG_PAYLOAD_META_ARG_INDEX);
@@ -2360,18 +2429,26 @@ void on9log_write_buffer_with_text_flags(on9log_level_t level,
     }
 
     uint32_t total_len = (uint32_t)buffer_len;
+    on9log_wire_str_t tag_wire = on9log_wire_str(tag, ON9LOG_MAX_DYNAMIC_STRING_LEN);
+    /* An inline tag takes room from the data so each packet keeps the size the transport expects. */
+    size_t tag_size = on9log_wire_str_size(tag_wire);
+    uint32_t chunk_max = tag_size < ON9LOG_BUFFER_CHUNK_SIZE ? (uint32_t)(ON9LOG_BUFFER_CHUNK_SIZE - tag_size) : 1u;
+    if (tag_size + 3u * sizeof(uint32_t) + chunk_max > ON9LOG_PAYLOAD_LEN_MAX) {
+        atomic_fetch_add_explicit(&s_dropped_count, 1, memory_order_relaxed);
+        return;
+    }
 
     if (total_len == 0) {
-        on9log_emit_buffer_packet(level, tag, bytes, total_len, 0, 0);
+        on9log_emit_buffer_packet(level, tag, tag_wire, bytes, total_len, 0, 0);
         return;
     }
 
     for (uint32_t offset = 0; offset < total_len;) {
         uint32_t chunk_len = total_len - offset;
-        if (chunk_len > ON9LOG_BUFFER_CHUNK_SIZE) {
-            chunk_len = ON9LOG_BUFFER_CHUNK_SIZE;
+        if (chunk_len > chunk_max) {
+            chunk_len = chunk_max;
         }
-        on9log_emit_buffer_packet(level, tag, bytes, total_len, offset, chunk_len);
+        on9log_emit_buffer_packet(level, tag, tag_wire, bytes, total_len, offset, chunk_len);
         offset += chunk_len;
     }
 #endif

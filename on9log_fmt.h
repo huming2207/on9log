@@ -7,6 +7,17 @@
 /** @brief Reserved payload length value meaning "unknown". The library no longer emits it; decoders may still see it from older firmware. */
 #define ON9LOG_PAYLOAD_LEN_STREAMING 0xffffu
 
+/**
+ * @brief tag_id / fmt_id value meaning "the string is copied into the payload".
+ *
+ * Used when the string's address cannot be resolved from the firmware image,
+ * for example a tag built on the stack or a runtime format in RAM. The payload
+ * then starts with the inline tag (if any) followed by the inline format (if
+ * any), each encoded as a little-endian uint32_t length and that many bytes
+ * without a trailing NUL, before the packet's normal payload.
+ */
+#define ON9LOG_ID_INLINE 0xffffffffu
+
 /** @brief Enumeration of on9log packet types carried in the high nibble of type_level in the header. */
 typedef enum {
     /** @brief Normal log message with formatted arguments. */

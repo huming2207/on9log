@@ -67,6 +67,13 @@ clock. `boot_id` is a random number picked once per boot.
 
 Format and tag strings are stored in ELF-only `.noload_keep_in_elf.*` sections — excluded from the flashed binary, resolved by address on the host.
 
+A tag or format the host cannot resolve by address (built on the stack, held
+in RAM, or a runtime format) is copied into the packet instead: its
+`tag_id`/`fmt_id` is `0xffffffff` (`ON9LOG_ID_INLINE`) and the payload starts
+with the inline tag, then the inline format, each as `u32 length + bytes`. The
+platform decides per pointer through `on9log_port_addr_in_image()`; see
+[Porting](#porting).
+
 The UART transport wraps packets in typed SLIP envelopes with CRC-16-CCITT verification.
 
 ## Firmware API
@@ -223,6 +230,30 @@ int main(void)
 `on9log_unix_stdio_init()` writes to `stdout`. Tests or applications that need
 another standard stream can call `on9log_unix_stdio_init_file(FILE *)` instead;
 that stream must remain open for the process lifetime.
+
+### Porting
+
+A new platform implements the hooks in `on9log_port.h`; anything it leaves out
+falls back to the weak defaults in `on9log_port_weak.c`. For inline strings,
+`on9log_port_addr_in_image()` should return true only for addresses inside the
+image's read-only data or `.noload_keep_in_elf` section. The weak default
+returns true for everything, which sends every address as before.
+
+On a bare-metal GNU ld target (for example STM32), the linker script must also
+keep the no-load strings in the ELF without loading them, and export the
+bounds the hook compares against, along with symbols around the flash
+`.rodata` output section:
+
+```ld
+.noload 0 (INFO) :
+{
+    . = 0;
+    LONG(0); /* keep address 0 free for NULL */
+    _noload_keep_in_elf_start = ABSOLUTE(.);
+    KEEP(*(.noload_keep_in_elf .noload_keep_in_elf.*))
+    _noload_keep_in_elf_end = ABSOLUTE(.);
+}
+```
 
 ### Code size
 

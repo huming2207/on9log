@@ -75,6 +75,11 @@ else()
 
         add_executable(on9log_core_regression tests/on9log_core_regression.cpp)
         target_link_libraries(on9log_core_regression PRIVATE on9log::on9log)
+        if(NOT APPLE)
+            # Like the demo: without PIE, literal addresses fit the 32-bit wire
+            # IDs, so the test covers both by-address and inline strings.
+            target_link_options(on9log_core_regression PRIVATE -no-pie)
+        endif()
         add_test(NAME on9log_core_regression COMMAND on9log_core_regression)
     endif()
 
