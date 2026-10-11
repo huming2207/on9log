@@ -10,6 +10,7 @@
 #endif
 
 #include "on9log_config.h"
+#include "on9log_fmt.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -398,6 +399,37 @@ void on9log_write_buffer_with_text_flags(on9log_level_t level,
  * @return ON9LOG_OK on success, or an error code if the packet is malformed.
  */
 on9log_err_t on9log_dispatch_packet(const uint8_t *packet, size_t packet_len);
+
+/**
+ * @brief Emit a BOOT packet through the normal sink path.
+ *
+ * Call once after startup, ideally before other logs. The platform uses it to
+ * show why the device restarted. @p boot_id is a random number chosen once per
+ * boot (for example from the hardware RNG) and must match the one passed to
+ * on9log_encode_time_sync(). In plain-text builds it logs one line instead.
+ *
+ * @param[in] boot_id Random per-boot identifier.
+ * @param[in] reason  Why the chip restarted; see on9log_port_reset_reason().
+ *
+ * @return ON9LOG_OK.
+ */
+on9log_err_t on9log_emit_boot(uint32_t boot_id, on9log_reset_reason_t reason);
+
+/**
+ * @brief Encode a TIME_SYNC packet into a buffer without dispatching it.
+ *
+ * A transport that sends logs in batches (for example over MQTT) appends one
+ * as the last packet of each batch, built at the moment of sending, so the
+ * receiver can place the batch in time without a trustworthy device clock. The
+ * packet does not use a sequence number. Needs at least 22 bytes.
+ *
+ * @param[out] buf     Destination.
+ * @param[in]  cap     Size of @p buf.
+ * @param[in]  boot_id The same identifier as given to on9log_emit_boot().
+ *
+ * @return Bytes written, or 0 if @p buf is too small or this is a plain-text build.
+ */
+size_t on9log_encode_time_sync(uint8_t *buf, size_t cap, uint32_t boot_id);
 
 #ifdef __cplusplus
 }

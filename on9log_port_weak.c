@@ -53,6 +53,11 @@ ON9LOG_WEAK uint32_t on9log_port_timestamp_ms(void)
  *
  * @return The value of @ref on9log_port_timestamp_ms() (the non-ISR variant).
  */
+ON9LOG_WEAK on9log_reset_reason_t on9log_port_reset_reason(void)
+{
+    return ON9LOG_RESET_UNKNOWN;
+}
+
 ON9LOG_WEAK uint32_t on9log_port_isr_timestamp_ms(void)
 {
     return on9log_port_timestamp_ms();

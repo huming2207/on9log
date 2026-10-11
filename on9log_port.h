@@ -4,6 +4,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "on9log_fmt.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -33,6 +35,12 @@ uint32_t on9log_port_timestamp_ms(void);
  * @return Milliseconds since an arbitrary epoch, safe to call from interrupt handlers.
  */
 uint32_t on9log_port_isr_timestamp_ms(void);
+/**
+ * @brief Return why the chip last restarted, for the BOOT packet.
+ *
+ * @return A reset reason, or ON9LOG_RESET_UNKNOWN if the port cannot tell.
+ */
+on9log_reset_reason_t on9log_port_reset_reason(void);
 /**
  * @brief Check whether the ISR packet backend is ready to accept a packet.
  *

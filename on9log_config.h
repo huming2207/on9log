@@ -81,6 +81,11 @@
 #error "ON9LOG_BUFFER_CHUNK_SIZE must be at least 1"
 #endif
 
+/* A buffer packet's payload is 12 bytes of metadata plus the chunk, and must fit the 16-bit length field. */
+#if ON9LOG_BUFFER_CHUNK_SIZE > 0xffffu - 1u - 12u
+#error "ON9LOG_BUFFER_CHUNK_SIZE is too large for a packet header's payload length"
+#endif
+
 /**
  * @brief Maximum byte length for runtime dynamic string arguments passed to on9log_write().
  *

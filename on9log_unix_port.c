@@ -39,6 +39,11 @@ uint32_t on9log_port_timestamp_ms(void)
     return (uint32_t)milliseconds;
 }
 
+on9log_reset_reason_t on9log_port_reset_reason(void)
+{
+    return ON9LOG_RESET_UNKNOWN;
+}
+
 uint32_t on9log_port_isr_timestamp_ms(void)
 {
     return on9log_port_timestamp_ms();

@@ -1,4 +1,5 @@
 #include "on9log.h"
+#include "on9log_fmt.h"
 
 #include <atomic>
 #include <chrono>
@@ -7,6 +8,7 @@
 #include <cstring>
 #include <mutex>
 #include <thread>
+#include <vector>
 
 static void require(bool condition)
 {
@@ -45,6 +47,88 @@ static const on9log_sink_t blocking_sink = {
     .payload_cb = blocking_payload,
     .end_cb = blocking_end,
 };
+
+// Collects what a sink receives for each packet: the header and the payload bytes after it.
+struct captured_packet {
+    std::vector<uint8_t> header;
+    size_t payload_bytes = 0;
+};
+
+static std::vector<captured_packet> g_captured;
+
+static void capture_start(const uint8_t *header, size_t header_len, void *)
+{
+    g_captured.push_back({std::vector<uint8_t>(header, header + header_len), 0});
+}
+
+static void capture_payload(const uint8_t *, size_t len, size_t, size_t, void *)
+{
+    g_captured.back().payload_bytes += len;
+}
+
+static void capture_end(void *) {}
+
+static const on9log_sink_t capture_sink = {
+    .start_cb = capture_start,
+    .payload_cb = capture_payload,
+    .end_cb = capture_end,
+};
+
+static uint16_t header_payload_len(const captured_packet &packet)
+{
+    require(packet.header.size() == sizeof(on9log_packet_header_t));
+    return static_cast<uint16_t>(packet.header[16] | (packet.header[17] << 8));
+}
+
+#if !ON9LOG_PLAIN_TEXT
+// Every packet's header must state exactly how many payload bytes follow it.
+static void check_payload_lengths()
+{
+    require(on9log_add_sink(&capture_sink, nullptr) == ON9LOG_OK);
+
+    char text[] = "dynamic";
+    const char *null_text = nullptr;
+    ON9_LOGI("lengths", "no arguments");
+    ON9_LOGI("lengths", "ints %d %u", 1, 2u);
+    ON9_LOGI("lengths", "wide %lld", 1234567890123ll);
+    ON9_LOGI("lengths", "string %s", text);
+    ON9_LOGI("lengths", "null string %s and ptr %p", null_text, ON9_PTR(text));
+    ON9_LOGI("lengths", "precision %.*s", 3, text);
+    ON9_LOG_BUFI("lengths", text, sizeof(text));
+
+    require(g_captured.size() == 7);
+    for (const auto &packet : g_captured) {
+        require(header_payload_len(packet) != ON9LOG_PAYLOAD_LEN_STREAMING);
+        require(header_payload_len(packet) == packet.payload_bytes);
+    }
+
+    require(on9log_remove_sink(&capture_sink, nullptr) == ON9LOG_OK);
+    g_captured.clear();
+}
+#endif
+
+#if !ON9LOG_PLAIN_TEXT
+static void check_boot_and_time_sync()
+{
+    require(on9log_add_sink(&capture_sink, nullptr) == ON9LOG_OK);
+    require(on9log_emit_boot(0xa1b2c3d4u, ON9LOG_RESET_BROWNOUT) == ON9LOG_OK);
+    require(on9log_remove_sink(&capture_sink, nullptr) == ON9LOG_OK);
+
+    require(g_captured.size() == 1);
+    const auto &boot = g_captured[0];
+    require((boot.header[1] >> 4) == ON9LOG_PKT_BOOT);
+    require(header_payload_len(boot) == 5 && boot.payload_bytes == 5);
+    g_captured.clear();
+
+    uint8_t sync[32];
+    require(on9log_encode_time_sync(sync, 21, 1) == 0);  // too small
+    require(on9log_encode_time_sync(sync, sizeof(sync), 0xa1b2c3d4u) == 22);
+    require(sync[0] == ON9LOG_PACKET_MAGIC);
+    require((sync[1] >> 4) == ON9LOG_PKT_TIME_SYNC);
+    require(sync[16] == 4 && sync[17] == 0);
+    require(sync[18] == 0xd4 && sync[19] == 0xc3 && sync[20] == 0xb2 && sync[21] == 0xa1);
+}
+#endif
 
 int main()
 {
@@ -126,5 +210,9 @@ int main()
     remover.join();
     require(removal_done.load(std::memory_order_acquire));
 
+#if !ON9LOG_PLAIN_TEXT
+    check_payload_lengths();
+    check_boot_and_time_sync();
+#endif
     return 0;
 }

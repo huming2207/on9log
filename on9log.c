@@ -708,145 +708,159 @@ static void on9log_emit_string_bytes(on9log_stream_t *stream,
     }
 }
 
-static void on9log_emit_cstr(on9log_stream_t *stream,
-                             const char *str,
-                             size_t total_arg_cnt,
-                             size_t curr_arg_index)
+/*
+ * A packet header must carry the payload size, which for a log call depends on
+ * the arguments. The size is worked out in a first pass over a copy of the
+ * va_list. String lengths are recorded there and reused when the payload is
+ * written, so the header stays right even if another task changes a string in
+ * between.
+ */
+typedef struct {
+    uint32_t len[ON9LOG_ARG_MASK_BITS]; /**< Bytes to send per string argument, or ON9LOG_NULL_STRING_LEN. */
+} on9log_string_lens_t;
+
+/** Largest payload a header can describe; 0xffff is reserved for "unknown". */
+#define ON9LOG_PAYLOAD_LEN_MAX (ON9LOG_PAYLOAD_LEN_STREAMING - 1u)
+
+static uint32_t on9log_cstr_len(const char *str, bool has_precision, int32_t precision)
 {
     if (str == NULL) {
-        on9log_emit_u32(stream, ON9LOG_NULL_STRING_LEN, total_arg_cnt, curr_arg_index);
-        return;
+        return ON9LOG_NULL_STRING_LEN;
     }
 
-    size_t str_len = on9log_bounded_strlen(str, ON9LOG_MAX_DYNAMIC_STRING_LEN);
-    on9log_emit_string_bytes(stream, str, str_len, total_arg_cnt, curr_arg_index);
+    size_t len = on9log_bounded_strlen(str, ON9LOG_MAX_DYNAMIC_STRING_LEN);
+    if (has_precision && precision >= 0 && (size_t)precision < len) {
+        len = (size_t)precision;
+    }
+    return (uint32_t)len;
 }
 
-static void on9log_emit_precision_string(on9log_stream_t *stream,
-                                         const char *str,
-                                         int32_t precision,
-                                         size_t total_arg_cnt,
-                                         size_t curr_arg_index)
+static uint32_t on9log_view_len(const on9log_string_view_t *view)
 {
-    if (precision < 0) {
-        on9log_emit_cstr(stream, str, total_arg_cnt, curr_arg_index);
-        return;
+    if (view == NULL || (view->data == NULL && view->len != 0)) {
+        return ON9LOG_NULL_STRING_LEN;
     }
-    if (str == NULL) {
+    return (uint32_t)(view->len > ON9LOG_MAX_DYNAMIC_STRING_LEN ? ON9LOG_MAX_DYNAMIC_STRING_LEN : view->len);
+}
+
+static void on9log_emit_string(on9log_stream_t *stream,
+                               const char *str,
+                               uint32_t str_len,
+                               size_t total_arg_cnt,
+                               size_t curr_arg_index)
+{
+    if (str_len == ON9LOG_NULL_STRING_LEN) {
         on9log_emit_u32(stream, ON9LOG_NULL_STRING_LEN, total_arg_cnt, curr_arg_index);
         return;
     }
-
-    size_t actual_len = on9log_bounded_strlen(str, ON9LOG_MAX_DYNAMIC_STRING_LEN);
-    size_t str_len = ((size_t)precision < actual_len) ? (size_t)precision : actual_len;
     on9log_emit_string_bytes(stream, str, str_len, total_arg_cnt, curr_arg_index);
 }
 
 /**
- * @brief Emit a single typed argument to the stream.
+ * @brief First pass over a log call's arguments: payload size and string lengths.
  *
- * Handles all four argument types:
- *   - @c ON9_LOG_ARGS_TYPE_32BITS: emit a uint32_t.
- *   - @c ON9_LOG_ARGS_TYPE_64BITS: emit a uint64_t.
- *   - @c ON9_LOG_ARGS_TYPE_POINTER: emit the pointer as uint32_t (truncated on 64-bit platforms).
- *   - @c ON9_LOG_ARGS_TYPE_DYNAMIC_STRING: emit the string length followed by the string bytes.
- *   - @c ON9_LOG_ARGS_TYPE_DYNAMIC_STRING_VIEW: emit the descriptor length followed by the bytes.
+ * Consumes @p args, so pass a va_copy. The payload is the argument count, the
+ * type table, then each argument as written by @ref on9log_emit_payload_args.
  *
- * @param[in] stream          Stream snapshot.
- * @param[in] arg_type        Argument type code.
- * @param[in] args            Variable argument list pointer (consumed from).
- * @param[in] total_arg_cnt   Total number of arguments expected in this frame.
- * @param[in] curr_arg_index  Index of the current argument.
+ * @return @c false if the call cannot be described by a header (more than 32
+ *         arguments, or a payload over @ref ON9LOG_PAYLOAD_LEN_MAX); the
+ *         caller drops it.
  */
-static void on9log_emit_arg(on9log_stream_t *stream,
-                            uint8_t arg_type,
-                            va_list *args,
-                            size_t total_arg_cnt,
-                            size_t curr_arg_index)
+static bool on9log_measure_payload(const char *arg_types,
+                                   on9log_arg_mask_t precision_string_arg_mask,
+                                   va_list *args,
+                                   size_t arg_count,
+                                   on9log_string_lens_t *lens,
+                                   uint16_t *payload_len)
 {
-    switch (arg_type) {
-    case ON9_LOG_ARGS_TYPE_32BITS: {
-        uint32_t val = va_arg(*args, uint32_t);
-        on9log_emit_u32(stream, val, total_arg_cnt, curr_arg_index);
-        return;
+    if (arg_count > ON9LOG_ARG_MASK_BITS) {
+        return false;
     }
-    case ON9_LOG_ARGS_TYPE_64BITS: {
-        uint64_t val = va_arg(*args, uint64_t);
-        on9log_emit_u64(stream, val, total_arg_cnt, curr_arg_index);
-        return;
-    }
-    case ON9_LOG_ARGS_TYPE_POINTER: {
-        const void *ptr = va_arg(*args, const void *);
-        on9log_emit_u32(stream, (uint32_t)(uintptr_t)ptr, total_arg_cnt, curr_arg_index);
-        return;
-    }
-    case ON9_LOG_ARGS_TYPE_DYNAMIC_STRING: {
-        const char *str = va_arg(*args, const char *);
-        on9log_emit_cstr(stream, str, total_arg_cnt, curr_arg_index);
-        return;
-    }
-    case ON9_LOG_ARGS_TYPE_DYNAMIC_STRING_VIEW: {
-        const on9log_string_view_t *str = va_arg(*args, const on9log_string_view_t *);
-        if (str == NULL || (str->data == NULL && str->len != 0)) {
-            on9log_emit_u32(stream, ON9LOG_NULL_STRING_LEN, total_arg_cnt, curr_arg_index);
-            return;
-        }
 
-        size_t str_len = str->len;
-        if (str_len > ON9LOG_MAX_DYNAMIC_STRING_LEN) {
-            str_len = ON9LOG_MAX_DYNAMIC_STRING_LEN;
+    size_t total = 1u + arg_count;
+    uint8_t prev_arg_type = ON9_LOG_ARGS_TYPE_NONE;
+    uint32_t prev_u32 = 0;
+
+    for (unsigned idx = 0; idx < arg_count; ++idx) {
+        uint8_t arg_type = on9log_arg_type_at(arg_types, idx);
+        switch (arg_type) {
+        case ON9_LOG_ARGS_TYPE_32BITS:
+            prev_u32 = va_arg(*args, uint32_t);
+            total += sizeof(uint32_t);
+            break;
+        case ON9_LOG_ARGS_TYPE_64BITS:
+            (void)va_arg(*args, uint64_t);
+            total += sizeof(uint64_t);
+            break;
+        case ON9_LOG_ARGS_TYPE_POINTER:
+            (void)va_arg(*args, const void *);
+            total += sizeof(uint32_t);
+            break;
+        case ON9_LOG_ARGS_TYPE_DYNAMIC_STRING: {
+            const char *str = va_arg(*args, const char *);
+            bool has_precision = (precision_string_arg_mask & ((on9log_arg_mask_t)1u << idx)) != 0u &&
+                                 prev_arg_type == ON9_LOG_ARGS_TYPE_32BITS;
+            lens->len[idx] = on9log_cstr_len(str, has_precision, (int32_t)prev_u32);
+            total += sizeof(uint32_t) + (lens->len[idx] == ON9LOG_NULL_STRING_LEN ? 0u : lens->len[idx]);
+            break;
         }
-        on9log_emit_string_bytes(stream, str->data, str_len, total_arg_cnt, curr_arg_index);
-        return;
+        case ON9_LOG_ARGS_TYPE_DYNAMIC_STRING_VIEW:
+            lens->len[idx] = on9log_view_len(va_arg(*args, const on9log_string_view_t *));
+            total += sizeof(uint32_t) + (lens->len[idx] == ON9LOG_NULL_STRING_LEN ? 0u : lens->len[idx]);
+            break;
+        default:
+            break;
+        }
+        prev_arg_type = arg_type;
     }
-    case ON9_LOG_ARGS_TYPE_NONE:
-    default:
-        return;
+
+    if (total > ON9LOG_PAYLOAD_LEN_MAX) {
+        return false;
     }
+    *payload_len = (uint16_t)total;
+    return true;
 }
 
 /**
  * @brief Emit all arguments described by the type string to the stream.
  *
- * Iterates through the argument types and delegates each to
- * @ref on9log_emit_arg.
+ * Writes what @ref on9log_measure_payload counted, using the string lengths it
+ * recorded.
  *
  * @param[in] stream        Stream snapshot.
  * @param[in] arg_types     Packed argument-type string.
+ * @param[in] lens          String lengths from the measuring pass.
  * @param[in] args          Variable argument list pointer.
  * @param[in] total_arg_cnt Total number of arguments (passed to each emit).
  */
 static void on9log_emit_payload_args(on9log_stream_t *stream,
                                      const char *arg_types,
-                                     on9log_arg_mask_t precision_string_arg_mask,
+                                     const on9log_string_lens_t *lens,
                                      va_list *args,
                                      size_t total_arg_cnt)
 {
-    uint8_t prev_arg_type = ON9_LOG_ARGS_TYPE_NONE;
-    uint32_t prev_u32 = 0;
-
-    for (unsigned idx = 0; idx < total_arg_cnt && on9log_arg_type_at(arg_types, idx) != ON9_LOG_ARGS_TYPE_NONE; ++idx) {
-        uint8_t arg_type = on9log_arg_type_at(arg_types, idx);
-        switch (arg_type) {
+    for (unsigned idx = 0; idx < total_arg_cnt; ++idx) {
+        switch (on9log_arg_type_at(arg_types, idx)) {
         case ON9_LOG_ARGS_TYPE_32BITS:
-            prev_u32 = va_arg(*args, uint32_t);
-            on9log_emit_u32(stream, prev_u32, total_arg_cnt, idx);
+            on9log_emit_u32(stream, va_arg(*args, uint32_t), total_arg_cnt, idx);
+            break;
+        case ON9_LOG_ARGS_TYPE_64BITS:
+            on9log_emit_u64(stream, va_arg(*args, uint64_t), total_arg_cnt, idx);
+            break;
+        case ON9_LOG_ARGS_TYPE_POINTER:
+            on9log_emit_u32(stream, (uint32_t)(uintptr_t)va_arg(*args, const void *), total_arg_cnt, idx);
             break;
         case ON9_LOG_ARGS_TYPE_DYNAMIC_STRING:
-            if (idx < ON9LOG_ARG_MASK_BITS &&
-                (precision_string_arg_mask & ((on9log_arg_mask_t)1u << idx)) != 0u &&
-                prev_arg_type == ON9_LOG_ARGS_TYPE_32BITS) {
-                const char *str = va_arg(*args, const char *);
-                on9log_emit_precision_string(stream, str, (int32_t)prev_u32, total_arg_cnt, idx);
-            } else {
-                on9log_emit_arg(stream, arg_type, args, total_arg_cnt, idx);
-            }
+            on9log_emit_string(stream, va_arg(*args, const char *), lens->len[idx], total_arg_cnt, idx);
             break;
-        default:
-            on9log_emit_arg(stream, arg_type, args, total_arg_cnt, idx);
+        case ON9_LOG_ARGS_TYPE_DYNAMIC_STRING_VIEW: {
+            const on9log_string_view_t *view = va_arg(*args, const on9log_string_view_t *);
+            on9log_emit_string(stream, view != NULL ? view->data : NULL, lens->len[idx], total_arg_cnt, idx);
             break;
         }
-        prev_arg_type = arg_type;
+        default:
+            break;
+        }
     }
 }
 
@@ -869,7 +883,7 @@ static void on9log_emit_payload_args(on9log_stream_t *stream,
  * @param[in]     time_ms     Timestamp in milliseconds.
  * @param[in]     tag_id      Tag identifier (typically a pointer cast to uint32_t).
  * @param[in]     fmt_id      Format string identifier (typically a pointer cast to uint32_t).
- * @param[in]     payload_len Payload length (may be @c ON9LOG_PAYLOAD_LEN_STREAMING).
+ * @param[in]     payload_len Payload length in bytes.
  */
 static void on9log_put_header(on9log_encoder_t *enc,
                               on9log_packet_type_t type,
@@ -933,7 +947,7 @@ static bool on9log_encode_header(uint8_t *header,
  * @param[in]     level       Log level.
  * @param[in]     tag_id      Tag identifier.
  * @param[in]     fmt_id      Format identifier.
- * @param[in]     payload_len Payload length (may be @c ON9LOG_PAYLOAD_LEN_STREAMING).
+ * @param[in]     payload_len Payload length in bytes.
  */
 static void on9log_emit_header(on9log_stream_t *stream,
                                on9log_packet_type_t type,
@@ -1031,7 +1045,7 @@ static bool on9log_encode_isr_log_packet(uint8_t *packet,
                       on9log_port_isr_timestamp_ms(),
                       (uint32_t)(uintptr_t)tag,
                       (uint32_t)(uintptr_t)format,
-                      ON9LOG_PAYLOAD_LEN_STREAMING);
+                      0); /* patched below, once the payload size is known */
     on9log_put_u8(&enc, arg_count);
     for (unsigned idx = 0; idx < arg_count; ++idx) {
         on9log_put_u8(&enc, on9log_arg_type_at(arg_types, idx));
@@ -1063,6 +1077,10 @@ static bool on9log_encode_isr_log_packet(uint8_t *packet,
         return false;
     }
 
+    /* The header's last two bytes hold the payload length. */
+    size_t payload_len = enc.len - sizeof(on9log_packet_header_t);
+    packet[sizeof(on9log_packet_header_t) - 2u] = (uint8_t)(payload_len & 0xffu);
+    packet[sizeof(on9log_packet_header_t) - 1u] = (uint8_t)(payload_len >> 8u);
     *packet_len = enc.len;
     return true;
 }
@@ -1109,6 +1127,73 @@ static void on9log_emit_dropped_packet(uint32_t dropped_count)
 #endif
 }
 
+#if ON9LOG_PLAIN_TEXT
+typedef struct {
+    uint32_t boot_id;
+    uint32_t reason;
+} on9log_boot_text_ctx_t;
+
+static void on9log_boot_text_formatter(on9log_text_output_cb_t output, void *output_ctx, void *formatter_ctx)
+{
+    const on9log_boot_text_ctx_t *ctx = (const on9log_boot_text_ctx_t *)formatter_ctx;
+    output("boot id=", sizeof("boot id=") - 1u, output_ctx);
+    on9log_text_output_u32(output, output_ctx, ctx->boot_id);
+    output(" reset reason=", sizeof(" reset reason=") - 1u, output_ctx);
+    on9log_text_output_u32(output, output_ctx, ctx->reason);
+}
+#endif
+
+on9log_err_t on9log_emit_boot(uint32_t boot_id, on9log_reset_reason_t reason)
+{
+#if ON9LOG_PLAIN_TEXT
+    on9log_boot_text_ctx_t ctx = {.boot_id = boot_id, .reason = (uint32_t)reason};
+    on9log_dispatch_text_line(ON9_LOG_LEVEL_INFO,
+                              "on9log",
+                              on9log_port_timestamp_ms(),
+                              ON9LOG_TEXT_DEFAULT_FLAGS,
+                              on9log_boot_text_formatter,
+                              &ctx);
+#else
+    on9log_stream_t stream = {0};
+
+    on9log_emit_header(&stream, ON9LOG_PKT_BOOT, ON9_LOG_LEVEL_NONE, 0, 0, sizeof(uint32_t) + sizeof(uint8_t));
+    on9log_emit_u32(&stream, boot_id, 2, 0);
+    on9log_emit_u8(&stream, (uint8_t)reason, 2, 1);
+    on9log_stream_end(&stream);
+#endif
+    return ON9LOG_OK;
+}
+
+size_t on9log_encode_time_sync(uint8_t *buf, size_t cap, uint32_t boot_id)
+{
+#if ON9LOG_PLAIN_TEXT
+    (void)buf;
+    (void)cap;
+    (void)boot_id;
+    return 0;
+#else
+    if (buf == NULL) {
+        return 0;
+    }
+
+    on9log_encoder_t enc = {
+        .cap = cap,
+        .data = buf,
+    };
+    /* Not part of the log sequence: the sequence number stays 0 so sinks do not see a gap. */
+    on9log_put_header(&enc,
+                      ON9LOG_PKT_TIME_SYNC,
+                      ON9_LOG_LEVEL_NONE,
+                      0,
+                      on9log_port_timestamp_ms(),
+                      0,
+                      0,
+                      sizeof(uint32_t));
+    on9log_put_u32(&enc, boot_id);
+    return enc.overflow ? 0 : enc.len;
+#endif
+}
+
 /**
  * @brief Emit a buffer-data packet (type @c ON9LOG_PKT_BUFFER).
  *
@@ -1136,7 +1221,7 @@ static void on9log_emit_buffer_packet(on9log_level_t level,
                        level,
                        (uint32_t)(uintptr_t)tag,
                        0,
-                       ON9LOG_PAYLOAD_LEN_STREAMING);
+                       (uint16_t)(3u * sizeof(uint32_t) + chunk_len));
     on9log_emit_u32(&stream, total_len, 1, ON9LOG_PAYLOAD_META_ARG_INDEX);
     on9log_emit_u32(&stream, offset, 1, ON9LOG_PAYLOAD_META_ARG_INDEX);
     on9log_emit_u32(&stream, chunk_len, 1, ON9LOG_PAYLOAD_META_ARG_INDEX);
@@ -1864,17 +1949,28 @@ static void on9log_vwrite(on9log_level_t level,
         precision_string_arg_mask = on9log_mark_precision_string_args(format_scan, arg_count);
     }
 
+    on9log_string_lens_t string_lens;
+    uint16_t payload_len = 0;
+    va_list measure_args;
+    va_copy(measure_args, *args);
+    bool fits = on9log_measure_payload(arg_types, precision_string_arg_mask, &measure_args, arg_count, &string_lens, &payload_len);
+    va_end(measure_args);
+    if (!fits) {
+        atomic_fetch_add_explicit(&s_dropped_count, 1, memory_order_relaxed);
+        return;
+    }
+
     on9log_emit_header(&stream,
                        ON9LOG_PKT_LOG,
                        level,
                        (uint32_t)(uintptr_t)tag,
                        (uint32_t)(uintptr_t)format,
-                       ON9LOG_PAYLOAD_LEN_STREAMING);
+                       payload_len);
     on9log_emit_u8(&stream, arg_count, arg_count, ON9LOG_PAYLOAD_META_ARG_INDEX);
     if (arg_count != 0) {
         on9log_stream_payload(&stream, (const uint8_t *)arg_types, arg_count, arg_count, ON9LOG_PAYLOAD_META_ARG_INDEX);
     }
-    on9log_emit_payload_args(&stream, arg_types, precision_string_arg_mask, args, arg_count);
+    on9log_emit_payload_args(&stream, arg_types, &string_lens, args, arg_count);
     on9log_stream_end(&stream);
 #endif
 }

@@ -54,9 +54,16 @@ Every log packet carries an 18-byte little-endian header:
 | `time_ms` | u32 | Milliseconds since boot |
 | `tag_id` | u32 | Tag string address in ELF |
 | `fmt_id` | u32 | Format string address in ELF |
-| `payload_len` | u16 | Payload bytes, or `0xffff` for streaming |
+| `payload_len` | u16 | Payload bytes after the header (`0xffff` is reserved for "unknown") |
 
 Packet types: `LOG` (0), `DROPPED` (1), `TIME_SYNC` (2), `BOOT` (3), `BUFFER` (4).
+
+`BOOT` (payload: `u32 boot_id`, `u8 reset_reason`) is sent by the application
+once after startup with `on9log_emit_boot()`; the reason comes from
+`on9log_port_reset_reason()`. `TIME_SYNC` (payload: `u32 boot_id`) is meant for
+batching transports: `on9log_encode_time_sync()` builds one to append to each
+batch, so a receiver can place the batch in time without trusting the device
+clock. `boot_id` is a random number picked once per boot.
 
 Format and tag strings are stored in ELF-only `.noload_keep_in_elf.*` sections — excluded from the flashed binary, resolved by address on the host.
 

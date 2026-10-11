@@ -10,6 +10,7 @@
 
 #include "esp_log_timestamp.h"
 #include "esp_private/log_lock.h"
+#include "esp_system.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -52,4 +53,42 @@ void on9log_port_yield(void)
 uint32_t on9log_port_timestamp_ms(void)
 {
     return esp_log_timestamp();
+}
+
+on9log_reset_reason_t on9log_port_reset_reason(void)
+{
+    switch (esp_reset_reason()) {
+    case ESP_RST_POWERON:
+        return ON9LOG_RESET_POWER_ON;
+    case ESP_RST_EXT:
+        return ON9LOG_RESET_EXTERNAL;
+    case ESP_RST_SW:
+        return ON9LOG_RESET_SOFTWARE;
+    case ESP_RST_PANIC:
+        return ON9LOG_RESET_PANIC;
+    case ESP_RST_INT_WDT:
+        return ON9LOG_RESET_INT_WDT;
+    case ESP_RST_TASK_WDT:
+        return ON9LOG_RESET_TASK_WDT;
+    case ESP_RST_WDT:
+        return ON9LOG_RESET_OTHER_WDT;
+    case ESP_RST_DEEPSLEEP:
+        return ON9LOG_RESET_DEEP_SLEEP;
+    case ESP_RST_BROWNOUT:
+        return ON9LOG_RESET_BROWNOUT;
+    case ESP_RST_SDIO:
+        return ON9LOG_RESET_SDIO;
+    case ESP_RST_USB:
+        return ON9LOG_RESET_USB;
+    case ESP_RST_JTAG:
+        return ON9LOG_RESET_JTAG;
+    case ESP_RST_EFUSE:
+        return ON9LOG_RESET_EFUSE;
+    case ESP_RST_PWR_GLITCH:
+        return ON9LOG_RESET_POWER_GLITCH;
+    case ESP_RST_CPU_LOCKUP:
+        return ON9LOG_RESET_CPU_LOCKUP;
+    default:
+        return ON9LOG_RESET_UNKNOWN;
+    }
 }
