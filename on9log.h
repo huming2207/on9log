@@ -574,6 +574,14 @@ typedef enum {
 } on9log_args_type_t;
 
 /**
+ * @brief Maximum number of arguments one log call can encode.
+ *
+ * Calls with more arguments are dropped and counted as dropped packets. The
+ * C++ wrapper rejects them at compile time.
+ */
+#define ON9LOG_MAX_ARGS 32u
+
+/**
  * @brief Length-aware string argument descriptor.
  *
  * Used by the C++ wrapper for std::string and std::string_view arguments so the

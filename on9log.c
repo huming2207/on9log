@@ -51,6 +51,7 @@
 /** @brief Compact bitset for precision-bounded string argument indexes. */
 typedef uint32_t on9log_arg_mask_t;
 #define ON9LOG_ARG_MASK_BITS ((unsigned)(sizeof(on9log_arg_mask_t) * 8u))
+_Static_assert(ON9LOG_ARG_MASK_BITS == ON9LOG_MAX_ARGS, "the argument mask must cover ON9LOG_MAX_ARGS arguments");
 /** Maximum lock-free attempts to snapshot one sink slot before skipping it. */
 #define ON9LOG_SINK_SNAPSHOT_MAX_RETRIES 8u
 

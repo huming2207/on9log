@@ -305,7 +305,7 @@ consteval char arg_type_code()
 template <typename... Args>
 constexpr const char *arg_types() noexcept
 {
-    static_assert(sizeof...(Args) <= 255u, "on9log supports at most 255 encoded arguments");
+    static_assert(sizeof...(Args) <= ON9LOG_MAX_ARGS, "on9log supports at most 32 encoded arguments");
     static constexpr char types[] = {arg_type_code<Args>()..., static_cast<char>(ON9_LOG_ARGS_TYPE_NONE)};
     return types;
 }

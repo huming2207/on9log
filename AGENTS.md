@@ -63,8 +63,9 @@ byte stream without any transport framing (for example several packets in one
 MQTT message). Log packets get it from a first pass over a copy of the
 `va_list`, which also records each string argument's length so the header and
 the payload agree even if the string changes in between. A call with more than
-32 arguments, or a payload over 65534 bytes, is dropped and counted in the
-dropped-packet counter. `0xffff` (`ON9LOG_PAYLOAD_LEN_STREAMING`) stays
+`ON9LOG_MAX_ARGS` (32) arguments, or a payload over 65534 bytes, is dropped and
+counted in the dropped-packet counter; the C++ wrapper rejects more than 32
+arguments at compile time. `0xffff` (`ON9LOG_PAYLOAD_LEN_STREAMING`) stays
 reserved for "unknown"; older firmware used it for every log packet. Sink
 callbacks still receive an explicit `end_cb()`.
 

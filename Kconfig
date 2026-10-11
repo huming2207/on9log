@@ -55,12 +55,14 @@ menu "on9log"
 
     config ON9LOG_BUFFER_CHUNK_SIZE
         int "Maximum buffer dump chunk size"
-        range 1 65535
+        range 1 65522
         default 3042
         help
             Maximum number of user buffer bytes emitted in one ON9LOG_PKT_BUFFER
             packet. The default fits the largest buffer chunk that the default
-            ESP stdio VFS transport can forward in one frame.
+            ESP stdio VFS transport can forward in one frame. The upper bound is
+            the largest chunk whose 12-byte metadata plus data fits the packet
+            header's 16-bit payload length.
 
     config ON9LOG_MAX_DYNAMIC_STRING_LEN
         int "Maximum dynamic string argument length"
