@@ -15,7 +15,6 @@
 
 #include "esp_stdio_log_vfs.h"
 #include "freertos/FreeRTOS.h"
-#include "freertos/semphr.h"
 #include "on9log.h"
 
 /**
@@ -46,16 +45,11 @@ static on9log_esp_vfs_t s_on9log_esp_vfs = {
 #endif
 };
 
-/** @brief Dedicated sink mutex protecting the singleton accumulator buffer.
- *
- * Replaces esp_log_impl_lock() so that on9log packet accumulation no longer
- * blocks ESP-IDF system logging (ESP_LOG*) on other tasks/cores during a
- * frame write.  Non-recursive; callers must not log from within sink
- * callbacks.
+/*
+ * The accumulator buffer needs no lock of its own: the on9log core calls every
+ * sink with its emit lock held from start_cb to end_cb, so packets never
+ * interleave here.
  */
-static SemaphoreHandle_t s_sink_mutex = NULL;
-/** @brief Static storage for the sink mutex (avoids dynamic allocation). */
-static StaticSemaphore_t s_sink_mutex_storage;
 
 /**
  * @brief Append bytes to the frame accumulation buffer.
@@ -84,9 +78,8 @@ static void on9log_esp_vfs_append(const uint8_t *data, size_t len)
 /**
  * @brief Sink @c start_cb: begin a new log frame.
  *
- * Acquires the dedicated sink mutex (serialising access to the singleton
- * accumulator buffer), resets the accumulation buffer, and appends the
- * packet header.
+ * Resets the accumulation buffer and appends the packet header. The core's
+ * emit lock is held until end_cb, so the buffer is not shared mid-packet.
  *
  * @param[in] header      Pointer to the on9log packet header bytes.
  * @param[in] header_len  Length of the header in bytes.
@@ -96,9 +89,6 @@ static void on9log_esp_vfs_start(const uint8_t *header, size_t header_len, void 
 {
     (void)ctx;
 
-    if (s_sink_mutex != NULL) {
-        xSemaphoreTake(s_sink_mutex, portMAX_DELAY);
-    }
 #if ON9LOG_PLAIN_TEXT
     (void)header;
     (void)header_len;
@@ -140,12 +130,11 @@ static void on9log_esp_vfs_payload(const uint8_t *payload,
 }
 
 /**
- * @brief Sink @c end_cb: write the accumulated frame and release the sink mutex.
+ * @brief Sink @c end_cb: write the accumulated frame.
  *
  * If no overflow occurred, the assembled buffer is written as an on9log frame
- * via @ref esp_stdio_log_vfs_write_frame.  The sink mutex is released after
- * the transport write completes so that the accumulator buffer is not
- * overwritten by a concurrent packet.
+ * via @ref esp_stdio_log_vfs_write_frame. The core releases its emit lock only
+ * after this returns, so the buffer is not overwritten by another packet.
  *
  * @param[in] ctx  Sink context (unused).
  */
@@ -165,9 +154,6 @@ static void on9log_esp_vfs_end(void *ctx)
                                             s_on9log_esp_vfs.len);
     }
 #endif
-    if (s_sink_mutex != NULL) {
-        xSemaphoreGive(s_sink_mutex);
-    }
 }
 
 /** @brief Static sink descriptor for the ESP VFS output path. */
@@ -225,13 +211,6 @@ esp_err_t on9log_esp_vfs_init(void)
     on9log_err_t on9_err = on9log_init();
     if (on9_err != ON9LOG_OK) {
         return on9log_esp_vfs_to_esp_err(on9_err);
-    }
-
-    if (s_sink_mutex == NULL) {
-        s_sink_mutex = xSemaphoreCreateMutexStatic(&s_sink_mutex_storage);
-        if (s_sink_mutex == NULL) {
-            return ESP_ERR_NO_MEM;
-        }
     }
 
     esp_err_t err = esp_stdio_log_vfs_init();

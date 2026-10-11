@@ -52,29 +52,16 @@
 typedef uint32_t on9log_arg_mask_t;
 #define ON9LOG_ARG_MASK_BITS ((unsigned)(sizeof(on9log_arg_mask_t) * 8u))
 _Static_assert(ON9LOG_ARG_MASK_BITS == ON9LOG_MAX_ARGS, "the argument mask must cover ON9LOG_MAX_ARGS arguments");
-/** Maximum lock-free attempts to snapshot one sink slot before skipping it. */
-#define ON9LOG_SINK_SNAPSHOT_MAX_RETRIES 8u
-
 /**
- * @brief An atomic slot in the global sink table.
+ * @brief A slot in the global sink table.
  *
- * Each slot holds a pointer to a @ref on9log_sink_t and its opaque context,
- * both stored as @c atomic_uintptr_t so that lock-free readers can access
- * them without taking the port lock.
- *
- * A @c generation counter provides a seqlock so that the lock-free dispatch
- * reader can obtain a consistent @c (sink, ctx) pair even while a concurrent
- * @c on9log_add_sink / @c on9log_remove_sink modifies the slot.  The writer
- * increments @c generation to an odd value before the update and to an even
- * value after; the reader retries if it observes an odd generation or a
- * generation that changes between the two reads.
+ * Read and written only while holding the emit lock: packets are written
+ * under it, and on9log_add_sink() / on9log_remove_sink() take it too, so the
+ * table never changes while a packet is in flight.
  */
 typedef struct {
-    atomic_uint generation;     /**< Seqlock generation (even = stable, odd = write in progress). */
-    atomic_uintptr_t sink;      /**< Pointer to the sink descriptor (@ref on9log_sink_t). */
-    atomic_uintptr_t ctx;       /**< Opaque user context passed to every sink callback. */
-    atomic_uint readers;        /**< Dispatch snapshots currently using this slot. */
-    atomic_bool retiring;       /**< Empty slot awaiting completion of old readers. */
+    const on9log_sink_t *sink; /**< Sink descriptor, or NULL for a free slot. */
+    void *ctx;                 /**< Opaque user context passed to every sink callback. */
 } on9log_sink_entry_t;
 
 /**
@@ -92,26 +79,12 @@ typedef struct {
 } on9log_encoder_t;
 
 /**
- * @brief A single sink reference captured during a stream snapshot.
- *
- * This pairs a sink descriptor with its context so the stream iteration is
- * fast and does not touch the atomic slot table on every payload call.
+ * @brief Per-packet stream state: the registered sinks, compacted when the
+ *        stream is opened so payload calls skip free slots.
  */
 typedef struct {
-    const on9log_sink_t *sink; /**< The sink descriptor. */
-    void *ctx;                 /**< Opaque user context for the sink. */
-    on9log_sink_entry_t *entry; /**< Registry slot whose reader reference is held. */
-} on9log_stream_sink_t;
-
-/**
- * @brief Per-log-call stream state.
- *
- * A snapshot of the sink table is taken once at stream-start; this avoids
- * holding a lock during the entire multi-payload output sequence.
- */
-typedef struct {
-    size_t sink_count;                    /**< Number of sinks captured in @ref sinks. */
-    on9log_stream_sink_t sinks[ON9LOG_MAX_SINKS]; /**< Captured sink table. */
+    size_t sink_count;                          /**< Number of sinks captured in @ref sinks. */
+    on9log_sink_entry_t sinks[ON9LOG_MAX_SINKS]; /**< Registered sinks, in slot order. */
 } on9log_stream_t;
 
 /**
@@ -132,12 +105,7 @@ typedef struct on9log_tag_filter_node {
 /** @brief Type alias for the BSD sys/queue singly-linked list header. */
 SLIST_HEAD(on9log_tag_filter_list, on9log_tag_filter_node);
 
-/**
- * @brief Global sink table.
- *
- * Each slot can hold one sink.  Slots are read with acquire ordering and
- * written with release ordering for lock-free ISR safety.
- */
+/** @brief Global sink table, protected by the emit lock. */
 static on9log_sink_entry_t s_sinks[ON9LOG_MAX_SINKS];
 
 /** @brief Head of the per-tag filter linked list (protected by on9log_port_lock). */
@@ -301,8 +269,7 @@ static size_t on9log_bounded_strlen(const char *str, size_t max_len)
  *
  * The lock is held until @ref on9log_stream_end, so a packet's sequence number
  * and timestamp, taken after this call, match the order in which every sink
- * sees the packets. Reads the atomic sink table (with acquire ordering) and
- * captures every non-NULL slot into the stream structure.
+ * sees the packets, and no sink can be added or removed mid-packet.
  *
  * @param[out] stream      Stream state to initialise.
  */
@@ -310,51 +277,11 @@ static void on9log_stream_open(on9log_stream_t *stream)
 {
     on9log_port_emit_lock();
     stream->sink_count = 0;
-
     for (size_t i = 0; i < ON9LOG_MAX_SINKS; ++i) {
-        const on9log_sink_t *sink;
-        void *ctx;
-        unsigned gen1 = 0;
-        unsigned gen2 = 0;
-        bool consistent = false;
-        for (unsigned retry = 0; retry < ON9LOG_SINK_SNAPSHOT_MAX_RETRIES; ++retry) {
-            gen1 = atomic_load_explicit(&s_sinks[i].generation, memory_order_acquire);
-            if (gen1 & 1u) {
-                continue;
-            }
-            sink = (const on9log_sink_t *)atomic_load_explicit(&s_sinks[i].sink, memory_order_relaxed);
-            ctx = (void *)atomic_load_explicit(&s_sinks[i].ctx, memory_order_relaxed);
-            atomic_thread_fence(memory_order_acquire);
-            gen2 = atomic_load_explicit(&s_sinks[i].generation, memory_order_relaxed);
-            if (gen1 != gen2) {
-                continue;
-            }
-            if (sink == NULL) {
-                consistent = true;
-                break;
-            }
-
-            atomic_fetch_add_explicit(&s_sinks[i].readers, 1u, memory_order_acq_rel);
-            if (atomic_load_explicit(&s_sinks[i].generation, memory_order_acquire) == gen2 &&
-                atomic_load_explicit(&s_sinks[i].sink, memory_order_acquire) == (uintptr_t)sink) {
-                consistent = true;
-                break;
-            }
-            atomic_fetch_sub_explicit(&s_sinks[i].readers, 1u, memory_order_release);
-        }
-
-        if (!consistent) {
-            continue;
-        }
-
-        if (sink != NULL) {
-            stream->sinks[stream->sink_count].sink = sink;
-            stream->sinks[stream->sink_count].ctx = ctx;
-            stream->sinks[stream->sink_count].entry = &s_sinks[i];
-            ++stream->sink_count;
+        if (s_sinks[i].sink != NULL) {
+            stream->sinks[stream->sink_count++] = s_sinks[i];
         }
     }
-
 }
 
 /**
@@ -369,13 +296,6 @@ static void on9log_stream_send_header(on9log_stream_t *stream, const uint8_t *he
     for (size_t i = 0; i < stream->sink_count; ++i) {
         stream->sinks[i].sink->start_cb(header, header_len, stream->sinks[i].ctx);
     }
-}
-
-/** @brief Open a stream and send a header that needs no sequence number. */
-static void on9log_stream_start(on9log_stream_t *stream, const uint8_t *header, size_t header_len)
-{
-    on9log_stream_open(stream);
-    on9log_stream_send_header(stream, header, header_len);
 }
 
 /**
@@ -413,7 +333,6 @@ static void on9log_stream_end(on9log_stream_t *stream)
 {
     for (size_t i = 0; i < stream->sink_count; ++i) {
         stream->sinks[i].sink->end_cb(stream->sinks[i].ctx);
-        atomic_fetch_sub_explicit(&stream->sinks[i].entry->readers, 1u, memory_order_release);
     }
     on9log_port_emit_unlock();
 }
@@ -627,7 +546,8 @@ static void on9log_dispatch_text_line(on9log_level_t level,
         .flags = flags,
     };
 
-    on9log_stream_start(&stream, NULL, 0);
+    on9log_stream_open(&stream);
+    on9log_stream_send_header(&stream, NULL, 0);
     /* Read under the emission lock so timestamps follow output order. */
     on9log_text_output_prefix(on9log_text_filtered_output,
                               &filter,
@@ -1470,8 +1390,16 @@ static on9log_level_t on9log_filter_level_for_tag(const char *tag)
         memory_order_acquire);
     while (node != NULL) {
         if (atomic_load_explicit(&node->active, memory_order_acquire)) {
-            atomic_fetch_add_explicit(&node->readers, 1u, memory_order_acq_rel);
-            if (atomic_load_explicit(&node->active, memory_order_acquire)) {
+            /*
+             * seq_cst on this increment and the recheck, and on the writer's
+             * clear of `active` and wait on `readers`: each side writes one
+             * variable then reads the other's, and only seq_cst guarantees at
+             * least one side sees the other. With weaker ordering the writer
+             * could see no readers while this reader still sees the node
+             * active, then free the tag this reader is about to compare.
+             */
+            atomic_fetch_add_explicit(&node->readers, 1u, memory_order_seq_cst);
+            if (atomic_load_explicit(&node->active, memory_order_seq_cst)) {
                 bool matches = on9log_tag_matches(node->tag, tag);
                 on9log_level_t level = (on9log_level_t)atomic_load_explicit(
                     &node->level,
@@ -1558,10 +1486,26 @@ void on9log_write_text_with_flags(on9log_level_t level,
 #endif
 
 /**
+ * @brief Find the slot holding exactly (sink, ctx); (NULL, NULL) finds a free
+ *        slot. Caller holds the emit lock.
+ */
+static on9log_sink_entry_t *on9log_find_sink(const on9log_sink_t *sink, void *ctx)
+{
+    for (size_t i = 0; i < ON9LOG_MAX_SINKS; ++i) {
+        if (s_sinks[i].sink == sink && s_sinks[i].ctx == ctx) {
+            return &s_sinks[i];
+        }
+    }
+    return NULL;
+}
+
+/**
  * @brief Register a log sink.
  *
- * Adds the sink to the global atomic sink table.  Duplicate (sink, ctx)
- * pairs are silently accepted (returns @c ON9LOG_OK).  Thread-safe.
+ * Adds the sink to the sink table under the emit lock, so it waits for any
+ * packet in flight and the new sink sees only whole packets. Duplicate
+ * (sink, ctx) pairs are silently accepted (returns @c ON9LOG_OK). Must not be
+ * called from a sink callback.
  *
  * @param[in] sink  Pointer to the sink descriptor.  Must have all three
  *                  callbacks (@c start_cb, @c payload_cb, @c end_cb) set.
@@ -1578,38 +1522,27 @@ on9log_err_t on9log_add_sink(const on9log_sink_t *sink, void *ctx)
         return ON9LOG_ERR_INVALID_ARG;
     }
 
-    on9log_port_lock();
-    for (size_t i = 0; i < ON9LOG_MAX_SINKS; ++i) {
-        const on9log_sink_t *slot_sink = (const on9log_sink_t *)atomic_load_explicit(&s_sinks[i].sink, memory_order_acquire);
-        void *slot_ctx = (void *)atomic_load_explicit(&s_sinks[i].ctx, memory_order_relaxed);
-        if (slot_sink == sink && slot_ctx == ctx) {
-            on9log_port_unlock();
-            return ON9LOG_OK;
+    on9log_err_t result = ON9LOG_OK;
+    on9log_port_emit_lock();
+    if (on9log_find_sink(sink, ctx) == NULL) {
+        on9log_sink_entry_t *slot = on9log_find_sink(NULL, NULL);
+        if (slot != NULL) {
+            slot->sink = sink;
+            slot->ctx = ctx;
+        } else {
+            result = ON9LOG_ERR_NO_MEM;
         }
     }
-    for (size_t i = 0; i < ON9LOG_MAX_SINKS; ++i) {
-        if (atomic_load_explicit(&s_sinks[i].sink, memory_order_acquire) == (uintptr_t)NULL &&
-            !atomic_load_explicit(&s_sinks[i].retiring, memory_order_acquire)) {
-            unsigned gen = atomic_load_explicit(&s_sinks[i].generation, memory_order_relaxed);
-            atomic_store_explicit(&s_sinks[i].generation, gen + 1u, memory_order_relaxed);
-            atomic_thread_fence(memory_order_release);
-            atomic_store_explicit(&s_sinks[i].ctx, (uintptr_t)ctx, memory_order_relaxed);
-            atomic_store_explicit(&s_sinks[i].sink, (uintptr_t)sink, memory_order_release);
-            atomic_store_explicit(&s_sinks[i].generation, gen + 2u, memory_order_release);
-            on9log_port_unlock();
-            return ON9LOG_OK;
-        }
-    }
-    on9log_port_unlock();
-
-    return ON9LOG_ERR_NO_MEM;
+    on9log_port_emit_unlock();
+    return result;
 }
 
 /**
  * @brief Remove a previously registered log sink.
  *
- * Finds the matching (sink, ctx) entry in the sink table and clears the slot
- * with release ordering so that concurrent readers see the update.
+ * Takes the emit lock, so it waits for any packet in flight to finish; once
+ * it returns, the sink is never called again. Must not be called from a sink
+ * callback, which runs with the emit lock held.
  *
  * @param[in] sink  Pointer to the sink descriptor.
  * @param[in] ctx   Opaque user context that was passed to @ref on9log_add_sink.
@@ -1620,30 +1553,20 @@ on9log_err_t on9log_add_sink(const on9log_sink_t *sink, void *ctx)
  */
 on9log_err_t on9log_remove_sink(const on9log_sink_t *sink, void *ctx)
 {
-    on9log_port_lock();
-    for (size_t i = 0; i < ON9LOG_MAX_SINKS; ++i) {
-        const on9log_sink_t *slot_sink = (const on9log_sink_t *)atomic_load_explicit(&s_sinks[i].sink, memory_order_acquire);
-        void *slot_ctx = (void *)atomic_load_explicit(&s_sinks[i].ctx, memory_order_relaxed);
-        if (slot_sink == sink && slot_ctx == ctx) {
-            unsigned gen = atomic_load_explicit(&s_sinks[i].generation, memory_order_relaxed);
-            atomic_store_explicit(&s_sinks[i].generation, gen + 1u, memory_order_relaxed);
-            atomic_thread_fence(memory_order_release);
-            atomic_store_explicit(&s_sinks[i].sink, (uintptr_t)NULL, memory_order_release);
-            atomic_store_explicit(&s_sinks[i].ctx, (uintptr_t)NULL, memory_order_relaxed);
-            atomic_store_explicit(&s_sinks[i].retiring, true, memory_order_release);
-            atomic_store_explicit(&s_sinks[i].generation, gen + 2u, memory_order_release);
-            on9log_port_unlock();
-
-            while (atomic_load_explicit(&s_sinks[i].readers, memory_order_acquire) != 0u) {
-                on9log_port_yield();
-            }
-            atomic_store_explicit(&s_sinks[i].retiring, false, memory_order_release);
-            return ON9LOG_OK;
-        }
+    if (sink == NULL) {
+        return ON9LOG_ERR_NOT_FOUND;
     }
-    on9log_port_unlock();
 
-    return ON9LOG_ERR_NOT_FOUND;
+    on9log_err_t result = ON9LOG_ERR_NOT_FOUND;
+    on9log_port_emit_lock();
+    on9log_sink_entry_t *slot = on9log_find_sink(sink, ctx);
+    if (slot != NULL) {
+        slot->sink = NULL;
+        slot->ctx = NULL;
+        result = ON9LOG_OK;
+    }
+    on9log_port_emit_unlock();
+    return result;
 }
 
 /**
@@ -1753,7 +1676,8 @@ on9log_err_t on9log_set_tag_level(const char *tag, on9log_level_t level)
         }
     }
     if (reusable != NULL) {
-        while (atomic_load_explicit(&reusable->readers, memory_order_acquire) != 0u) {
+        /* seq_cst pairs with the reader in on9log_filter_level_for_tag(). */
+        while (atomic_load_explicit(&reusable->readers, memory_order_seq_cst) != 0u) {
             on9log_port_yield();
         }
         free(reusable->tag);
@@ -1808,7 +1732,8 @@ on9log_err_t on9log_clear_tag_level(const char *tag)
     on9log_tag_filter_node_t *node = NULL;
     SLIST_FOREACH(node, &s_tag_filters, entries) {
         if (on9log_tag_matches(node->tag, tag)) {
-            bool was_active = atomic_exchange_explicit(&node->active, false, memory_order_acq_rel);
+            /* seq_cst pairs with the reader in on9log_filter_level_for_tag(). */
+            bool was_active = atomic_exchange_explicit(&node->active, false, memory_order_seq_cst);
             if (was_active) {
                 atomic_fetch_sub_explicit(&s_active_tag_filter_count, 1, memory_order_acq_rel);
             }
@@ -1860,7 +1785,8 @@ on9log_err_t on9log_dispatch_packet(const uint8_t *packet, size_t packet_len)
     }
 
 #if ON9LOG_PLAIN_TEXT
-    on9log_stream_start(&stream, NULL, 0);
+    on9log_stream_open(&stream);
+    on9log_stream_send_header(&stream, NULL, 0);
     on9log_stream_payload(&stream,
                           packet,
                           packet_len,

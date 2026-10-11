@@ -150,9 +150,9 @@ on9log_err_t on9log_add_sink(const on9log_sink_t *sink, void *ctx);
  * @brief Remove a previously registered log sink.
  *
  * Both the sink descriptor pointer and the context pointer must match the
- * values used during registration. On success, all in-flight callbacks for
- * this registration have completed, so the caller may release both objects.
- * This function must not be called from one of the sink's own callbacks.
+ * values used during registration. It waits for any packet being written;
+ * on success the sink is never called again, so the caller may release both
+ * objects. Must not be called from any sink callback (it would deadlock).
  *
  * @param[in] sink Pointer to the sink descriptor to remove.
  * @param[in] ctx  User context that was passed at registration time.

@@ -131,11 +131,11 @@ fits this VFS transport cap (`3072 - 18 byte on9log header - 12 byte buffer
 metadata`). Non-UART sinks such as MQTT or WebSocket still receive raw on9log
 packet bytes without SLIP wrapping.
 
-The sink holds a dedicated non-recursive FreeRTOS mutex (`s_sink_mutex`,
-statically allocated) from `start_cb()` through `end_cb()` so on9log packet
-buffering does not interleave across tasks/cores.  This mutex is separate from
-ESP-IDF's `esp_log_impl_lock()`, so `ESP_LOG*` calls from other tasks/cores are
-not blocked during an on9log frame write.  The sink does **not** take
+The sink has no lock of its own: the core calls every sink with its emit lock
+held from `start_cb()` through `end_cb()` (see Locking And Atomics), so on9log
+packet buffering never interleaves across tasks/cores. That lock is separate
+from ESP-IDF's `esp_log_impl_lock()`, so `ESP_LOG*` calls from other
+tasks/cores are not blocked during an on9log frame write. The sink does **not** take
 `flockfile(stdout)` or call `fflush(stdout)`; stdout is unbuffered
 (`setvbuf(..., _IONBF, 0)`) and wire serialization is handled by the transport
 mutex inside `esp_stdio_log_vfs_write_frame()`.
@@ -789,35 +789,31 @@ Current shared state is handled as follows:
 
 - packet sequence counter: atomic (assigned under the emit lock);
 - dropped packet counter: atomic;
-- sink stream dispatch: lock-free atomic pointer loads plus per-slot reader
-  references;
-- sink add/remove: still locked to serialize table mutation and duplicate/free
-  slot checks.
+- sink table: plain pointers protected by the emit lock;
+- tag filters: atomic per-node reader counts, mutations under
+  `on9log_port_lock()`.
 
-Each sink slot uses an even/odd generation seqlock around its atomic `(sink,
-ctx)` pair. Writers publish the odd generation before changing either pointer
-and publish the next even generation with release ordering. Dispatch reads an
-even generation, snapshots both pointers, executes an acquire fence, and
-validates the generation again. For a non-empty stable snapshot, dispatch then
-obtains a per-slot reader reference, revalidates the generation and sink
-pointer, and retains that reference through `end_cb()`. A slot that cannot
-produce and retain a stable snapshot in eight attempts is skipped for that
-packet, preventing a preempted or abandoned writer from livelocking all
-logging.
+The sink table needs no atomics. Packets are written under the emit lock, and
+`on9log_add_sink()` / `on9log_remove_sink()` take the same lock, so the table
+never changes while a packet is in flight. A successful `on9log_remove_sink()`
+is therefore an in-flight callback barrier: it waits for any packet being
+written, and the sink is never called after it returns, so the caller may
+release the sink descriptor and context. Add and remove must not be called
+from a sink callback: the emit lock is not recursive, so that deadlocks. (An
+earlier lock-free design with per-slot generation counters and reader counts
+was removed once emission became serialised; it also had a store/load
+ordering bug.)
 
-Removal clears both `sink` and `ctx`, marks the slot as retiring, and waits
-outside the port lock until existing readers finish. The slot cannot be reused
-during retirement. Therefore a successful `on9log_remove_sink()` is an
-in-flight callback barrier: after it returns, the caller may release the sink
-descriptor and context. Calling remove from that sink's own callback is invalid
-because it would wait for its own reader reference.
+Tag-filter lookups run before a packet is built, outside the emit lock. A
+reader increments the node's reader count and then rechecks `active`; the
+writer clears `active` (in `on9log_clear_tag_level()`) and, before reusing the
+node, waits for the reader count to reach zero. Each side writes one variable
+then reads the other's, so these four operations are `memory_order_seq_cst`:
+with acquire/release both sides could read stale values and the writer could
+free a tag a reader is still comparing.
 
-This makes normal log emission and sink dispatch lock-free. Registration and
-removal are expected to be infrequent, so keeping those paths locked is a
-reasonable tradeoff.
-
-Mutation paths use `on9log_port_yield()` while waiting for reader references.
-ESP-IDF implements it with `taskYIELD()` and the Unix port uses `sched_yield()`;
+Node reuse uses `on9log_port_yield()` while waiting for readers. ESP-IDF
+implements it with `taskYIELD()` and the Unix port uses `sched_yield()`;
 custom preemptive ports should provide an equivalent task-context operation.
 
 ## clangd Atomic Diagnostics
