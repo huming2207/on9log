@@ -11,7 +11,7 @@ if(COMMAND idf_component_register)
             "on9log_esp_isr.c"
         INCLUDE_DIRS "."
         REQUIRES "log"
-        PRIV_REQUIRES "vfs" "freertos" "esp_ringbuf" "esp_app_format"
+        PRIV_REQUIRES "vfs" "freertos" "esp_ringbuf" "esp_app_format" "esp_timer"
     )
 
     if(CONFIG_ON9LOG_PLAIN_TEXT)

@@ -83,10 +83,22 @@ UUID.
 The ID is self-reported over an unauthenticated stream. It catches mistakes,
 not attackers: anyone able to tamper with the stream can send the expected ID.
 Firmware authenticity needs Secure Boot, and trustworthy logs would need
-signed or MAC'd packets, which on9log does not provide. `TIME_SYNC` (payload: `u32 boot_id`) is meant for
+signed or MAC'd packets, which on9log does not provide.
+
+`TIME_SYNC` (payload: `u32 boot_id`) is meant for
 batching transports: `on9log_encode_time_sync()` builds one to append to each
 batch, so a receiver can place the batch in time without trusting the device
 clock. `boot_id` is a random number picked once per boot.
+
+The `seq` counter is shared by every packet that goes through the sinks: LOG,
+BUFFER, DROPPED and BOOT. TIME_SYNC is built outside that path and is not
+part of the sequence: its `seq` field is always 0, but 0 is also an ordinary
+sequence value, so decoders must recognise TIME_SYNC by its packet type and
+leave it out of gap counting.
+
+`time_ms` is milliseconds since boot as a wrapping `u32`. On ESP-IDF it comes
+from `esp_timer`, so it has real 1 ms resolution regardless of the FreeRTOS
+tick rate. Finer or 64-bit times belong in log arguments.
 
 Format and tag strings are stored in ELF-only `.noload_keep_in_elf.*` sections — excluded from the flashed binary, resolved by address on the host.
 

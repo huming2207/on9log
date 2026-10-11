@@ -14,7 +14,6 @@
 #include <stdint.h>
 #include <stdatomic.h>
 
-#include "esp_log_timestamp.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/ringbuf.h"
 #include "freertos/task.h"
@@ -72,19 +71,14 @@ static void on9log_esp_isr_drain_task(void *ctx)
 /**
  * @brief Return a timestamp in milliseconds from an ISR-safe source.
  *
- * When called inside an ISR context (detected via @c xPortInIsrContext) the
- * function reads the FreeRTOS tick count via @c xTaskGetTickCountFromISR.
- * Otherwise it falls back to @c esp_log_timestamp().
+ * The task-context clock (esp_timer) is ISR-safe, so ISR and task logs use
+ * the same time base.
  *
- * @return Timestamp in milliseconds (wraps around after ~49 days on 32-bit).
+ * @return Timestamp in milliseconds (wraps around after ~49.7 days).
  */
 uint32_t on9log_port_isr_timestamp_ms(void)
 {
-    if (xPortInIsrContext()) {
-        return (uint32_t)(xTaskGetTickCountFromISR() * portTICK_PERIOD_MS);
-    }
-
-    return esp_log_timestamp();
+    return on9log_port_timestamp_ms();
 }
 
 /**

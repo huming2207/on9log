@@ -11,7 +11,7 @@
 #include <string.h>
 
 #include "esp_app_desc.h"
-#include "esp_log_timestamp.h"
+#include "esp_timer.h"
 #include "esp_private/log_lock.h"
 #include "esp_system.h"
 #include "freertos/FreeRTOS.h"
@@ -46,16 +46,17 @@ void on9log_port_yield(void)
 }
 
 /**
- * @brief Return a monotonic system timestamp in milliseconds.
+ * @brief Return a monotonic timestamp in milliseconds since boot.
  *
- * Delegates to @c esp_log_timestamp() which returns the FreeRTOS tick count
- * converted to milliseconds.
+ * Uses esp_timer rather than the FreeRTOS tick, whose resolution is the tick
+ * period (10 ms at the default CONFIG_FREERTOS_HZ=100). Safe from ISR context
+ * too, so task and ISR logs share one clock.
  *
- * @return Timestamp in milliseconds (wraps around after ~49 days on 32-bit).
+ * @return Timestamp in milliseconds (wraps around after ~49.7 days).
  */
 uint32_t on9log_port_timestamp_ms(void)
 {
-    return esp_log_timestamp();
+    return (uint32_t)(esp_timer_get_time() / 1000);
 }
 
 /**

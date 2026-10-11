@@ -352,7 +352,7 @@ otherwise the static archive linker can satisfy those references from the weak
 object before pulling in `on9log_esp_port.c`, causing all timestamps to remain
 zero. `on9log_esp_port.c` provides the ESP-IDF implementation using
 `esp_log_impl_lock()` (a non-recursive FreeRTOS mutex, task-context only) and
-`esp_log_timestamp()`. ESP-IDF console output is provided by `on9log_esp_vfs.c`,
+`esp_timer_get_time() / 1000` for timestamps (task and ISR alike). ESP-IDF console output is provided by `on9log_esp_vfs.c`,
 which buffers a complete on9log packet and passes it to
 `esp_stdio_log_vfs_write_frame()`.
 
@@ -556,6 +556,14 @@ This works across wrap, for example:
 If losing more than 65535 packets between two received packets is realistic, the
 counter should become `uint32_t`.
 
+Every packet that goes through the sinks takes the next `seq`: LOG, ISR LOG,
+BUFFER, DROPPED and BOOT. TIME_SYNC does not: `on9log_encode_time_sync()` builds
+it outside the sink path for batching transports and writes `seq = 0`. Because
+0 is also an ordinary sequence value, decoders identify TIME_SYNC by packet
+type and exclude it from gap counting. Do not reserve 0 by making the counter
+skip it: the counter would then wrap at 65535 and break the plain `uint16_t`
+subtraction above.
+
 ## Timestamp
 
 The packet stores `uint32_t time_ms`, milliseconds since boot.
@@ -569,17 +577,17 @@ uint32_t dt = now_ms - previous_ms;
 
 This works across wrap.
 
-UTC should not be placed in every normal packet. A better future design is a
-separate time sync packet:
+On ESP-IDF, `time_ms` comes from `esp_timer_get_time() / 1000`, not the
+FreeRTOS tick, so its resolution is 1 ms even at `CONFIG_FREERTOS_HZ=100` (the
+tick would give 10 ms). The ISR path uses the same clock. The wire stays a
+`u32` of milliseconds by design: microsecond or 64-bit times are rare needs and
+belong in log arguments, not in every header.
 
-```text
-ON9LOG_PKT_TIME_SYNC:
-    boot_time_ms
-    utc_unix_ms
-```
-
-The host can then map boot-relative timestamps to UTC without increasing every
-normal log packet.
+UTC is not placed in every packet. A batching transport appends a TIME_SYNC
+packet (payload `u32 boot_id`, header `time_ms` = device time when built) as
+the last packet of each batch; the receiver pairs that device time with its
+own receive time, so it can place the batch in time without a trusted device
+clock. `boot_id` ties it to the BOOT packet of the same boot.
 
 ## BOOT Packet And Image ID
 
