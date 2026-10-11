@@ -300,6 +300,14 @@ falls back to the weak defaults in `on9log_port_weak.c`. For inline strings,
 image's read-only data or `.noload_keep_in_elf` section. The weak default
 returns true for everything, which sends every address as before.
 
+Any port where more than one task can log must implement
+`on9log_port_emit_lock()` / `on9log_port_emit_unlock()`. The lock is held
+while a packet gets its sequence number and is written to every sink, which
+keeps the wire in sequence order and protects the sink table. Use the RTOS's
+own mutex, for example a statically allocated FreeRTOS mutex as the ESP port
+does, separate from any lock a sink's transport uses. The weak default is a
+no-op, which is only safe on a single-threaded target.
+
 On a bare-metal GNU ld target (for example STM32), the linker script must also
 keep the no-load strings in the ELF without loading them, and export the
 bounds the hook compares against, along with symbols around the flash
