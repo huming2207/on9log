@@ -24,6 +24,17 @@
 #endif
 
 static pthread_mutex_t s_on9log_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t s_on9log_emit_lock = PTHREAD_MUTEX_INITIALIZER;
+
+void on9log_port_emit_lock(void)
+{
+    (void)pthread_mutex_lock(&s_on9log_emit_lock);
+}
+
+void on9log_port_emit_unlock(void)
+{
+    (void)pthread_mutex_unlock(&s_on9log_emit_lock);
+}
 
 void on9log_port_lock(void)
 {

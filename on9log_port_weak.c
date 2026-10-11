@@ -37,6 +37,12 @@ ON9LOG_WEAK void on9log_port_unlock(void) {}
 
 ON9LOG_WEAK void on9log_port_yield(void) {}
 
+/** @brief Weak default emission lock: no-op, enough for a single-threaded port. */
+ON9LOG_WEAK void on9log_port_emit_lock(void) {}
+
+/** @brief Weak default emission unlock. */
+ON9LOG_WEAK void on9log_port_emit_unlock(void) {}
+
 /**
  * @brief Weak default monotonic timestamp in milliseconds.
  *

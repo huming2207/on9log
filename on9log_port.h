@@ -21,6 +21,18 @@ void on9log_port_lock(void);
  * @brief Release the on9log mutex/lock previously acquired via on9log_port_lock().
  */
 void on9log_port_unlock(void);
+/**
+ * @brief Acquire the lock that serialises packet emission.
+ *
+ * Held from the moment a packet gets its sequence number and timestamp until
+ * every sink has seen its end, so packets reach each sink in sequence order.
+ * Task context only; must not be the lock ESP_LOG*-style logging or a sink's
+ * transport uses, since sinks run while it is held. Sinks must not log through
+ * on9log. The weak default does nothing, which suits single-threaded ports.
+ */
+void on9log_port_emit_lock(void);
+/** @brief Release the lock taken by on9log_port_emit_lock(). */
+void on9log_port_emit_unlock(void);
 /** Yield execution while an infrequent task-context mutation waits for readers. */
 void on9log_port_yield(void);
 /**

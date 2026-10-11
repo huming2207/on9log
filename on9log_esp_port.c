@@ -15,6 +15,7 @@
 #include "esp_private/log_lock.h"
 #include "esp_system.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 
 /**
@@ -38,6 +39,38 @@ void on9log_port_lock(void)
 void on9log_port_unlock(void)
 {
     esp_log_impl_unlock();
+}
+
+/*
+ * A FreeRTOS mutex separate from esp_log_impl_lock(): sinks write to the
+ * console while it is held, and a console driver that logs with ESP_LOG* must
+ * not block on it. Statically allocated and created by a constructor during
+ * startup, before app_main and before any task can log; FreeRTOS allows that
+ * before the scheduler starts.
+ */
+static StaticSemaphore_t s_emit_mutex_storage;
+static SemaphoreHandle_t s_emit_mutex;
+
+__attribute__((constructor)) static void on9log_esp_port_create_emit_mutex(void)
+{
+    s_emit_mutex = xSemaphoreCreateMutexStatic(&s_emit_mutex_storage);
+}
+
+void on9log_port_emit_lock(void)
+{
+    /* Before the scheduler runs there is only one context: nothing to exclude. */
+    if (s_emit_mutex == NULL || xTaskGetSchedulerState() == taskSCHEDULER_NOT_STARTED) {
+        return;
+    }
+    xSemaphoreTake(s_emit_mutex, portMAX_DELAY);
+}
+
+void on9log_port_emit_unlock(void)
+{
+    if (s_emit_mutex == NULL || xTaskGetSchedulerState() == taskSCHEDULER_NOT_STARTED) {
+        return;
+    }
+    xSemaphoreGive(s_emit_mutex);
 }
 
 void on9log_port_yield(void)

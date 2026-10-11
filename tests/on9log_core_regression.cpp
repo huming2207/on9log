@@ -202,6 +202,54 @@ static void check_inline_strings()
     g_captured.clear();
 }
 
+// Records each packet's seq in the order the sink sees it. start_cb yields to
+// give other threads every chance to get between numbering and output.
+static std::mutex g_order_mutex;
+static std::vector<uint16_t> g_order;
+
+static void order_start(const uint8_t *header, size_t header_len, void *)
+{
+    require(header_len == sizeof(on9log_packet_header_t));
+    std::this_thread::yield();
+    std::lock_guard<std::mutex> lock(g_order_mutex);
+    g_order.push_back(static_cast<uint16_t>(header[2] | (header[3] << 8)));
+}
+
+static void order_payload(const uint8_t *, size_t, size_t, size_t, void *) {}
+static void order_end(void *) {}
+
+static const on9log_sink_t order_sink = {
+    .start_cb = order_start,
+    .payload_cb = order_payload,
+    .end_cb = order_end,
+};
+
+// Packets must reach a sink in sequence order even when tasks race.
+static void check_wire_order_matches_seq()
+{
+    constexpr int threads = 4;
+    constexpr int logs_per_thread = 2000;
+    g_order.clear();
+    require(on9log_add_sink(&order_sink, nullptr) == ON9LOG_OK);
+    std::vector<std::thread> workers;
+    for (int t = 0; t < threads; ++t) {
+        workers.emplace_back([t] {
+            for (int i = 0; i < logs_per_thread; ++i) {
+                ON9_LOGI("order", "thread %d log %d", t, i);
+            }
+        });
+    }
+    for (auto &worker : workers) {
+        worker.join();
+    }
+    require(on9log_remove_sink(&order_sink, nullptr) == ON9LOG_OK);
+
+    require(g_order.size() == static_cast<size_t>(threads * logs_per_thread));
+    for (size_t i = 1; i < g_order.size(); ++i) {
+        require(g_order[i] == static_cast<uint16_t>(g_order[i - 1] + 1u));
+    }
+}
+
 // Appends one ELF note with the given alignment.
 static void put_note(std::vector<uint8_t> &notes, uint32_t type, const char *name, const std::vector<uint8_t> &desc, size_t align)
 {
@@ -370,6 +418,7 @@ int main()
 #if !ON9LOG_PLAIN_TEXT
     check_payload_lengths();
     check_inline_strings();
+    check_wire_order_matches_seq();
     check_gnu_build_id_parser();
     check_boot_and_time_sync();
 #endif

@@ -762,11 +762,25 @@ compile time, matching the C ISR path's runtime restriction.
 
 ## Locking And Atomics
 
-The logger hot path should avoid locks where practical.
+The logger hot path should avoid locks where practical, with one deliberate
+exception: packet emission is serialised.
+
+Every packet is written while holding the emit lock (`on9log_port_emit_lock()`),
+taken in `on9log_stream_open()` and released in `on9log_stream_end()`. The
+sequence number and timestamp are assigned after it is taken, so packets reach
+every sink in sequence order and task timestamps never go backwards on the
+wire. Without it, a task preempted between numbering and output let another
+task's later packet overtake it, and the host reported ~65k lost packets. The
+ESP port uses a statically allocated FreeRTOS mutex created by a constructor
+(a no-op before the scheduler starts); it must stay separate from
+`esp_log_impl_lock()` because sinks write to the console while holding it. The
+Unix port uses a pthread mutex; the weak default is a no-op. Sinks must not log
+through on9log (the lock is not recursive). Ports for RTOS targets should use
+the RTOS's own mutex, not pthread.
 
 Current shared state is handled as follows:
 
-- packet sequence counter: atomic;
+- packet sequence counter: atomic (assigned under the emit lock);
 - dropped packet counter: atomic;
 - sink stream dispatch: lock-free atomic pointer loads plus per-slot reader
   references;

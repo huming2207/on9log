@@ -297,18 +297,18 @@ static size_t on9log_bounded_strlen(const char *str, size_t max_len)
 }
 
 /**
- * @brief Begin a new log stream: snapshot sink table and emit the header.
+ * @brief Open a stream: take the emission lock and snapshot the sink table.
  *
- * Reads the atomic sink table (with acquire ordering), captures every
- * non-NULL slot into the stream structure, and forwards the header bytes to
- * every captured sink's @c start_cb.
+ * The lock is held until @ref on9log_stream_end, so a packet's sequence number
+ * and timestamp, taken after this call, match the order in which every sink
+ * sees the packets. Reads the atomic sink table (with acquire ordering) and
+ * captures every non-NULL slot into the stream structure.
  *
  * @param[out] stream      Stream state to initialise.
- * @param[in]  header      Packet header bytes, or NULL for plain text.
- * @param[in]  header_len  Header length, or zero for plain text.
  */
-static void on9log_stream_start(on9log_stream_t *stream, const uint8_t *header, size_t header_len)
+static void on9log_stream_open(on9log_stream_t *stream)
 {
+    on9log_port_emit_lock();
     stream->sink_count = 0;
 
     for (size_t i = 0; i < ON9LOG_MAX_SINKS; ++i) {
@@ -355,9 +355,27 @@ static void on9log_stream_start(on9log_stream_t *stream, const uint8_t *header, 
         }
     }
 
+}
+
+/**
+ * @brief Send the packet header to every sink captured by @ref on9log_stream_open.
+ *
+ * @param[in] stream      Open stream.
+ * @param[in] header      Packet header bytes, or NULL for plain text.
+ * @param[in] header_len  Header length, or zero for plain text.
+ */
+static void on9log_stream_send_header(on9log_stream_t *stream, const uint8_t *header, size_t header_len)
+{
     for (size_t i = 0; i < stream->sink_count; ++i) {
         stream->sinks[i].sink->start_cb(header, header_len, stream->sinks[i].ctx);
     }
+}
+
+/** @brief Open a stream and send a header that needs no sequence number. */
+static void on9log_stream_start(on9log_stream_t *stream, const uint8_t *header, size_t header_len)
+{
+    on9log_stream_open(stream);
+    on9log_stream_send_header(stream, header, header_len);
 }
 
 /**
@@ -397,6 +415,7 @@ static void on9log_stream_end(on9log_stream_t *stream)
         stream->sinks[i].sink->end_cb(stream->sinks[i].ctx);
         atomic_fetch_sub_explicit(&stream->sinks[i].entry->readers, 1u, memory_order_release);
     }
+    on9log_port_emit_unlock();
 }
 
 #if ON9LOG_PLAIN_TEXT
@@ -597,7 +616,6 @@ static void on9log_text_output_suffix(on9log_text_output_cb_t output,
 
 static void on9log_dispatch_text_line(on9log_level_t level,
                                       const char *tag,
-                                      uint32_t timestamp_ms,
                                       uint8_t flags,
                                       on9log_text_formatter_cb_t formatter,
                                       void *formatter_ctx)
@@ -610,10 +628,11 @@ static void on9log_dispatch_text_line(on9log_level_t level,
     };
 
     on9log_stream_start(&stream, NULL, 0);
+    /* Read under the emission lock so timestamps follow output order. */
     on9log_text_output_prefix(on9log_text_filtered_output,
                               &filter,
                               level,
-                              timestamp_ms,
+                              on9log_port_timestamp_ms(),
                               tag,
                               flags);
     if (formatter != NULL) {
@@ -985,9 +1004,9 @@ static bool on9log_encode_header(uint8_t *header,
 /**
  * @brief Emit a complete packet header and begin the stream.
  *
- * Allocates a temporary header buffer, fills it with the encoded header
- * (including an auto-incremented sequence number and the current timestamp),
- * and calls @ref on9log_stream_start.
+ * Opens the stream first, so the sequence number and timestamp are taken
+ * under the emission lock and match the order sinks see packets in, then
+ * encodes the header and sends it.
  *
  * @param[in,out] stream      Stream state to initialise.
  * @param[in]     type        Packet type.
@@ -1005,16 +1024,17 @@ static void on9log_emit_header(on9log_stream_t *stream,
 {
     uint8_t header[sizeof(on9log_packet_header_t)];
 
-    if (on9log_encode_header(header,
-                             type,
-                             level,
-                             (uint16_t)atomic_fetch_add_explicit(&s_seq, 1, memory_order_relaxed),
-                             on9log_port_timestamp_ms(),
-                             tag_id,
-                             fmt_id,
-                             payload_len)) {
-        on9log_stream_start(stream, header, sizeof(header));
-    }
+    on9log_stream_open(stream);
+    /* The buffer is exactly one header long, so encoding cannot fail. */
+    (void)on9log_encode_header(header,
+                               type,
+                               level,
+                               (uint16_t)atomic_fetch_add_explicit(&s_seq, 1, memory_order_relaxed),
+                               on9log_port_timestamp_ms(),
+                               tag_id,
+                               fmt_id,
+                               payload_len);
+    on9log_stream_send_header(stream, header, sizeof(header));
 }
 
 /**
@@ -1169,7 +1189,6 @@ static void on9log_emit_dropped_packet(uint32_t dropped_count)
     on9log_dropped_text_ctx_t ctx = {.count = dropped_count};
     on9log_dispatch_text_line(ON9_LOG_LEVEL_WARN,
                               "on9log",
-                              on9log_port_timestamp_ms(),
                               ON9LOG_TEXT_DEFAULT_FLAGS,
                               on9log_dropped_text_formatter,
                               &ctx);
@@ -1291,7 +1310,6 @@ on9log_err_t on9log_emit_boot(uint32_t boot_id, on9log_reset_reason_t reason)
     };
     on9log_dispatch_text_line(ON9_LOG_LEVEL_INFO,
                               "on9log",
-                              on9log_port_timestamp_ms(),
                               ON9LOG_TEXT_DEFAULT_FLAGS,
                               on9log_boot_text_formatter,
                               &ctx);
@@ -1528,7 +1546,6 @@ void on9log_write_text_with_flags(on9log_level_t level,
 
     on9log_dispatch_text_line(level,
                               tag,
-                              on9log_port_timestamp_ms(),
                               text_flags,
                               formatter,
                               formatter_ctx);
