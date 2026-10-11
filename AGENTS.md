@@ -718,6 +718,13 @@ overhead and cannot use the whole buffer for a single item, keep
 `CONFIG_ON9LOG_ESP_ISR_RINGBUF_SIZE` comfortably larger than twice
 `CONFIG_ON9LOG_ISR_PACKET_MAX`.
 
+ISR packets are encoded with `seq = 0`. `on9log_dispatch_packet()` gives each
+packet the next sequence number under the emit lock when the drain task writes
+it, and keeps its ISR timestamp (when the event happened). ISR packets are
+therefore in sequence order on the wire, though their timestamps may be earlier
+than the task packet just before them. A packet dropped inside the ISR uses no
+sequence number, so only the DROPPED count reports it, not also a gap.
+
 This ESP ringbuffer backend is intentionally platform-specific. Future
 non-ESP ports should implement `on9log_port_isr_enqueue_packet()` using the
 platform's own ISR-safe queue, lock-free ring, or interrupt-safe handoff

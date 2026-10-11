@@ -1110,10 +1110,15 @@ static bool on9log_encode_isr_log_packet(uint8_t *packet,
     on9log_wire_str_t tag_wire = on9log_wire_str(tag, inline_max);
     on9log_wire_str_t format_wire = on9log_wire_str(format, inline_max);
 
+    /*
+     * seq stays 0 here: on9log_dispatch_packet() numbers the packet when the
+     * drain task writes it. A packet dropped in the ISR therefore never uses a
+     * sequence number, and only the DROPPED count reports it.
+     */
     on9log_put_header(&enc,
                       ON9LOG_PKT_LOG,
                       level,
-                      (uint16_t)atomic_fetch_add_explicit(&s_seq, 1, memory_order_relaxed),
+                      0,
                       on9log_port_isr_timestamp_ms(),
                       tag_wire.id,
                       format_wire.id,
@@ -1862,7 +1867,22 @@ on9log_err_t on9log_dispatch_packet(const uint8_t *packet, size_t packet_len)
                           0,
                           ON9LOG_PAYLOAD_META_ARG_INDEX);
 #else
-    on9log_stream_start(&stream, packet, sizeof(on9log_packet_header_t));
+    /*
+     * The packet joins this logger's sequence when it is written, not when it
+     * was built: an ISR packet waits in the ring buffer while task logs go
+     * out, and numbering it in the ISR made it arrive "out of order". Its
+     * timestamp is kept, since it records when the event happened. TIME_SYNC
+     * stays outside the sequence.
+     */
+    uint8_t header[sizeof(on9log_packet_header_t)];
+    memcpy(header, packet, sizeof(header));
+    on9log_stream_open(&stream);
+    if ((header[1] >> 4u) != (uint8_t)ON9LOG_PKT_TIME_SYNC) {
+        uint16_t seq = (uint16_t)atomic_fetch_add_explicit(&s_seq, 1, memory_order_relaxed);
+        header[2] = (uint8_t)(seq & 0xffu);
+        header[3] = (uint8_t)(seq >> 8u);
+    }
+    on9log_stream_send_header(&stream, header, sizeof(header));
     on9log_stream_payload(&stream,
                           &packet[sizeof(on9log_packet_header_t)],
                           packet_len - sizeof(on9log_packet_header_t),

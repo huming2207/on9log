@@ -390,8 +390,13 @@ void on9log_write_buffer_with_text_flags(on9log_level_t level,
  * @brief Dispatch a complete raw on9log packet through the normal sink path.
  *
  * Parses the packet header and dispatches each argument payload through
- * registered sink callbacks. Useful for forwarding or replaying packets from
- * an external source.
+ * registered sink callbacks. Used by the ISR drain task, and useful for
+ * forwarding or replaying packets from an external source.
+ *
+ * In binary mode the packet takes this logger's next sequence number when it
+ * is written (the caller's buffer is not modified), so it fits the stream the
+ * host sees; its timestamp and everything else are kept. TIME_SYNC packets
+ * keep sequence number 0.
  *
  * @param[in] packet     Pointer to the complete on9log packet (header + payload).
  * @param[in] packet_len Total byte length of the packet.

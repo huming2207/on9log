@@ -250,6 +250,37 @@ static void check_wire_order_matches_seq()
     }
 }
 
+// A packet passed to on9log_dispatch_packet() (as the ISR drain task does)
+// takes the next sequence number when written, keeping its own timestamp.
+static void check_dispatch_takes_next_seq()
+{
+    require(on9log_add_sink(&capture_sink, nullptr) == ON9LOG_OK);
+    ON9_LOGI("dispatch", "before");
+    uint8_t queued[sizeof(on9log_packet_header_t) + 1] = {
+        ON9LOG_PACKET_MAGIC, (ON9LOG_PKT_LOG << 4) | ON9_LOG_LEVEL_INFO,
+        0x34, 0x12,             // seq from elsewhere: must be replaced
+        0x78, 0x56, 0x34, 0x12, // time_ms: must be kept
+        0, 0, 0, 0, 0, 0, 0, 0, // tag_id, fmt_id
+        1, 0,                   // payload_len
+        0,                      // arg_count
+    };
+    require(on9log_dispatch_packet(queued, sizeof(queued)) == ON9LOG_OK);
+    require(queued[2] == 0x34 && queued[3] == 0x12); // caller's buffer untouched
+    ON9_LOGI("dispatch", "after");
+    uint8_t sync[32];
+    const size_t sync_len = on9log_encode_time_sync(sync, sizeof(sync), 1);
+    require(on9log_dispatch_packet(sync, sync_len) == ON9LOG_OK);
+    require(on9log_remove_sink(&capture_sink, nullptr) == ON9LOG_OK);
+
+    require(g_captured.size() == 4);
+    auto seq = [](const captured_packet &p) { return static_cast<uint16_t>(p.header[2] | (p.header[3] << 8)); };
+    require(seq(g_captured[1]) == static_cast<uint16_t>(seq(g_captured[0]) + 1u));
+    require(seq(g_captured[2]) == static_cast<uint16_t>(seq(g_captured[1]) + 1u));
+    require(read_u32(g_captured[1].header, 4) == 0x12345678u);
+    require(seq(g_captured[3]) == 0); // TIME_SYNC stays outside the sequence
+    g_captured.clear();
+}
+
 // Appends one ELF note with the given alignment.
 static void put_note(std::vector<uint8_t> &notes, uint32_t type, const char *name, const std::vector<uint8_t> &desc, size_t align)
 {
@@ -419,6 +450,7 @@ int main()
     check_payload_lengths();
     check_inline_strings();
     check_wire_order_matches_seq();
+    check_dispatch_takes_next_seq();
     check_gnu_build_id_parser();
     check_boot_and_time_sync();
 #endif
