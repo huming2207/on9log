@@ -581,6 +581,40 @@ ON9LOG_PKT_TIME_SYNC:
 The host can then map boot-relative timestamps to UTC without increasing every
 normal log packet.
 
+## BOOT Packet And Image ID
+
+`on9log_emit_boot(boot_id, reason)` sends one BOOT packet:
+
+```text
+u32 boot_id | u8 reset_reason | u8 wire_format_version | u8 image_id_kind |
+u8 image_id_len | u8 image_id[image_id_len]
+```
+
+`wire_format_version` is `ON9LOG_WIRE_FORMAT_VERSION` (1: exact `payload_len`,
+inline strings, this BOOT layout); bump it for any change a decoder must know
+about. The first 5 bytes match the older BOOT payload. The image ID comes from
+`on9log_port_image_id()` and is sent whole (up to `ON9LOG_IMAGE_ID_MAX_LEN`,
+32 bytes); it is only sent once per boot, so truncating it saves nothing.
+
+| Kind | Port | Host computes |
+|---|---|---|
+| 0 `NONE` | weak default, or no usable ID | nothing to check |
+| 1 `ELF_SHA256` | ESP-IDF: `esp_app_get_description()->app_elf_sha256` | SHA-256 of the ELF file |
+| 2 `GNU_BUILD_ID` | Linux (`PT_NOTE` of the main executable); bare-metal via linker symbols | the `NT_GNU_BUILD_ID` note |
+| 3 `MACHO_UUID` | macOS | the `LC_UUID` load command |
+
+An ELF cannot contain its own SHA-256. ESP-IDF leaves the field zero in the
+ELF; `esptool elf2image --elf-sha256-offset 0xb0` hashes the finished ELF and
+patches it into the flashed `.bin`. The ESP port reports an all-zero field as
+`NONE`, so an unpatched image never claims an ID. GNU build-id solves the same
+problem inside the linker by hashing the output with the ID field excluded.
+`on9log_find_gnu_build_id()` parses a note block for ports; note offsets are
+aligned from each note's start (4 or 8, from `p_align`).
+
+The ID detects decoding with the wrong ELF. It is not authentication: it is
+self-reported over an unauthenticated stream, and anyone who can tamper with
+the stream can send the expected ID.
+
 ## Dropped Packets
 
 If the logger cannot build a packet, it increments an internal dropped counter.

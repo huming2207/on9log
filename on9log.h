@@ -406,7 +406,9 @@ on9log_err_t on9log_dispatch_packet(const uint8_t *packet, size_t packet_len);
  * Call once after startup, ideally before other logs. The platform uses it to
  * show why the device restarted. @p boot_id is a random number chosen once per
  * boot (for example from the hardware RNG) and must match the one passed to
- * on9log_encode_time_sync(). In plain-text builds it logs one line instead.
+ * on9log_encode_time_sync(). The packet also carries the wire format version
+ * and the firmware image ID from on9log_port_image_id(), so the host can tell
+ * whether its ELF matches. In plain-text builds it logs one line instead.
  *
  * @param[in] boot_id Random per-boot identifier.
  * @param[in] reason  Why the chip restarted; see on9log_port_reset_reason().

@@ -13,11 +13,14 @@
 #include <sched.h>
 #include <time.h>
 
+#include <string.h>
+
 #if defined(__linux__)
 #include <link.h>
 #elif defined(__APPLE__)
 #include <mach-o/dyld.h>
 #include <mach-o/getsect.h>
+#include <mach-o/loader.h>
 #endif
 
 static pthread_mutex_t s_on9log_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -129,6 +132,76 @@ bool on9log_port_addr_in_image(const void *addr)
 {
     (void)addr;
     return true;
+}
+#endif
+
+#if defined(__linux__)
+typedef struct {
+    uint8_t *id;
+    size_t cap;
+    size_t len;
+} on9log_unix_build_id_t;
+
+static int on9log_unix_find_build_id(struct dl_phdr_info *info, size_t size, void *data)
+{
+    on9log_unix_build_id_t *result = (on9log_unix_build_id_t *)data;
+    (void)size;
+
+    for (ElfW(Half) i = 0; i < info->dlpi_phnum && result->len == 0; ++i) {
+        const ElfW(Phdr) *phdr = &info->dlpi_phdr[i];
+        if (phdr->p_type == PT_NOTE) {
+            result->len = on9log_find_gnu_build_id((const void *)(info->dlpi_addr + phdr->p_vaddr),
+                                                   phdr->p_memsz,
+                                                   phdr->p_align,
+                                                   result->id,
+                                                   result->cap);
+        }
+    }
+    /* Only the main executable, the first object reported. */
+    return 1;
+}
+
+size_t on9log_port_image_id(uint8_t *id, size_t cap, on9log_image_id_kind_t *kind)
+{
+    on9log_unix_build_id_t result = {.id = id, .cap = cap, .len = 0};
+
+    (void)dl_iterate_phdr(on9log_unix_find_build_id, &result);
+    if (result.len != 0) {
+        *kind = ON9LOG_IMAGE_ID_GNU_BUILD_ID;
+    }
+    return result.len;
+}
+#elif defined(__APPLE__)
+size_t on9log_port_image_id(uint8_t *id, size_t cap, on9log_image_id_kind_t *kind)
+{
+    const struct mach_header_64 *header = (const struct mach_header_64 *)_dyld_get_image_header(0);
+    if (header == NULL) {
+        return 0;
+    }
+
+    const uint8_t *cmd = (const uint8_t *)(header + 1);
+    for (uint32_t i = 0; i < header->ncmds; ++i) {
+        const struct load_command *load = (const struct load_command *)cmd;
+        if (load->cmd == LC_UUID) {
+            const struct uuid_command *uuid = (const struct uuid_command *)cmd;
+            if (cap < sizeof(uuid->uuid)) {
+                return 0;
+            }
+            memcpy(id, uuid->uuid, sizeof(uuid->uuid));
+            *kind = ON9LOG_IMAGE_ID_MACHO_UUID;
+            return sizeof(uuid->uuid);
+        }
+        cmd += load->cmdsize;
+    }
+    return 0;
+}
+#else
+size_t on9log_port_image_id(uint8_t *id, size_t cap, on9log_image_id_kind_t *kind)
+{
+    (void)id;
+    (void)cap;
+    (void)kind;
+    return 0;
 }
 #endif
 

@@ -59,6 +59,19 @@ ON9LOG_WEAK on9log_reset_reason_t on9log_port_reset_reason(void)
 }
 
 /**
+ * @brief Weak default firmware image ID.
+ *
+ * @return 0: no ID, so BOOT reports ON9LOG_IMAGE_ID_NONE.
+ */
+ON9LOG_WEAK size_t on9log_port_image_id(uint8_t *id, size_t cap, on9log_image_id_kind_t *kind)
+{
+    (void)id;
+    (void)cap;
+    (void)kind;
+    return 0;
+}
+
+/**
  * @brief Weak default image-address check.
  *
  * @return @c true, so every tag and format is sent by address as before.

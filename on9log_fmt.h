@@ -44,6 +44,43 @@ typedef struct {
 } __attribute__((packed)) on9log_packet_header_t;
 
 /**
+ * @brief Wire format version carried in every BOOT packet.
+ *
+ * Bumped on any change a decoder must know about. Version 1: exact
+ * payload_len in every packet, inline tag/format strings (ON9LOG_ID_INLINE),
+ * and the BOOT payload below.
+ */
+#define ON9LOG_WIRE_FORMAT_VERSION 1u
+
+/**
+ * @brief Longest firmware image ID a BOOT packet carries.
+ */
+#define ON9LOG_IMAGE_ID_MAX_LEN 32u
+
+/**
+ * @brief What the image ID in a BOOT packet is, so the host knows how to
+ *        compute the same value from the ELF it decodes with.
+ *
+ * The ID only detects decoding with the wrong ELF. It is self-reported over
+ * an unauthenticated stream, so it proves nothing about who built or sent the
+ * firmware.
+ *
+ * BOOT payload (little-endian):
+ *   u32 boot_id | u8 reset_reason | u8 wire_format_version |
+ *   u8 image_id_kind | u8 image_id_len | u8 image_id[image_id_len]
+ */
+typedef enum {
+    /** No ID available; image_id_len is 0. */
+    ON9LOG_IMAGE_ID_NONE = 0,
+    /** SHA-256 of the whole ELF file (ESP-IDF's esp_app_desc.app_elf_sha256). */
+    ON9LOG_IMAGE_ID_ELF_SHA256 = 1,
+    /** Contents of the ELF's NT_GNU_BUILD_ID note (linker --build-id). */
+    ON9LOG_IMAGE_ID_GNU_BUILD_ID = 2,
+    /** Mach-O LC_UUID of the main image. */
+    ON9LOG_IMAGE_ID_MACHO_UUID = 3,
+} on9log_image_id_kind_t;
+
+/**
  * @brief Why the chip last restarted, carried in a BOOT packet.
  *
  * The values are part of the wire format; the platform maps them to names.

@@ -8,6 +8,9 @@
  */
 #include "on9log_port.h"
 
+#include <string.h>
+
+#include "esp_app_desc.h"
 #include "esp_log_timestamp.h"
 #include "esp_private/log_lock.h"
 #include "esp_system.h"
@@ -53,6 +56,34 @@ void on9log_port_yield(void)
 uint32_t on9log_port_timestamp_ms(void)
 {
     return esp_log_timestamp();
+}
+
+/**
+ * @brief Report the SHA-256 of the app's ELF file.
+ *
+ * The ELF cannot hold its own hash; esptool elf2image hashes the finished ELF
+ * and patches the result into the flashed .bin's app descriptor. An image
+ * that skipped that step still has all zeros, which is reported as no ID
+ * rather than as a hash that matches nothing.
+ */
+size_t on9log_port_image_id(uint8_t *id, size_t cap, on9log_image_id_kind_t *kind)
+{
+    const esp_app_desc_t *desc = esp_app_get_description();
+    const size_t len = sizeof(desc->app_elf_sha256);
+    bool all_zero = true;
+
+    if (cap < len) {
+        return 0;
+    }
+    for (size_t i = 0; i < len; ++i) {
+        all_zero = all_zero && desc->app_elf_sha256[i] == 0u;
+    }
+    if (all_zero) {
+        return 0;
+    }
+    memcpy(id, desc->app_elf_sha256, len);
+    *kind = ON9LOG_IMAGE_ID_ELF_SHA256;
+    return len;
 }
 
 /* Defined by the ESP-IDF linker scripts on every target. */

@@ -58,9 +58,32 @@ Every log packet carries an 18-byte little-endian header:
 
 Packet types: `LOG` (0), `DROPPED` (1), `TIME_SYNC` (2), `BOOT` (3), `BUFFER` (4).
 
-`BOOT` (payload: `u32 boot_id`, `u8 reset_reason`) is sent by the application
-once after startup with `on9log_emit_boot()`; the reason comes from
-`on9log_port_reset_reason()`. `TIME_SYNC` (payload: `u32 boot_id`) is meant for
+`BOOT` is sent by the application once after startup with
+`on9log_emit_boot()`; the reason comes from `on9log_port_reset_reason()`. Its
+payload is:
+
+| Field | Size | Description |
+|---|---|---|
+| `boot_id` | u32 | Random number picked once per boot |
+| `reset_reason` | u8 | `on9log_reset_reason_t` |
+| `wire_format_version` | u8 | `ON9LOG_WIRE_FORMAT_VERSION`, currently 1 |
+| `image_id_kind` | u8 | `on9log_image_id_kind_t`: 0 none, 1 ELF SHA-256, 2 GNU build-id, 3 Mach-O UUID |
+| `image_id_len` | u8 | 0–32 |
+| `image_id` | bytes | The ID itself |
+
+The image ID lets the host refuse to decode with the wrong ELF. It computes
+the same value from its ELF: the SHA-256 of the whole file (kind 1), the
+`NT_GNU_BUILD_ID` note (kind 2), or the `LC_UUID` load command (kind 3). On
+ESP-IDF it is the full `esp_app_desc.app_elf_sha256`: the ELF cannot contain
+its own hash, so `esptool elf2image` hashes the finished ELF and patches the
+result into the flashed `.bin`. An image flashed without that step still holds
+zeros and reports no ID. Linux reports the GNU build-id and macOS the Mach-O
+UUID.
+
+The ID is self-reported over an unauthenticated stream. It catches mistakes,
+not attackers: anyone able to tamper with the stream can send the expected ID.
+Firmware authenticity needs Secure Boot, and trustworthy logs would need
+signed or MAC'd packets, which on9log does not provide. `TIME_SYNC` (payload: `u32 boot_id`) is meant for
 batching transports: `on9log_encode_time_sync()` builds one to append to each
 batch, so a receiver can place the batch in time without trusting the device
 clock. `boot_id` is a random number picked once per boot.
@@ -279,6 +302,20 @@ bounds the hook compares against, along with symbols around the flash
     KEEP(*(.noload_keep_in_elf .noload_keep_in_elf.*))
     _noload_keep_in_elf_end = ABSOLUTE(.);
 }
+```
+
+For the BOOT image ID, a bare-metal port should link with
+`-Wl,--build-id=sha1`, keep the note in flash, and pass it to
+`on9log_find_gnu_build_id()` from `on9log_port_image_id()`, reporting
+`ON9LOG_IMAGE_ID_GNU_BUILD_ID`:
+
+```ld
+.note.gnu.build-id : ALIGN(4)
+{
+    __on9log_build_id_start = .;
+    KEEP(*(.note.gnu.build-id))
+    __on9log_build_id_end = .;
+} > FLASH
 ```
 
 ### Code size

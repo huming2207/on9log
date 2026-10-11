@@ -202,6 +202,50 @@ static void check_inline_strings()
     g_captured.clear();
 }
 
+// Appends one ELF note with the given alignment.
+static void put_note(std::vector<uint8_t> &notes, uint32_t type, const char *name, const std::vector<uint8_t> &desc, size_t align)
+{
+    const uint32_t namesz = static_cast<uint32_t>(std::strlen(name) + 1);
+    const uint32_t descsz = static_cast<uint32_t>(desc.size());
+    const uint32_t fields[3] = {namesz, descsz, type};
+    const auto *raw = reinterpret_cast<const uint8_t *>(fields);
+    notes.insert(notes.end(), raw, raw + sizeof(fields));
+    notes.insert(notes.end(), name, name + namesz);
+    notes.resize((notes.size() + align - 1) / align * align, 0);
+    notes.insert(notes.end(), desc.begin(), desc.end());
+    notes.resize((notes.size() + align - 1) / align * align, 0);
+}
+
+static void check_gnu_build_id_parser()
+{
+    const std::vector<uint8_t> build_id = {0x90, 0x05, 0x96, 0x59, 0xaa, 0xc0, 0x43, 0xe6, 0x00, 0x8a,
+                                           0xca, 0xd7, 0x48, 0x94, 0xcd, 0x4b, 0x63, 0x65, 0x02, 0x05};
+    uint8_t id[ON9LOG_IMAGE_ID_MAX_LEN];
+
+    for (size_t align : {size_t{4}, size_t{8}}) {
+        // The build-id follows another note, as in a real PT_NOTE segment.
+        std::vector<uint8_t> notes;
+        put_note(notes, 1, "GNU", {0, 0, 0, 0, 3, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0}, align);
+        put_note(notes, 3, "GNU", build_id, align);
+        require(on9log_find_gnu_build_id(notes.data(), notes.size(), align, id, sizeof(id)) == build_id.size());
+        require(std::memcmp(id, build_id.data(), build_id.size()) == 0);
+
+        // Too small a destination, a cut-off note, or no build-id note: nothing found.
+        require(on9log_find_gnu_build_id(notes.data(), notes.size(), align, id, build_id.size() - 1) == 0);
+        require(on9log_find_gnu_build_id(notes.data(), notes.size() - 8, align, id, sizeof(id)) == 0);
+        std::vector<uint8_t> other;
+        put_note(other, 3, "XYZ", build_id, align);
+        require(on9log_find_gnu_build_id(other.data(), other.size(), align, id, sizeof(id)) == 0);
+    }
+
+    // A corrupt size field must not read past the buffer.
+    std::vector<uint8_t> corrupt;
+    put_note(corrupt, 3, "GNU", build_id, 4);
+    corrupt[4] = 0xff;
+    corrupt[5] = 0xff;
+    require(on9log_find_gnu_build_id(corrupt.data(), corrupt.size(), 4, id, sizeof(id)) == 0);
+}
+
 static void check_boot_and_time_sync()
 {
     require(on9log_add_sink(&capture_sink, nullptr) == ON9LOG_OK);
@@ -211,7 +255,26 @@ static void check_boot_and_time_sync()
     require(g_captured.size() == 1);
     const auto &boot = g_captured[0];
     require((boot.header[1] >> 4) == ON9LOG_PKT_BOOT);
-    require(header_payload_len(boot) == 5 && boot.payload_bytes == 5);
+    require(header_payload_len(boot) == boot.payload.size());
+
+    // boot_id | reset_reason | wire version | ID kind | ID length | ID
+    require(boot.payload.size() >= 8);
+    require(read_u32(boot.payload, 0) == 0xa1b2c3d4u);
+    require(boot.payload[4] == ON9LOG_RESET_BROWNOUT);
+    require(boot.payload[5] == ON9LOG_WIRE_FORMAT_VERSION);
+    const size_t id_len = boot.payload[7];
+    require(boot.payload.size() == 8 + id_len);
+
+    uint8_t expected_id[ON9LOG_IMAGE_ID_MAX_LEN];
+    on9log_image_id_kind_t expected_kind = ON9LOG_IMAGE_ID_NONE;
+    const size_t expected_len = on9log_port_image_id(expected_id, sizeof(expected_id), &expected_kind);
+    require(id_len == expected_len);
+    require(boot.payload[6] == (expected_len == 0 ? ON9LOG_IMAGE_ID_NONE : expected_kind));
+    require(std::memcmp(&boot.payload[8], expected_id, id_len) == 0);
+#if defined(__linux__)
+    // GCC on Linux links with --build-id by default.
+    require(boot.payload[6] == ON9LOG_IMAGE_ID_GNU_BUILD_ID && id_len > 0);
+#endif
     g_captured.clear();
 
     uint8_t sync[32];
@@ -307,6 +370,7 @@ int main()
 #if !ON9LOG_PLAIN_TEXT
     check_payload_lengths();
     check_inline_strings();
+    check_gnu_build_id_parser();
     check_boot_and_time_sync();
 #endif
     return 0;

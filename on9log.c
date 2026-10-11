@@ -1182,26 +1182,113 @@ static void on9log_emit_dropped_packet(uint32_t dropped_count)
 #endif
 }
 
+size_t on9log_find_gnu_build_id(const void *notes, size_t len, size_t align, uint8_t *id, size_t cap)
+{
+    /* ELF note: u32 namesz, u32 descsz, u32 type, name, desc; name and desc padded to align. */
+    const uint32_t note_gnu_build_id = 3u;
+    const uint8_t *p = (const uint8_t *)notes;
+    size_t left = len;
+
+    if (notes == NULL || id == NULL) {
+        return 0;
+    }
+    if (align != 8u) {
+        align = 4u; /* GNU notes use 4 unless the segment says 8. */
+    }
+
+    const size_t header_len = 3u * sizeof(uint32_t);
+    while (left >= header_len) {
+        uint32_t namesz;
+        uint32_t descsz;
+        uint32_t type;
+        memcpy(&namesz, p, sizeof(namesz));
+        memcpy(&descsz, p + 4u, sizeof(descsz));
+        memcpy(&type, p + 8u, sizeof(type));
+
+        /* Offsets count from the note's start, which is itself aligned. */
+        if (namesz > left - header_len) {
+            return 0;
+        }
+        size_t desc_off = (header_len + namesz + align - 1u) & ~(align - 1u);
+        if (desc_off > left || descsz > left - desc_off) {
+            return 0;
+        }
+        if (type == note_gnu_build_id && namesz == 4u && memcmp(p + header_len, "GNU", 4u) == 0) {
+            if (descsz == 0u || descsz > cap) {
+                return 0;
+            }
+            memcpy(id, p + desc_off, descsz);
+            return descsz;
+        }
+        size_t next_off = (desc_off + descsz + align - 1u) & ~(align - 1u);
+        if (next_off >= left) {
+            return 0;
+        }
+        p += next_off;
+        left -= next_off;
+    }
+    return 0;
+}
+
+/** @brief Ask the port for the image ID, reporting none if the answer is unusable. */
+static size_t on9log_image_id(uint8_t id[ON9LOG_IMAGE_ID_MAX_LEN], on9log_image_id_kind_t *kind)
+{
+    on9log_image_id_kind_t reported = ON9LOG_IMAGE_ID_NONE;
+    size_t len = on9log_port_image_id(id, ON9LOG_IMAGE_ID_MAX_LEN, &reported);
+
+    if (len == 0 || len > ON9LOG_IMAGE_ID_MAX_LEN || reported == ON9LOG_IMAGE_ID_NONE) {
+        *kind = ON9LOG_IMAGE_ID_NONE;
+        return 0;
+    }
+    *kind = reported;
+    return len;
+}
+
 #if ON9LOG_PLAIN_TEXT
 typedef struct {
     uint32_t boot_id;
     uint32_t reason;
+    on9log_image_id_kind_t id_kind;
+    size_t id_len;
+    const uint8_t *id;
 } on9log_boot_text_ctx_t;
 
 static void on9log_boot_text_formatter(on9log_text_output_cb_t output, void *output_ctx, void *formatter_ctx)
 {
+    static const char hex[] = "0123456789abcdef";
     const on9log_boot_text_ctx_t *ctx = (const on9log_boot_text_ctx_t *)formatter_ctx;
     output("boot id=", sizeof("boot id=") - 1u, output_ctx);
     on9log_text_output_u32(output, output_ctx, ctx->boot_id);
     output(" reset reason=", sizeof(" reset reason=") - 1u, output_ctx);
     on9log_text_output_u32(output, output_ctx, ctx->reason);
+    output(" image id=", sizeof(" image id=") - 1u, output_ctx);
+    if (ctx->id_len == 0) {
+        output("none", sizeof("none") - 1u, output_ctx);
+        return;
+    }
+    on9log_text_output_u32(output, output_ctx, (uint32_t)ctx->id_kind);
+    output(":", 1u, output_ctx);
+    for (size_t i = 0; i < ctx->id_len; ++i) {
+        const char byte_hex[2] = {hex[ctx->id[i] >> 4u], hex[ctx->id[i] & 0x0fu]};
+        output(byte_hex, sizeof(byte_hex), output_ctx);
+    }
 }
 #endif
 
 on9log_err_t on9log_emit_boot(uint32_t boot_id, on9log_reset_reason_t reason)
 {
+    uint8_t id[ON9LOG_IMAGE_ID_MAX_LEN];
+    on9log_image_id_kind_t id_kind = ON9LOG_IMAGE_ID_NONE;
+    size_t id_len = on9log_image_id(id, &id_kind);
+
 #if ON9LOG_PLAIN_TEXT
-    on9log_boot_text_ctx_t ctx = {.boot_id = boot_id, .reason = (uint32_t)reason};
+    on9log_boot_text_ctx_t ctx = {
+        .boot_id = boot_id,
+        .reason = (uint32_t)reason,
+        .id_kind = id_kind,
+        .id_len = id_len,
+        .id = id,
+    };
     on9log_dispatch_text_line(ON9_LOG_LEVEL_INFO,
                               "on9log",
                               on9log_port_timestamp_ms(),
@@ -1210,10 +1297,23 @@ on9log_err_t on9log_emit_boot(uint32_t boot_id, on9log_reset_reason_t reason)
                               &ctx);
 #else
     on9log_stream_t stream = {0};
+    /* boot_id, reset_reason, wire format version, ID kind, ID length, ID bytes. */
+    const uint8_t fields[4] = {
+        (uint8_t)reason,
+        (uint8_t)ON9LOG_WIRE_FORMAT_VERSION,
+        (uint8_t)id_kind,
+        (uint8_t)id_len,
+    };
 
-    on9log_emit_header(&stream, ON9LOG_PKT_BOOT, ON9_LOG_LEVEL_NONE, 0, 0, sizeof(uint32_t) + sizeof(uint8_t));
-    on9log_emit_u32(&stream, boot_id, 2, 0);
-    on9log_emit_u8(&stream, (uint8_t)reason, 2, 1);
+    on9log_emit_header(&stream,
+                       ON9LOG_PKT_BOOT,
+                       ON9_LOG_LEVEL_NONE,
+                       0,
+                       0,
+                       (uint16_t)(sizeof(uint32_t) + sizeof(fields) + id_len));
+    on9log_emit_u32(&stream, boot_id, 0, ON9LOG_PAYLOAD_META_ARG_INDEX);
+    on9log_stream_payload(&stream, fields, sizeof(fields), 0, ON9LOG_PAYLOAD_META_ARG_INDEX);
+    on9log_stream_payload(&stream, id, id_len, 0, ON9LOG_PAYLOAD_META_ARG_INDEX);
     on9log_stream_end(&stream);
 #endif
     return ON9LOG_OK;
