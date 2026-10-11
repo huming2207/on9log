@@ -400,6 +400,26 @@ the flashed binary. Use `ON9FMT("...")`, the NTTP form
 `Logger::info("..."_on9fmt, ...)` when the format should be emitted into
 `.noload_keep_in_elf.*`.
 
+With `ON9LOG_CXX_REFLECTION` (`CONFIG_ON9LOG_CXX_REFLECTION`, default off,
+binary mode only), the plain overloads also place the literal in `.noload`.
+Their format parameter becomes `detail::literal_format`, whose `consteval`
+constructor reads the literal during compilation and calls
+`std::meta::substitute(^^noload_format_storage, {reflect_constant(fixed_string<N>(s))})`
+to instantiate the same storage the NTTP form uses, then keeps a pointer to
+it. The literal itself is never emitted to flash. Non-constant formats do not
+compile; they must be wrapped in `on9log::runtime_format()` (an identity
+function when the option is off). `ON9FMT(str)` passes the literal through in
+this mode.
+
+The option is deliberately strict: `on9log.hpp` `#error`s unless
+`__cpp_impl_reflection` and `__cpp_lib_reflection` are at least 202506L, and in
+plain-text mode. Never add a silent fallback; a firmware whose formats quietly
+stayed in flash would differ from what was configured. GCC 16 defines both
+macros only with `-std=gnu++26 -freflection`; CMake adds `-freflection` to C++
+consumers when the option is on. Verified with Espressif GCC 16.1 on ESP-IDF
+master (ESP-IDF v6.1 rejects GCC 16 and its libc headers do not compile with
+it). Host GCC 15 and Clang 21 have no reflection, so CI cannot cover this path.
+
 Both C++ forms are still address-only on the wire. Plain
 `Logger::info("...", ...)` does **not** copy the format string into the log
 packet; it sends the `.rodata` address as `fmt_id`. The no-load forms also send

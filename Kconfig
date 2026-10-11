@@ -45,6 +45,24 @@ menu "on9log"
             string will be placed into .rodata instead of .noload. This only
             recommended for debug builds.
 
+    config ON9LOG_CXX_REFLECTION
+        bool "Move plain C++ format literals to .noload with C++26 reflection"
+        depends on !ON9LOG_PLAIN_TEXT
+        default n
+        help
+            When enabled, on9log::Logger calls such as log.info("value=%d", x)
+            place the format literal in the ELF-only .noload_keep_in_elf
+            section, like the NTTP and "_on9fmt" forms, instead of leaving it
+            in flash .rodata.
+
+            Requires a compiler with C++26 static reflection, for example
+            Espressif GCC 16 (esp-16.x) or newer; the component adds
+            -freflection to C++ builds. With an older toolchain the build
+            fails with an #error rather than falling back.
+
+            Plain overloads then accept only string literals or constexpr char
+            arrays. Wrap a format chosen at runtime in on9log::runtime_format().
+
     config ON9LOG_MAX_SINKS
         int "Maximum on9log sinks"
         range 1 16

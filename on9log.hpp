@@ -24,18 +24,37 @@
 #include <iterator>
 #endif
 
+/*
+ * ON9LOG_CXX_REFLECTION is an explicit build choice. If it is on, a compiler
+ * without C++26 reflection must stop the build: quietly keeping the format
+ * literals in flash would change the firmware without anyone noticing.
+ */
+#if ON9LOG_CXX_REFLECTION
+#if ON9LOG_PLAIN_TEXT
+#error "ON9LOG_CXX_REFLECTION needs binary mode: plain-text logging formats at runtime and cannot use .noload formats"
+#endif
+#if !defined(__cpp_impl_reflection) || __cpp_impl_reflection < 202506L
+#error "ON9LOG_CXX_REFLECTION is enabled but this compiler lacks C++26 reflection. Build with GCC 16+ (e.g. Espressif esp-16.x) using -std=gnu++26 -freflection, or disable CONFIG_ON9LOG_CXX_REFLECTION."
+#endif
+#include <meta>
+#if !defined(__cpp_lib_reflection) || __cpp_lib_reflection < 202506L
+#error "ON9LOG_CXX_REFLECTION is enabled but this standard library lacks <meta> reflection support."
+#endif
+#endif
+
 /**
  * @brief  Macro to annotate a format string literal with the appropriate
  *         section attribute for flash placement.
  *
  * When @c ON9FMT is not defined before inclusion it defaults to
  * @c ON9_LOG_ATTR_STR(str).  Users may define it before including this header
- * to override the attribute strategy.
+ * to override the attribute strategy. With @c ON9LOG_CXX_REFLECTION the plain
+ * overloads already move literals to .noload, so it passes the literal through.
  *
  * @param str  A string literal to annotate.
  */
 #ifndef ON9FMT
-#if ON9LOG_PLAIN_TEXT
+#if ON9LOG_PLAIN_TEXT || ON9LOG_CXX_REFLECTION
 #define ON9FMT(str) (str)
 #else
 #define ON9FMT(str) ON9_LOG_ATTR_STR(str)
@@ -125,6 +144,57 @@ constexpr const char *noload_format() noexcept
 {
     return noload_format_storage<Format>.value;
 }
+
+#if ON9LOG_CXX_REFLECTION
+/** @brief  A format chosen at runtime; build one with @ref on9log::runtime_format. */
+struct runtime_format_t {
+    const char *str;
+};
+
+/**
+ * @brief  Format argument of the plain Logger overloads in reflection mode.
+ *
+ * The consteval constructor reads the literal during compilation and uses
+ * reflection to instantiate @ref noload_format_storage for its contents, so
+ * the call site only references the .noload copy and the literal itself is
+ * never emitted to flash. Identical formats share one copy. Anything that is
+ * not a constant char array fails to compile; runtime formats must be wrapped
+ * in @ref on9log::runtime_format.
+ */
+struct literal_format {
+    const char *str;
+
+    template <std::size_t N>
+    consteval literal_format(const char (&literal)[N]) noexcept
+        : str(std::meta::extract<const fixed_string<N> &>(
+                  std::meta::substitute(^^noload_format_storage,
+                                        {std::meta::reflect_constant(fixed_string<N>(literal))}))
+                  .value)
+    {
+    }
+
+    constexpr literal_format(runtime_format_t format) noexcept
+        : str(format.str)
+    {
+    }
+};
+
+/** @brief  Format parameter type of the plain Logger overloads. */
+using plain_format_t = literal_format;
+
+constexpr const char *format_pointer(literal_format format) noexcept
+{
+    return format.str;
+}
+#else
+/** @brief  Format parameter type of the plain Logger overloads. */
+using plain_format_t = const char *;
+
+constexpr const char *format_pointer(const char *format) noexcept
+{
+    return format;
+}
+#endif
 
 /**
  * @brief  Empty tag type that selects the NTTP / token-based logging path.
@@ -922,6 +992,30 @@ consteval detail::format_token<Format> operator""_on9fmt() noexcept
 
 } // namespace literals
 
+/**
+ * @brief  Mark a format string that is only known at runtime.
+ *
+ * Needed with @c ON9LOG_CXX_REFLECTION, where the plain overloads accept only
+ * literals; without it, this simply returns @p format, so code using it builds
+ * either way. The format stays in addressable memory (and goes inline in the
+ * packet if the host cannot resolve its address).
+ *
+ * @code
+ *   log.info(on9log::runtime_format(pick_format()), value);
+ * @endcode
+ */
+#if ON9LOG_CXX_REFLECTION
+constexpr detail::runtime_format_t runtime_format(const char *format) noexcept
+{
+    return {format};
+}
+#else
+constexpr const char *runtime_format(const char *format) noexcept
+{
+    return format;
+}
+#endif
+
 // -----------------------------------------------------------------------
 // Logger class  --  main public API
 // -----------------------------------------------------------------------
@@ -933,8 +1027,9 @@ consteval detail::format_token<Format> operator""_on9fmt() noexcept
  * Each @c Logger instance holds an optional tag string and exposes
  * per-level logging methods in three flavours:
  *
- *  1. **Plain format** -- the format string is a plain @c const char*
- *     argument kept in flash via @c ON9FMT.
+ *  1. **Plain format** -- the format string is a plain string argument,
+ *     kept in flash, or moved to the noload section when
+ *     @c ON9LOG_CXX_REFLECTION is enabled.
  *  2. **NTTP format** -- the format string is a non-type template parameter
  *     (e.g. @c logger.info<"count %d">(42)), which places it in a noload
  *     ELF section.
@@ -1069,9 +1164,9 @@ public:
      * @param args    Variadic arguments.
      */
     template <typename... Args>
-    void error(const char *format, Args &&...args) const noexcept
+    void error(detail::plain_format_t format, Args &&...args) const noexcept
     {
-        detail::write_log<ON9_LOG_LEVEL_ERROR>(tag_, format, static_cast<Args &&>(args)...);
+        detail::write_log<ON9_LOG_LEVEL_ERROR>(tag_, detail::format_pointer(format), static_cast<Args &&>(args)...);
     }
 
     /**
@@ -1119,9 +1214,9 @@ public:
      * @param args    Variadic arguments.
      */
     template <typename... Args>
-    void warn(const char *format, Args &&...args) const noexcept
+    void warn(detail::plain_format_t format, Args &&...args) const noexcept
     {
-        detail::write_log<ON9_LOG_LEVEL_WARN>(tag_, format, static_cast<Args &&>(args)...);
+        detail::write_log<ON9_LOG_LEVEL_WARN>(tag_, detail::format_pointer(format), static_cast<Args &&>(args)...);
     }
 
     /**
@@ -1164,9 +1259,9 @@ public:
      * @param args    Variadic arguments.
      */
     template <typename... Args>
-    void info(const char *format, Args &&...args) const noexcept
+    void info(detail::plain_format_t format, Args &&...args) const noexcept
     {
-        detail::write_log<ON9_LOG_LEVEL_INFO>(tag_, format, static_cast<Args &&>(args)...);
+        detail::write_log<ON9_LOG_LEVEL_INFO>(tag_, detail::format_pointer(format), static_cast<Args &&>(args)...);
     }
 
     /**
@@ -1209,9 +1304,9 @@ public:
      * @param args    Variadic arguments.
      */
     template <typename... Args>
-    void debug(const char *format, Args &&...args) const noexcept
+    void debug(detail::plain_format_t format, Args &&...args) const noexcept
     {
-        detail::write_log<ON9_LOG_LEVEL_DEBUG>(tag_, format, static_cast<Args &&>(args)...);
+        detail::write_log<ON9_LOG_LEVEL_DEBUG>(tag_, detail::format_pointer(format), static_cast<Args &&>(args)...);
     }
 
     /**
@@ -1254,9 +1349,9 @@ public:
      * @param args    Variadic arguments.
      */
     template <typename... Args>
-    void verbose(const char *format, Args &&...args) const noexcept
+    void verbose(detail::plain_format_t format, Args &&...args) const noexcept
     {
-        detail::write_log<ON9_LOG_LEVEL_VERBOSE>(tag_, format, static_cast<Args &&>(args)...);
+        detail::write_log<ON9_LOG_LEVEL_VERBOSE>(tag_, detail::format_pointer(format), static_cast<Args &&>(args)...);
     }
 
     /**
@@ -1307,9 +1402,9 @@ public:
      * @param args    Variadic arguments.
      */
     template <typename... Args>
-    void e(const char *format, Args &&...args) const noexcept
+    void e(detail::plain_format_t format, Args &&...args) const noexcept
     {
-        detail::write_log<ON9_LOG_LEVEL_ERROR>(tag_, format, static_cast<Args &&>(args)...);
+        detail::write_log<ON9_LOG_LEVEL_ERROR>(tag_, detail::format_pointer(format), static_cast<Args &&>(args)...);
     }
 
     /**
@@ -1351,9 +1446,9 @@ public:
      * @param args    Variadic arguments.
      */
     template <typename... Args>
-    void w(const char *format, Args &&...args) const noexcept
+    void w(detail::plain_format_t format, Args &&...args) const noexcept
     {
-        detail::write_log<ON9_LOG_LEVEL_WARN>(tag_, format, static_cast<Args &&>(args)...);
+        detail::write_log<ON9_LOG_LEVEL_WARN>(tag_, detail::format_pointer(format), static_cast<Args &&>(args)...);
     }
 
     /**
@@ -1395,9 +1490,9 @@ public:
      * @param args    Variadic arguments.
      */
     template <typename... Args>
-    void i(const char *format, Args &&...args) const noexcept
+    void i(detail::plain_format_t format, Args &&...args) const noexcept
     {
-        detail::write_log<ON9_LOG_LEVEL_INFO>(tag_, format, static_cast<Args &&>(args)...);
+        detail::write_log<ON9_LOG_LEVEL_INFO>(tag_, detail::format_pointer(format), static_cast<Args &&>(args)...);
     }
 
     /**
@@ -1439,9 +1534,9 @@ public:
      * @param args    Variadic arguments.
      */
     template <typename... Args>
-    void d(const char *format, Args &&...args) const noexcept
+    void d(detail::plain_format_t format, Args &&...args) const noexcept
     {
-        detail::write_log<ON9_LOG_LEVEL_DEBUG>(tag_, format, static_cast<Args &&>(args)...);
+        detail::write_log<ON9_LOG_LEVEL_DEBUG>(tag_, detail::format_pointer(format), static_cast<Args &&>(args)...);
     }
 
     /**
@@ -1483,9 +1578,9 @@ public:
      * @param args    Variadic arguments.
      */
     template <typename... Args>
-    void v(const char *format, Args &&...args) const noexcept
+    void v(detail::plain_format_t format, Args &&...args) const noexcept
     {
-        detail::write_log<ON9_LOG_LEVEL_VERBOSE>(tag_, format, static_cast<Args &&>(args)...);
+        detail::write_log<ON9_LOG_LEVEL_VERBOSE>(tag_, detail::format_pointer(format), static_cast<Args &&>(args)...);
     }
 
     /**
@@ -1528,9 +1623,9 @@ public:
      * @param args    Variadic arguments.
      */
     template <on9log_level_t Level, typename... Args>
-    void log(const char *format, Args &&...args) const noexcept
+    void log(detail::plain_format_t format, Args &&...args) const noexcept
     {
-        detail::write_log<Level>(tag_, format, static_cast<Args &&>(args)...);
+        detail::write_log<Level>(tag_, detail::format_pointer(format), static_cast<Args &&>(args)...);
     }
 
     /**
@@ -1577,9 +1672,9 @@ public:
      *         was full.
      */
     template <typename... Args>
-    bool isr_error(const char *format, Args &&...args) const noexcept
+    bool isr_error(detail::plain_format_t format, Args &&...args) const noexcept
     {
-        return detail::write_log_isr<ON9_LOG_LEVEL_ERROR>(tag_, format, static_cast<Args &&>(args)...);
+        return detail::write_log_isr<ON9_LOG_LEVEL_ERROR>(tag_, detail::format_pointer(format), static_cast<Args &&>(args)...);
     }
 
     /**
@@ -1625,9 +1720,9 @@ public:
      * @return @c true if queued, @c false if the ISR buffer was full.
      */
     template <typename... Args>
-    bool isr_warn(const char *format, Args &&...args) const noexcept
+    bool isr_warn(detail::plain_format_t format, Args &&...args) const noexcept
     {
-        return detail::write_log_isr<ON9_LOG_LEVEL_WARN>(tag_, format, static_cast<Args &&>(args)...);
+        return detail::write_log_isr<ON9_LOG_LEVEL_WARN>(tag_, detail::format_pointer(format), static_cast<Args &&>(args)...);
     }
 
     /**
@@ -1673,9 +1768,9 @@ public:
      * @return @c true if queued, @c false if the ISR buffer was full.
      */
     template <typename... Args>
-    bool isr_info(const char *format, Args &&...args) const noexcept
+    bool isr_info(detail::plain_format_t format, Args &&...args) const noexcept
     {
-        return detail::write_log_isr<ON9_LOG_LEVEL_INFO>(tag_, format, static_cast<Args &&>(args)...);
+        return detail::write_log_isr<ON9_LOG_LEVEL_INFO>(tag_, detail::format_pointer(format), static_cast<Args &&>(args)...);
     }
 
     /**
@@ -1721,9 +1816,9 @@ public:
      * @return @c true if queued, @c false if the ISR buffer was full.
      */
     template <typename... Args>
-    bool isr_debug(const char *format, Args &&...args) const noexcept
+    bool isr_debug(detail::plain_format_t format, Args &&...args) const noexcept
     {
-        return detail::write_log_isr<ON9_LOG_LEVEL_DEBUG>(tag_, format, static_cast<Args &&>(args)...);
+        return detail::write_log_isr<ON9_LOG_LEVEL_DEBUG>(tag_, detail::format_pointer(format), static_cast<Args &&>(args)...);
     }
 
     /**
@@ -1769,9 +1864,9 @@ public:
      * @return @c true if queued, @c false if the ISR buffer was full.
      */
     template <typename... Args>
-    bool isr_verbose(const char *format, Args &&...args) const noexcept
+    bool isr_verbose(detail::plain_format_t format, Args &&...args) const noexcept
     {
-        return detail::write_log_isr<ON9_LOG_LEVEL_VERBOSE>(tag_, format, static_cast<Args &&>(args)...);
+        return detail::write_log_isr<ON9_LOG_LEVEL_VERBOSE>(tag_, detail::format_pointer(format), static_cast<Args &&>(args)...);
     }
 
     /**
@@ -1818,9 +1913,9 @@ public:
      * @return @c true if queued, @c false if the ISR buffer was full.
      */
     template <on9log_level_t Level, typename... Args>
-    bool isr_log(const char *format, Args &&...args) const noexcept
+    bool isr_log(detail::plain_format_t format, Args &&...args) const noexcept
     {
-        return detail::write_log_isr<Level>(tag_, format, static_cast<Args &&>(args)...);
+        return detail::write_log_isr<Level>(tag_, detail::format_pointer(format), static_cast<Args &&>(args)...);
     }
 
     /**

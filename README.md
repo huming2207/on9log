@@ -116,6 +116,32 @@ log.buffer_info(bytes, len);
 log.isr_error("isr fault core=%d", core);
 ```
 
+### C++ format literals in .noload (C++26 reflection)
+
+By default a plain `log.info("...")` keeps its format literal in flash; the
+NTTP (`log.info<"...">()`) and `"..."_on9fmt` forms move it to `.noload`.
+Enable `CONFIG_ON9LOG_CXX_REFLECTION` (or `-DON9LOG_CXX_REFLECTION=ON` for the
+host build) and the plain form moves it too, with no macro: the format
+parameter has a `consteval` constructor that uses C++26 reflection to
+instantiate the `.noload` copy of the literal it receives. Identical formats
+share one copy.
+
+- Needs a compiler with C++26 reflection: GCC 16+ (Espressif esp-16.x) with
+  `-std=gnu++26 -freflection`; the component adds `-freflection` for you.
+  ESP-IDF v6.1 ships esp-15.2 and does not build with GCC 16, so use an
+  ESP-IDF release that ships esp-16 (currently master).
+- With an older compiler the build stops with an `#error`. It never falls back
+  to keeping literals in flash.
+- Plain overloads then accept only string literals and `constexpr` char
+  arrays. Wrap a format chosen at runtime:
+
+```cpp
+log.info(on9log::runtime_format(pick_format()), value);
+```
+
+`on9log::runtime_format()` also exists when the option is off, so the same
+code builds either way.
+
 ### C argument caveat
 
 The C macros classify arguments from their expression types before the firmware

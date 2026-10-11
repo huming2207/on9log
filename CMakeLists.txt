@@ -24,6 +24,12 @@ if(COMMAND idf_component_register)
         add_subdirectory(external/fmt EXCLUDE_FROM_ALL)
         target_link_libraries(${COMPONENT_LIB} PUBLIC fmt::fmt)
     endif()
+
+    if(CONFIG_ON9LOG_CXX_REFLECTION)
+        # C++ code including on9log.hpp needs C++26 reflection. A toolchain
+        # without it fails here or at on9log.hpp's #error, never silently.
+        target_compile_options(${COMPONENT_LIB} PUBLIC $<$<COMPILE_LANGUAGE:CXX>:-freflection>)
+    endif()
 else()
     if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
         project(on9log LANGUAGES C CXX)
@@ -39,6 +45,10 @@ else()
     endif()
 
     option(ON9LOG_PLAIN_TEXT "Emit formatted plain text instead of binary packets" OFF)
+    option(ON9LOG_CXX_REFLECTION "Move plain C++ format literals to .noload with C++26 reflection" OFF)
+    if(ON9LOG_CXX_REFLECTION AND ON9LOG_PLAIN_TEXT)
+        message(FATAL_ERROR "ON9LOG_CXX_REFLECTION requires ON9LOG_PLAIN_TEXT=OFF")
+    endif()
     option(ON9LOG_BUILD_TESTS "Build the Unix host smoke test" ${_on9log_build_tests_default})
     option(ON9LOG_BUILD_DEMO "Build the comprehensive Unix host demo" ${_on9log_build_demo_default})
 
@@ -55,7 +65,12 @@ else()
     target_compile_features(on9log PUBLIC c_std_11 cxx_std_23)
     target_compile_definitions(on9log PUBLIC
         ON9LOG_PLAIN_TEXT=$<BOOL:${ON9LOG_PLAIN_TEXT}>
+        ON9LOG_CXX_REFLECTION=$<BOOL:${ON9LOG_CXX_REFLECTION}>
     )
+    if(ON9LOG_CXX_REFLECTION)
+        target_compile_features(on9log PUBLIC cxx_std_26)
+        target_compile_options(on9log PUBLIC $<$<COMPILE_LANGUAGE:CXX>:-freflection>)
+    endif()
     target_link_libraries(on9log PUBLIC Threads::Threads)
 
     if(ON9LOG_PLAIN_TEXT)

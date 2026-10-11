@@ -23,6 +23,21 @@
 #endif
 
 /**
+ * @brief Place plain C++ Logger format literals in .noload via C++26 reflection.
+ *
+ * In ESP-IDF builds this follows CONFIG_ON9LOG_CXX_REFLECTION. When enabled,
+ * on9log.hpp refuses to compile without reflection support instead of
+ * silently keeping the literals in flash.
+ */
+#ifndef ON9LOG_CXX_REFLECTION
+#ifdef CONFIG_ON9LOG_CXX_REFLECTION
+#define ON9LOG_CXX_REFLECTION CONFIG_ON9LOG_CXX_REFLECTION
+#else
+#define ON9LOG_CXX_REFLECTION 0
+#endif
+#endif
+
+/**
  * @brief Compile-time maximum log level for this translation unit.
  *
  * Log statements whose level exceeds this value are compiled out entirely.
