@@ -194,6 +194,16 @@ enable firmware-side `%.*s` scanning and length-bounded copying. For
 non-NUL-terminated slices without retaining format literals, prefer the C++
 wrapper with `std::string_view`.
 
+Two C-macro cases are wrong on 64-bit Linux hosts (x86-64, AArch64) and are
+skipped there by the tests; ESP32 (Xtensa) and other ILP32 targets are fine,
+and the C++ wrapper is fine everywhere:
+
+- a `double` or `float` argument is read with `va_arg(uint64_t)`, but these
+  ABIs pass variadic doubles in floating-point registers, so it and every
+  later argument encode garbage;
+- `long` / `unsigned long` (and so `size_t`) are classified as 32-bit, so a
+  64-bit `long` loses its upper half.
+
 ## Host Tools
 
 The host-side decoder library (`on9log-protocol`), live monitor (`on9log-cli`),
@@ -217,6 +227,9 @@ on9log/
 ├── on9log_unix_port.c           Linux/macOS lock and timestamp port
 ├── on9log_unix_stdio.c/.h       Linux/macOS stdio sink
 ├── on9log_port_weak.c           Weak no-op stubs for non-ESP targets
+├── tests/                       Test cases shared by Linux and ESP32 QEMU
+├── test_apps/qemu/              ESP32-S3 test app run in QEMU
+├── ci/run_tests.sh              Runs every test; CI calls it
 ├── CMakeLists.txt
 └── Kconfig
 ```
@@ -337,6 +350,44 @@ For the BOOT image ID, a bare-metal port should link with
     __on9log_build_id_end = .;
 } > FLASH
 ```
+
+## Testing
+
+`ci/run_tests.sh` runs everything; GitHub Actions and GitLab CI call it, and it
+works the same locally:
+
+```sh
+ci/run_tests.sh host   # Linux: GCC and Clang, binary and plain text, ASan/UBSan, TSan
+ci/run_tests.sh qemu   # ESP32-S3 in QEMU, binary and plain text
+ci/run_tests.sh        # both
+```
+
+The QEMU run needs ESP-IDF exported (`. $IDF_PATH/export.sh`) and Espressif's
+QEMU installed (`python $IDF_PATH/tools/idf_tools.py install qemu-xtensa`).
+Build trees go to `build-ci/`.
+
+The cases in `tests/on9log_test_cases.cpp` run on both platforms: packet
+layout byte for byte for every argument type (from C and C++), inline strings,
+buffers and chunking, sequence numbers and wrap, dropped-packet reporting,
+BOOT, TIME_SYNC, `on9log_dispatch_packet()`, level and tag filters, the sink
+table, and plain-text line formatting. Each platform adds its own:
+
+- Linux (`tests/on9log_unit_linux.cpp`, `tests/on9log_unix_smoke.cpp`): wire
+  order under threads, the remove-sink barrier, tag filters under concurrent
+  lookups, the GNU build-id parser, and the stdio sink's SLIP/CRC frames.
+- ESP32-S3 (`test_apps/qemu`): which addresses count as in the image, the ELF
+  SHA-256 image ID (the script also checks it against `sha256sum` of the ELF),
+  `esp_timer` timestamps, wire order across both cores, the remove-sink
+  barrier, ISR logs from a real timer interrupt (including the drop paths and a
+  full ringbuffer), and the stdio VFS frames.
+- Compile-time checks (`tests/on9log_compile_fail.cpp`): code that must not
+  build, such as 33 C++ arguments, strings in ISR logs, or
+  `ON9LOG_CXX_REFLECTION` on a compiler without reflection.
+
+TSan needs address randomisation turned off on recent kernels; where that is
+not allowed (Docker's default seccomp profile) the script skips TSan and says
+so. ESP32 coverage is QEMU, not hardware: flash-cache and real-UART behaviour
+still need a board.
 
 ### Code size
 

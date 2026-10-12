@@ -84,4 +84,4 @@ Temporary Items
 
 # ESP-IDF package manager lockfile (we don't use that, just ignore it)
 dependencies.lock
-managed_components/
+managed_components/build-ci/

@@ -1,10 +1,8 @@
 name: CI
 
-# on9log — Linux host test build (C/CMake)
-#
-# Builds the Unix host shim: libon9log.a, on9log_unix_demo, on9log_unix_smoke.
-#
-# Requires C++23 (gcc-14 or clang-18).
+# on9log tests, all run by ci/run_tests.sh:
+#   host: Linux, GCC and Clang, binary and plain text, ASan/UBSan, TSan
+#   qemu: the ESP32-S3 test app (test_apps/qemu) in Espressif's QEMU
 
 on:
   push:
@@ -15,36 +13,54 @@ on:
 
 jobs:
 
-  build-test:
-    name: "C build + test (gcc-14)"
+  host:
+    name: "Linux (GCC 14, Clang 18, sanitizers)"
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
 
-      - name: Install toolchain
+      - name: Install toolchains
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq cmake gcc-14 g++-14 make
-          sudo update-alternatives --install /usr/bin/cc cc /usr/bin/gcc-14 100
-          sudo update-alternatives --install /usr/bin/c++ c++ /usr/bin/g++-14 100
+          sudo apt-get install -y -qq cmake make gcc-14 g++-14 clang-18
 
-      - name: Configure
-        run: cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
+      - name: Run tests
+        env:
+          ON9LOG_CI_GCC: gcc-14
+          ON9LOG_CI_GXX: g++-14
+          ON9LOG_CI_CLANG: clang-18
+          ON9LOG_CI_CLANGXX: clang++-18
+        run: ci/run_tests.sh host
 
-      - name: Build
-        run: cmake --build build
+  qemu:
+    name: "ESP32-S3 in QEMU (ESP-IDF v6.1)"
+    runs-on: ubuntu-24.04
+    container: espressif/idf:v6.1
+    steps:
+      # The test app finds the component by its directory name, which is the repository name: on9log.
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
-      - name: Test
-        run: ctest --test-dir build --output-on-failure --verbose
+      - name: Install QEMU
+        shell: bash
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq libsdl2-2.0-0 libslirp0
+          python3 "$IDF_PATH/tools/idf_tools.py" install qemu-xtensa
 
-      - name: Upload build artifacts
+      - name: Run tests
+        shell: bash
+        run: |
+          . "$IDF_PATH/export.sh"
+          ci/run_tests.sh qemu
+
+      - name: Upload QEMU logs
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: on9log-linux-x86_64
-          path: |
-            build/libon9log.a
-            build/on9log_unix_demo
-            build/on9log_unix_smoke
-          retention-days: 1
+          name: on9log-qemu-logs
+          path: build-ci/qemu-*/qemu.log
+          retention-days: 7

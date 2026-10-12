@@ -116,19 +116,19 @@ static struct on9log_tag_filter_list s_tag_filters = SLIST_HEAD_INITIALIZER(s_ta
  *
  * Updated every time the filter list is modified.
  */
-static atomic_uintptr_t s_tag_filter_head = ATOMIC_VAR_INIT((uintptr_t)NULL);
+static atomic_uintptr_t s_tag_filter_head = (uintptr_t)NULL;
 
 /** @brief Number of active (non-deactivated) tag filter nodes (atomic counter). */
-static atomic_uint_fast32_t s_active_tag_filter_count = ATOMIC_VAR_INIT(0);
+static atomic_uint_fast32_t s_active_tag_filter_count = 0;
 
 /** @brief Default minimum log level (applied when no per-tag filter matches). */
-static atomic_int s_default_level = ATOMIC_VAR_INIT(ON9_LOG_LEVEL_VERBOSE);
+static atomic_int s_default_level = ON9_LOG_LEVEL_VERBOSE;
 
 /** @brief Monotonically increasing packet sequence number. */
-static atomic_uint_fast16_t s_seq = ATOMIC_VAR_INIT(0);
+static atomic_uint_fast16_t s_seq = 0;
 
 /** @brief Pending dropped-packet count since the last dropped notification. */
-static atomic_uint_fast32_t s_dropped_count = ATOMIC_VAR_INIT(0);
+static atomic_uint_fast32_t s_dropped_count = 0;
 
 /**
  * @brief Write a single uint8_t to the encoder buffer.
@@ -1935,7 +1935,7 @@ typedef struct {
 } on9log_printf_formatter_ctx_t;
 
 static on9log_printf_cookie_t s_on9log_printf_cookie;
-static atomic_uintptr_t s_on9log_printf_stream = ATOMIC_VAR_INIT((uintptr_t)NULL);
+static atomic_uintptr_t s_on9log_printf_stream = (uintptr_t)NULL;
 
 #if ON9LOG_USE_FUNOPEN
 static int on9log_printf_cookie_write(void *cookie, const char *data, int len)

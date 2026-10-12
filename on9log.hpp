@@ -752,7 +752,11 @@ void write_log(const char *tag,
         (void)text_flags;
         with_wire_args(
             [&](auto... packed_args) {
+                // The format is not a literal here, as in the C macros.
+                ON9_LOG_DIAG_PUSH;
+                ON9_LOG_DIAG_IGNORE_FORMAT_OVERFLOW;
                 on9log_write(Level, tag, format, arg_types<Args...>(), packed_args...);
+                ON9_LOG_DIAG_POP;
             },
             static_cast<Args &&>(args)...);
 #endif
@@ -868,7 +872,12 @@ bool write_log_isr(const char *tag,
         (void)text_flags;
         return with_wire_args(
             [&](auto... packed_args) {
-                return on9log_write_isr(Level, tag, format, arg_types<Args...>(), packed_args...);
+                // The format is not a literal here, as in the C macros.
+                ON9_LOG_DIAG_PUSH;
+                ON9_LOG_DIAG_IGNORE_FORMAT_OVERFLOW;
+                bool queued = on9log_write_isr(Level, tag, format, arg_types<Args...>(), packed_args...);
+                ON9_LOG_DIAG_POP;
+                return queued;
             },
             static_cast<Args &&>(args)...);
 #endif

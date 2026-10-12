@@ -84,18 +84,49 @@ else()
 
     if(ON9LOG_BUILD_TESTS)
         enable_testing()
-        add_executable(on9log_unix_smoke tests/on9log_unix_smoke.cpp)
+        add_executable(on9log_unix_smoke tests/on9log_unix_smoke.cpp tests/on9log_test.cpp)
         target_link_libraries(on9log_unix_smoke PRIVATE on9log::on9log)
         add_test(NAME on9log_unix_smoke COMMAND on9log_unix_smoke)
 
-        add_executable(on9log_core_regression tests/on9log_core_regression.cpp)
-        target_link_libraries(on9log_core_regression PRIVATE on9log::on9log)
+        # The same cases also run on ESP32 in QEMU (test_apps/qemu).
+        add_executable(on9log_unit
+            tests/on9log_unit_linux.cpp
+            tests/on9log_test.cpp
+            tests/on9log_test_cases.cpp
+            tests/on9log_test_c_calls.c
+        )
+        target_link_libraries(on9log_unit PRIVATE on9log::on9log)
         if(NOT APPLE)
             # Like the demo: without PIE, literal addresses fit the 32-bit wire
-            # IDs, so the test covers both by-address and inline strings.
-            target_link_options(on9log_core_regression PRIVATE -no-pie)
+            # IDs, so the test covers both by-address and inline strings. The
+            # build-id is the image ID the BOOT packet reports.
+            target_link_options(on9log_unit PRIVATE -no-pie -Wl,--build-id)
         endif()
-        add_test(NAME on9log_core_regression COMMAND on9log_core_regression)
+        add_test(NAME on9log_unit COMMAND on9log_unit)
+
+        # Builds that must fail: the test passes when the compiler prints the expected error.
+        function(on9log_add_compile_fail_test name expected_error)
+            add_test(NAME on9log_compile_fail_${name}
+                     COMMAND ${CMAKE_CXX_COMPILER} -std=gnu++23 -fsyntax-only
+                             -I${CMAKE_CURRENT_SOURCE_DIR} ${ARGN}
+                             ${CMAKE_CURRENT_SOURCE_DIR}/tests/on9log_compile_fail.cpp)
+            set_tests_properties(on9log_compile_fail_${name} PROPERTIES PASS_REGULAR_EXPRESSION "${expected_error}")
+        endfunction()
+        if(NOT ON9LOG_PLAIN_TEXT)
+            on9log_add_compile_fail_test(too_many_args "at most 32 encoded arguments" -DON9T_TOO_MANY_ARGS)
+            on9log_add_compile_fail_test(isr_string_arg "does not support dynamic string arguments" -DON9T_ISR_STRING_ARG)
+            on9log_add_compile_fail_test(unsupported_type "unsupported on9log C" -DON9T_UNSUPPORTED_TYPE)
+            on9log_add_compile_fail_test(chunk_too_large "is too large for a packet header"
+                                         -DON9T_CONFIG_ONLY -DON9LOG_BUFFER_CHUNK_SIZE=65523)
+            on9log_add_compile_fail_test(isr_packet_too_small "must be at least 32"
+                                         -DON9T_CONFIG_ONLY -DON9LOG_ISR_PACKET_MAX=31)
+            on9log_add_compile_fail_test(reflection_with_plain_text "needs binary mode"
+                                         -DON9T_CONFIG_ONLY -DON9LOG_CXX_REFLECTION=1 -DON9LOG_PLAIN_TEXT=1
+                                         -I${CMAKE_CURRENT_SOURCE_DIR}/external/fmt/include)
+            # Compiled as C++23, so no compiler has reflection here: the option must stop the build.
+            on9log_add_compile_fail_test(reflection_unsupported "lacks C\\+\\+26 reflection"
+                                         -DON9T_CONFIG_ONLY -DON9LOG_CXX_REFLECTION=1)
+        endif()
     endif()
 
     if(ON9LOG_BUILD_DEMO)

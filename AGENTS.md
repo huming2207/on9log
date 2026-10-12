@@ -418,7 +418,8 @@ stayed in flash would differ from what was configured. GCC 16 defines both
 macros only with `-std=gnu++26 -freflection`; CMake adds `-freflection` to C++
 consumers when the option is on. Verified with Espressif GCC 16.1 on ESP-IDF
 master (ESP-IDF v6.1 rejects GCC 16 and its libc headers do not compile with
-it). Host GCC 15 and Clang 21 have no reflection, so CI cannot cover this path.
+it). Host GCC 15 and Clang 21 have no reflection, so CI only checks that
+enabling the option without reflection fails to compile.
 
 Both C++ forms are still address-only on the wire. Plain
 `Logger::info("...", ...)` does **not** copy the format string into the log
@@ -878,10 +879,44 @@ files; the standalone CMake branch does not claim to support non-Unix cross
 targets. The top-level ESP project requires CMake 3.22, above the component's
 3.20 minimum.
 
-The current changes have passed binary and plain-text Unix ASan/UBSan tests, a
-ThreadSanitizer concurrency regression, targeted C/C++ macro probes, and a full
-ESP-IDF v6.0.2 ESP32-S3 `idf.py build`. Hardware execution and the separate Rust
-decoder test suite were not rerun as part of this change.
+## Tests And CI
+
+`ci/run_tests.sh` is the single entry point (`host`, `qemu`, or both); the
+GitHub and GitLab pipelines only install toolchains and call it. See the
+README "Testing" section for what each part covers.
+
+- `tests/on9log_test.h/.cpp`: a small dependency-free harness (`ON9T_CHECK`,
+  `ON9T_SKIP`, a capture sink, little-endian helpers, and a SLIP/CRC frame
+  decoder written from the spec, not shared with the code under test). The
+  runner restores the logger after every case (capture sink removed, level
+  VERBOSE, pending drop count flushed).
+- `tests/on9log_test_cases.cpp`: `on9t::core_cases`, run by both the Linux
+  unit test and the ESP32 QEMU app. Expectations are exact bytes. Add new
+  wire-format behaviour here so both platforms check it.
+- `tests/on9log_test_c_calls.c`: the C-macro calls, compiled as C so the
+  `_Generic` classifier is tested (C++ uses templates).
+- `tests/on9log_unit_linux.cpp`: Linux-only cases (threads, ELF notes, port).
+- `tests/on9log_unix_smoke.cpp`: the Unix stdio sink end to end; a separate
+  program because that sink cannot be removed once installed.
+- `tests/on9log_compile_fail.cpp`: code that must not compile; each ctest entry
+  passes when the compiler prints the expected error.
+- `test_apps/qemu`: ESP32-S3 app with the core cases plus ESP port cases. It
+  prints `ON9T RESULT: PASS|FAIL` and restarts; QEMU runs with `-no-reboot`, so
+  the restart ends the run. It also prints `ON9T ELF SHA256:`, which the script
+  compares with `sha256sum` of the built ELF. Runs in the `binary` and
+  `plain_text` configs (`sdkconfig.ci.*`). The component directory must be
+  named `on9log` (the app finds it through `EXTRA_COMPONENT_DIRS`).
+
+Host builds use `-Wall -Wextra -Werror`; plain-text builds also pass
+`-Wno-unused-function -Wno-unused-variable` because some binary-only helpers
+in `on9log.c` are compiled but unused there. TSan runs only where `setarch -R`
+can turn off address randomisation (TSan aborts at random on recent kernels
+otherwise, and Docker's default seccomp profile forbids it); the script prints
+that it skipped. The reflection path is checked only as "must not compile
+without reflection"; a reflection build still needs GCC 16 by hand.
+
+A failed log attempt still reports pending drops first, so two failed calls in
+a row produce a DROPPED packet each; the tests rely on this.
 
 ## Known Implementation Risks
 
@@ -892,6 +927,14 @@ these review findings are still open and should be treated as real constraints:
   require a literal so the format can be placed in `.noload`. Runtime pointers
   use `ON9_LOG_RUNTIMEE/W/I/D/V()` and remain in addressable firmware storage;
   the matching ELF must retain that storage for host resolution.
+- **C-macro doubles and longs are wrong on 64-bit Linux hosts.** The core
+  reads every `ON9_LOG_ARGS_TYPE_64BITS` argument with `va_arg(uint64_t)`; on
+  x86-64 and AArch64 a variadic `double` travels in a floating-point register,
+  so it and every later argument are misread. `_Generic` also maps `long` to
+  32 bits, truncating a 64-bit `long`/`size_t`. Xtensa (ESP32) and other ILP32
+  targets are correct; the C++ wrapper converts floats to bits itself and is
+  correct everywhere. `c_double_arguments` and `c_long_arguments` are skipped
+  on those hosts until this is fixed.
 - **Argument capture is ABI-reliant.** Type detection only special-cases a small
   set of C/C++ types, then `on9log_emit_arg()` reads raw `uint32_t`, `uint64_t`,
   pointer, or string values from `va_arg`. This is not a complete printf ABI

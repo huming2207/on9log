@@ -1,0 +1,8 @@
+CONFIG_IDF_TARGET="esp32s3"
+# The cases allocate test buffers and run long loops on the main task.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
+CONFIG_ESP_TASK_WDT_INIT=n
+# The ISR case logs from an esp_timer callback that runs in the interrupt.
+CONFIG_ESP_TIMER_SUPPORTS_ISR_DISPATCH_METHOD=y
+# Keep the default 100 Hz tick: the timestamp case checks on9log is finer than it.
+CONFIG_FREERTOS_HZ=100

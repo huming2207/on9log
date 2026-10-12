@@ -1,0 +1,2 @@
+# Binary packets (the default).
+CONFIG_ON9LOG_PLAIN_TEXT=n

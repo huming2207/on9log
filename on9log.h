@@ -200,7 +200,8 @@ on9log_level_t on9log_get_level(void);
  * @brief Override the runtime log level for a specific tag.
  *
  * When a tag-level override is set, messages with that tag use the override
- * level instead of the global level, provided the override is more restrictive.
+ * level instead of the global level, whether it is stricter or looser. The
+ * compile-time ON9_LOG_LOCAL_LEVEL still caps it.
  *
  * @param[in] tag   The tag string to filter. The logger copies this string.
  * @param[in] level Maximum log level allowed for this tag.

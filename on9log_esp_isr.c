@@ -38,7 +38,7 @@ typedef struct {
 
 /** @brief Singleton state for the ISR logging subsystem. */
 static on9log_esp_isr_t s_on9log_esp_isr = {
-    .ringbuf = ATOMIC_VAR_INIT((uintptr_t)NULL),
+    .ringbuf = (uintptr_t)NULL,
     .task = NULL,
     .installed = false,
 };
