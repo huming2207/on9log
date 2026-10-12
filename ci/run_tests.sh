@@ -84,8 +84,9 @@ qemu_test() {
     echo "=== qemu: $config"
     "${idf[@]}" build
 
-    # The app restarts when it is done; -no-reboot turns that into QEMU exiting.
-    timeout 600 "${idf[@]}" qemu --qemu-extra-args="-no-reboot" </dev/null | tee "$build/qemu.log"
+    # The app restarts when it is done; -no-reboot turns that into QEMU exiting. A run
+    # takes seconds, so the timeout only ends a hang.
+    timeout 300 "${idf[@]}" qemu --qemu-extra-args="-no-reboot" </dev/null | tee "$build/qemu.log"
     if ! grep -q "ON9T RESULT: PASS" "$build/qemu.log"; then
         echo "qemu-$config: tests failed, see $build/qemu.log"
         return 1

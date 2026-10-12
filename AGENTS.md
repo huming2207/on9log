@@ -920,7 +920,12 @@ README "Testing" section for what each part covers.
   prints `ON9T RESULT: PASS|FAIL` and restarts; QEMU runs with `-no-reboot`, so
   the restart ends the run. It also prints `ON9T ELF SHA256:`, which the script
   compares with `sha256sum` of the built ELF. Runs in the `binary`,
-  `plain_text` and `reflection` configs (`sdkconfig.ci.*`). The component directory must be
+  `plain_text` and `reflection` configs (`sdkconfig.ci.*`). It links with
+  `-Wl,--wrap=rtc_clk_bbpll_add_consumer` and an empty wrapper: on ESP-IDF
+  6.2-dev (master) any ESP32-S3 app using `vfs` links the USB-Serial-JTAG
+  connection monitor, whose boot-time init waits for a BBPLL calibration that
+  QEMU never completes (an unmodified `hello_world` with `PRIV_REQUIRES vfs`
+  hangs the same way). Test app only; firmware is unaffected. The component directory must be
   named `on9log` (the app finds it through `EXTRA_COMPONENT_DIRS`).
 
 Host builds use `-Wall -Wextra -Werror`; plain-text builds also pass

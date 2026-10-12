@@ -10,3 +10,8 @@ idf_component_register(
     INCLUDE_DIRS "../../../tests"
     PRIV_REQUIRES on9log esp_app_format esp_timer freertos vfs
 )
+
+# QEMU only: ESP-IDF 6.2-dev's USB-Serial-JTAG driver (linked by vfs) turns the BBPLL on
+# at boot and waits for a calibration that QEMU never finishes. Skip that wait here;
+# see __wrap_rtc_clk_bbpll_add_consumer in on9log_qemu_test.cpp.
+target_link_libraries(${COMPONENT_LIB} INTERFACE "-Wl,--wrap=rtc_clk_bbpll_add_consumer")

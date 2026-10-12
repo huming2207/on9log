@@ -26,6 +26,14 @@
 #include "on9log_esp_isr.h"
 #include "on9log_port.h"
 
+/*
+ * QEMU only (linked with -Wl,--wrap=rtc_clk_bbpll_add_consumer, see main/CMakeLists.txt).
+ * ESP-IDF 6.2-dev's USB-Serial-JTAG connection monitor, linked by vfs, calls this at
+ * boot and it spins until the BBPLL reports calibrated, which QEMU never does. The
+ * PLL is already running the CPU here and this app never changes clocks or sleeps.
+ */
+extern "C" void __wrap_rtc_clk_bbpll_add_consumer(void) {}
+
 extern "C" const char _noload_keep_in_elf_start[];
 extern "C" const char _noload_keep_in_elf_end[];
 
