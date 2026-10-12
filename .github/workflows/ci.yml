@@ -1,8 +1,11 @@
 name: CI
 
 # on9log tests, all run by ci/run_tests.sh:
-#   host: Linux, GCC and Clang, binary and plain text, ASan/UBSan, TSan
-#   qemu: the ESP32-S3 test app (test_apps/qemu) in Espressif's QEMU
+#   host / host-latest: Linux, GCC and Clang, binary and plain text, ASan/UBSan, TSan;
+#                       the oldest supported compilers and the newest ones
+#   host-latest also:   C++26 reflection on Linux (GCC 16)
+#   qemu:               the ESP32-S3 test app (test_apps/qemu) in Espressif's QEMU
+#   qemu-reflection:    the same with C++26 reflection, on ESP-IDF master (Espressif GCC 16)
 
 on:
   push:
@@ -34,6 +37,33 @@ jobs:
           ON9LOG_CI_CLANGXX: clang++-18
         run: ci/run_tests.sh host
 
+  host-latest:
+    name: "Linux (GCC 16, Clang 22, reflection)"
+    runs-on: ubuntu-24.04
+    container: gcc:16
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install CMake and Clang
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq cmake lsb-release wget gnupg
+          wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
+          bash /tmp/llvm.sh 22
+
+      # TSan is skipped here (no way to turn off address randomisation in a container); the host job runs it.
+      - name: Run tests
+        env:
+          ON9LOG_CI_GCC: gcc
+          ON9LOG_CI_GXX: g++
+          ON9LOG_CI_CLANG: clang-22
+          ON9LOG_CI_CLANGXX: clang++-22
+        run: |
+          ci/run_tests.sh host
+          ci/run_tests.sh host-reflection
+
   qemu:
     name: "ESP32-S3 in QEMU (ESP-IDF v6.1)"
     runs-on: ubuntu-24.04
@@ -62,5 +92,35 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: on9log-qemu-logs
+          path: build-ci/qemu-*/qemu.log
+          retention-days: 7
+
+  qemu-reflection:
+    name: "ESP32-S3 in QEMU, C++26 reflection (ESP-IDF master, GCC 16)"
+    runs-on: ubuntu-24.04
+    container: espressif/idf:latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install QEMU
+        shell: bash
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq libsdl2-2.0-0 libslirp0
+          python3 "$IDF_PATH/tools/idf_tools.py" install qemu-xtensa
+
+      - name: Run tests
+        shell: bash
+        run: |
+          . "$IDF_PATH/export.sh"
+          ci/run_tests.sh qemu-reflection
+
+      - name: Upload QEMU logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: on9log-qemu-reflection-logs
           path: build-ci/qemu-*/qemu.log
           retention-days: 7

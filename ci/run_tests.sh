@@ -3,9 +3,14 @@
 #
 #   ci/run_tests.sh host   Linux: GCC and Clang, binary and plain text, ASan/UBSan, and
 #                          TSan where address randomisation can be turned off
+#   ci/run_tests.sh host-reflection
+#                          Linux with ON9LOG_CXX_REFLECTION (needs GCC 16+ as ON9LOG_CI_GCC/GXX)
 #   ci/run_tests.sh qemu   ESP32-S3 in QEMU, binary and plain text (needs ESP-IDF exported
 #                          and qemu-xtensa installed: idf_tools.py install qemu-xtensa)
-#   ci/run_tests.sh        both
+#   ci/run_tests.sh qemu-reflection
+#                          ESP32-S3 in QEMU with CONFIG_ON9LOG_CXX_REFLECTION (needs an
+#                          ESP-IDF whose toolchain is GCC 16+, e.g. master, exported)
+#   ci/run_tests.sh        host and qemu
 #
 # Compilers can be chosen with ON9LOG_CI_GCC/GXX/CLANG/CLANGXX (default gcc, g++,
 # clang, clang++). Build trees go to build-ci/ unless ON9LOG_CI_DIR says otherwise.
@@ -63,6 +68,12 @@ run_tsan() {
     "${no_aslr[@]}" ctest --test-dir "$out/host-tsan" --output-on-failure
 }
 
+# C++26 reflection: plain Logger literals go to .noload. The build fails without GCC 16+.
+run_host_reflection() {
+    host_test gcc-reflection "$gcc" "$gxx" "$warnings" -DON9LOG_CXX_REFLECTION=ON
+    host_test asan-reflection "$gcc" "$gxx" "$sanitizers" -DON9LOG_CXX_REFLECTION=ON
+}
+
 # qemu_test CONFIG: build test_apps/qemu with sdkconfig.ci.CONFIG and run it in QEMU.
 qemu_test() {
     local config=$1
@@ -88,6 +99,18 @@ qemu_test() {
         echo "qemu-$config: firmware image ID '$reported' is not the ELF SHA-256 $elf"
         return 1
     fi
+
+    # A plain C++ Logger literal is in the flashed image without reflection, and only in
+    # the ELF (.noload) with it. The binary configs log one to check this both ways.
+    if [ "$config" != plain_text ]; then
+        local literal="on9t plain literal" in_bin=no expected=yes
+        grep -qaF "$literal" "$build/on9log_qemu_test.bin" && in_bin=yes
+        [ "$config" = reflection ] && expected=no
+        if [ "$in_bin" != "$expected" ] || ! grep -qaF "$literal" "$build/on9log_qemu_test.elf"; then
+            echo "qemu-$config: '$literal' in flash: $in_bin, expected $expected (and always in the ELF)"
+            return 1
+        fi
+    fi
 }
 
 run_qemu() {
@@ -97,13 +120,15 @@ run_qemu() {
 
 case "${1:-all}" in
 host) run_host ;;
+host-reflection) run_host_reflection ;;
 qemu) run_qemu ;;
+qemu-reflection) qemu_test reflection ;;
 all)
     run_host
     run_qemu
     ;;
 *)
-    echo "usage: $0 [host|qemu|all]" >&2
+    echo "usage: $0 [host|host-reflection|qemu|qemu-reflection|all]" >&2
     exit 2
     ;;
 esac

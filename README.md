@@ -357,14 +357,29 @@ For the BOOT image ID, a bare-metal port should link with
 works the same locally:
 
 ```sh
-ci/run_tests.sh host   # Linux: GCC and Clang, binary and plain text, ASan/UBSan, TSan
-ci/run_tests.sh qemu   # ESP32-S3 in QEMU, binary and plain text
-ci/run_tests.sh        # both
+ci/run_tests.sh host             # Linux: GCC and Clang, binary and plain text, ASan/UBSan, TSan
+ci/run_tests.sh host-reflection  # Linux with ON9LOG_CXX_REFLECTION (GCC 16+)
+ci/run_tests.sh qemu             # ESP32-S3 in QEMU, binary and plain text
+ci/run_tests.sh qemu-reflection  # ESP32-S3 in QEMU with ON9LOG_CXX_REFLECTION
+ci/run_tests.sh                  # host and qemu
 ```
 
-The QEMU run needs ESP-IDF exported (`. $IDF_PATH/export.sh`) and Espressif's
+The QEMU runs need ESP-IDF exported (`. $IDF_PATH/export.sh`) and Espressif's
 QEMU installed (`python $IDF_PATH/tools/idf_tools.py install qemu-xtensa`).
-Build trees go to `build-ci/`.
+`qemu-reflection` needs an ESP-IDF whose toolchain is Espressif GCC 16, which
+today means ESP-IDF master (`esp-16.1.0`). Compilers for the host runs are
+chosen with `ON9LOG_CI_GCC`, `ON9LOG_CI_GXX`, `ON9LOG_CI_CLANG` and
+`ON9LOG_CI_CLANGXX`. Build trees go to `build-ci/`.
+
+CI runs the host tests twice, with the oldest supported compilers (GCC 14,
+Clang 18) and the newest (GCC 16, Clang 22, in the `gcc:16` image, plus the
+Linux reflection build), and the QEMU tests on ESP-IDF v6.1 and, for
+reflection, on `espressif/idf:latest`.
+
+With reflection on, plain `log.info("...")` literals must be in `.noload` and
+not in flash. The QEMU app checks each one's address is inside `.noload`, and
+the script checks that a known literal is in the ELF but absent from the
+flashed `.bin` (and present in it in the non-reflection config).
 
 The cases in `tests/on9log_test_cases.cpp` run on both platforms: packet
 layout byte for byte for every argument type (from C and C++), inline strings,
@@ -380,6 +395,8 @@ table, and plain-text line formatting. Each platform adds its own:
   `esp_timer` timestamps, wire order across both cores, the remove-sink
   barrier, ISR logs from a real timer interrupt (including the drop paths and a
   full ringbuffer), and the stdio VFS frames.
+- Formats from two translation units that start with the same `.noload`
+  format all survive linking (this used to drop the second unit's formats).
 - Compile-time checks (`tests/on9log_compile_fail.cpp`): code that must not
   build, such as 33 C++ arguments, strings in ISR logs, or
   `ON9LOG_CXX_REFLECTION` on a compiler without reflection.

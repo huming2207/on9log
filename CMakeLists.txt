@@ -94,6 +94,8 @@ else()
             tests/on9log_test.cpp
             tests/on9log_test_cases.cpp
             tests/on9log_test_c_calls.c
+            tests/on9log_test_tu_a.cpp
+            tests/on9log_test_tu_b.cpp
         )
         target_link_libraries(on9log_unit PRIVATE on9log::on9log)
         if(NOT APPLE)

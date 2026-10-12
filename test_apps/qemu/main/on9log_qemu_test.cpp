@@ -133,19 +133,24 @@ void formats_live_in_noload()
     log.info<"nttp %d">(2);
     log.info("token %d"_on9fmt, 3);
     log.info(ON9FMT("macro %d"), 4);
-    log.info("plain %d", 5);
+    // ci/run_tests.sh looks for this text in the flashed .bin: there only without reflection.
+    log.info("on9t plain literal %d", 5);
+    log.e("on9t plain short form %d", 6);
     auto packets = on9t::capture_stop();
 
-    ON9T_CHECK(packets.size() == 5);
+    ON9T_CHECK(packets.size() == 6);
     for (size_t i = 0; i < 4; ++i) {
         ON9T_CHECK(in_noload(packets[i].fmt_id()));
     }
+    for (size_t i = 4; i < 6; ++i) {
 #if ON9LOG_CXX_REFLECTION
-    ON9T_CHECK(in_noload(packets[4].fmt_id()));
+        // C++26 reflection moved the plain literal to .noload at compile time.
+        ON9T_CHECK(in_noload(packets[i].fmt_id()));
 #else
-    // Without reflection a plain literal stays in flash rodata, still sent by address.
-    ON9T_CHECK(!in_noload(packets[4].fmt_id()) && packets[4].fmt_id() != ON9LOG_ID_INLINE);
+        // Without reflection a plain literal stays in flash rodata, still sent by address.
+        ON9T_CHECK(!in_noload(packets[i].fmt_id()) && packets[i].fmt_id() != ON9LOG_ID_INLINE);
 #endif
+    }
 }
 #endif
 
@@ -453,7 +458,8 @@ const on9t::test_case esp_cases[] = {
 
 extern "C" void app_main(void)
 {
-    std::printf("ON9T START (%s)\n", ON9LOG_PLAIN_TEXT ? "plain text" : "binary");
+    std::printf("ON9T START (%s%s)\n", ON9LOG_PLAIN_TEXT ? "plain text" : "binary",
+                ON9LOG_CXX_REFLECTION ? ", C++26 reflection" : "");
     if (on9log_init() != ON9LOG_OK) {
         std::printf("ON9T RESULT: FAIL (on9log_init failed)\n");
     } else {

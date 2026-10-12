@@ -124,13 +124,22 @@ struct fixed_string {
  * survives linker garbage collection and lands in the designated noload
  * section so the format string does not occupy RAM at runtime.
  *
+ * Internal linkage (static) on purpose. The section attribute is expanded
+ * once, so every instantiation in a translation unit shares one section. As
+ * inline (COMDAT) variables, GCC puts that whole section in one group named
+ * after the TU's first format; when two TUs start with the same format the
+ * linker keeps one group and drops the other, and every other format of the
+ * dropped TU becomes NULL (silently on Xtensa). Static copies are never
+ * dropped; a format used in several TUs is stored once per TU, which costs
+ * ELF space only, since .noload is not flashed.
+ *
  * @tparam Format  A @ref fixed_string NTTP containing the format literal.
  */
 template <fixed_string Format>
 #if ON9LOG_PLAIN_TEXT
-inline constexpr auto noload_format_storage __attribute__((used)) = Format;
+static constexpr auto noload_format_storage __attribute__((used)) = Format;
 #else
-inline constexpr auto noload_format_storage ON9_LOG_NOLOAD_ATTR __attribute__((used)) = Format;
+static constexpr auto noload_format_storage ON9_LOG_NOLOAD_ATTR __attribute__((used)) = Format;
 #endif
 
 /**
@@ -730,12 +739,16 @@ void write_log(const char *tag,
 #if ON9LOG_PLAIN_TEXT
         if constexpr ((is_printf_arg_v<Args> && ...)) {
             if (uses_printf_format(format)) {
+                // The format is not a literal here, as in the C macros.
+                ON9_LOG_DIAG_PUSH;
+                ON9_LOG_DIAG_IGNORE_FORMAT_OVERFLOW;
                 on9log_write_with_text_flags(Level,
                                              tag,
                                              text_flags,
                                              format,
                                              NULL,
                                              printf_arg(static_cast<Args &&>(args))...);
+                ON9_LOG_DIAG_POP;
                 return;
             }
         }
@@ -846,13 +859,17 @@ bool write_log_isr(const char *tag,
 #if ON9LOG_PLAIN_TEXT
         if constexpr ((is_printf_arg_v<Args> && ...)) {
             if (uses_printf_format(format)) {
-                return on9log_write_isr_with_text_flags(
-                    Level,
-                    tag,
-                    text_flags,
-                    format,
-                    arg_types<Args...>(),
-                    printf_arg(static_cast<Args &&>(args))...);
+                // The format is not a literal here, as in the C macros.
+                ON9_LOG_DIAG_PUSH;
+                ON9_LOG_DIAG_IGNORE_FORMAT_OVERFLOW;
+                bool queued = on9log_write_isr_with_text_flags(Level,
+                                                               tag,
+                                                               text_flags,
+                                                               format,
+                                                               arg_types<Args...>(),
+                                                               printf_arg(static_cast<Args &&>(args))...);
+                ON9_LOG_DIAG_POP;
+                return queued;
             }
         }
         char text[ON9LOG_ISR_PACKET_MAX];

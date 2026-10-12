@@ -465,6 +465,22 @@ void null_tag_is_address_zero()
     ON9T_CHECK(packets[0].tag_id() == 0);
 }
 
+// Formats from two TUs that start with the same format all survive linking.
+void noload_formats_in_two_tus()
+{
+    on9t::capture_start();
+    on9t::tu_a_log();
+    on9t::tu_b_log();
+    auto packets = on9t::capture_stop();
+
+    ON9T_CHECK(packets.size() == 4);
+    for (const auto &p : packets) {
+        ON9T_CHECK(well_formed(p));
+        ON9T_CHECK(p.fmt_id() != 0 && p.fmt_id() != ON9LOG_ID_INLINE);
+    }
+    ON9T_CHECK(packets[1].fmt_id() != packets[3].fmt_id());
+}
+
 // ---------------------------------------------------------------------------
 // Binary mode: buffers
 // ---------------------------------------------------------------------------
@@ -1033,6 +1049,7 @@ const test_case core_cases[] = {
     {"long_strings_are_capped", long_strings_are_capped},
     {"inline_tags_and_formats", inline_tags_and_formats},
     {"null_tag_is_address_zero", null_tag_is_address_zero},
+    {"noload_formats_in_two_tus", noload_formats_in_two_tus},
     {"buffer_small_and_empty", buffer_small_and_empty},
     {"buffer_chunks", buffer_chunks},
     {"buffer_with_inline_tag", buffer_with_inline_tag},

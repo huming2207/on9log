@@ -111,6 +111,10 @@ struct frame {
 /** Decodes every frame in a transport byte stream; bytes between frames are skipped. */
 std::vector<frame> decode_frames(const std::vector<uint8_t> &stream);
 
+/** Log two NTTP formats each; the first is the same in both (tests/on9log_test_tu_*.cpp). */
+void tu_a_log();
+void tu_b_log();
+
 /** Cases that run on every platform (tests/on9log_test_cases.cpp). */
 extern const test_case core_cases[];
 extern const size_t core_case_count;

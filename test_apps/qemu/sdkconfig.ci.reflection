@@ -1,0 +1,4 @@
+# Binary packets, with C++26 reflection moving plain Logger literals to .noload.
+# Needs GCC 16 (ESP-IDF master at the time of writing).
+CONFIG_ON9LOG_PLAIN_TEXT=n
+CONFIG_ON9LOG_CXX_REFLECTION=y

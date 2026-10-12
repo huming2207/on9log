@@ -1,6 +1,9 @@
 # on9log tests, all run by ci/run_tests.sh:
-#   host-tests: Linux, GCC and Clang, binary and plain text, ASan/UBSan, TSan
-#   qemu-tests: the ESP32-S3 test app (test_apps/qemu) in Espressif's QEMU
+#   host-tests / host-latest-tests: Linux, GCC and Clang, binary and plain text, ASan/UBSan,
+#                                   TSan where allowed; the oldest supported and newest compilers
+#   host-latest-tests also:         C++26 reflection on Linux (GCC 16)
+#   qemu-tests:                     the ESP32-S3 test app (test_apps/qemu) in Espressif's QEMU
+#   qemu-reflection-tests:          the same with C++26 reflection, on ESP-IDF master (GCC 16)
 
 stages:
   - test
@@ -27,20 +30,49 @@ host-tests:
   script:
     - ci/run_tests.sh host
 
-# The test app finds the component by its directory name, which is the project name: on9log.
-qemu-tests:
+host-latest-tests:
   stage: test
   extends: .default-settings
-  image: espressif/idf:v6.1
+  image: gcc:16
+  variables:
+    ON9LOG_CI_GCC: gcc
+    ON9LOG_CI_GXX: g++
+    ON9LOG_CI_CLANG: clang-22
+    ON9LOG_CI_CLANGXX: clang++-22
+  before_script:
+    - apt-get update -qq
+    - apt-get install -y -qq cmake lsb-release wget gnupg
+    - wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
+    - bash /tmp/llvm.sh 22
+  script:
+    - ci/run_tests.sh host
+    - ci/run_tests.sh host-reflection
+
+# The test app finds the component by its directory name, which is the project name: on9log.
+.qemu-settings:
+  extends: .default-settings
   before_script:
     - apt-get update -qq
     - apt-get install -y -qq libsdl2-2.0-0 libslirp0
     - python3 "$IDF_PATH/tools/idf_tools.py" install qemu-xtensa
     - . "$IDF_PATH/export.sh"
-  script:
-    - ci/run_tests.sh qemu
   artifacts:
     when: always
     paths:
       - build-ci/qemu-*/qemu.log
     expire_in: 7 days
+
+qemu-tests:
+  stage: test
+  extends: .qemu-settings
+  image: espressif/idf:v6.1
+  script:
+    - ci/run_tests.sh qemu
+
+# ESP-IDF master is the first ESP-IDF on Espressif GCC 16, which has C++26 reflection.
+qemu-reflection-tests:
+  stage: test
+  extends: .qemu-settings
+  image: espressif/idf:latest
+  script:
+    - ci/run_tests.sh qemu-reflection
